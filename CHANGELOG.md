@@ -9,6 +9,8 @@ from GitHub and shows the entries below that are newer than the installed one.
   (must be nginx), iptables rules that drop/reject the port, fail2ban jails on 80/443 with banned addresses (Let's
   Encrypt's validation servers get "Connection refused" once banned after failed challenges), and whether the
   Proxmox firewall, when enabled, accepts 80/443 (HTTP/HTTPS macros or dport rules).
+- The same check fails when an iptables/nftables rule from another tool forwards (DNAT) ports 80/443 to a guest:
+  then requests never reach nginx on the host; the message shows the rule and how to remove it.
 
 ## 1.2.3 - 2026-10-16
 - Fix: when certbot failed, the reason (Domain / Type / Detail) was dropped - only stderr was kept, certbot prints

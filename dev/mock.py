@@ -54,6 +54,7 @@ SCENARIOS = {
     "le-blocked": "Let's Encrypt can't reach port 80 (provider firewall) although it works from the host itself",
     "f2b-ban": "fail2ban banned Let's Encrypt's validation servers on ports 80/443 (after failed challenges)",
     "pvefw-no-http": "Proxmox firewall enabled without a rule accepting HTTP/HTTPS",
+    "dnat-80": "another tool's iptables rule forwards ports 80/443 to a firewall VM instead of the host's nginx",
 }
 
 PVEFW_OK = """[OPTIONS]
@@ -367,6 +368,9 @@ server {
                                               "-s 64.78.149.164/32 -j REJECT --reject-with icmp-port-unreachable",
                                               "-j RETURN"]
                 flt["INPUT"].insert(0, "-p tcp -m multiport --dports 80,443 -j f2b-nginx-botsearch")
+            elif name == "dnat-80":
+                nat["PREROUTING"].insert(0, "-d %s/32 -p tcp -m multiport --dports 80,443 -j DNAT --to-destination 10.10.10.254"
+                                         % HOST_IP)
             elif name == "pvefw-no-http":
                 with open(self.path_for("/etc/pve/firewall/cluster.fw"), "w") as f:
                     f.write(PVEFW_OK.replace("IN HTTP(ACCEPT) -log nolog\n", "").replace("IN HTTPS(ACCEPT) -log nolog\n", ""))

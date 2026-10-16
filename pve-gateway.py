@@ -1385,6 +1385,27 @@ def port_checks(cfg, ports=(80, 443)):
             res.append(("fail2ban %s" % jail[4:], "warn", "%d address(es) banned on ports 80/443 - Let's Encrypt's validation servers "
                         "get 'Connection refused' if they are among them (they are banned after failed challenges = 404s). "
                         "Unban: fail2ban-client unban --all, and exclude /.well-known/acme-challenge/ from that jail" % banned))
+    # 80/443 must reach nginx on this host; a DNAT from another tool sends them to a guest instead
+    rc, nat = sh(["iptables-save", "-t", "nat"])
+    for l in nat.splitlines() if rc == 0 else []:
+        m = re.search(r"--dports? (\S+)", l)
+        to = re.search(r"--to-destination (\S+)", l)
+        if l.startswith("-A ") and "-j DNAT" in l and m and set(ports) & _ports_in(m.group(1)) and "-p udp" not in l \
+                and not l.split()[1].startswith("PVEGW_"):
+            res.append(("port %s forwarded away" % "/".join(str(p) for p in sorted(set(ports) & _ports_in(m.group(1)))), "fail",
+                        "an iptables rule outside pve-gateway forwards it to %s, so requests never reach nginx on this host "
+                        "(%s) - remove it: iptables -t nat -D %s" % (to.group(1) if to else "another address", l[:140], l[3:])))
+    rc, nft = sh(["nft", "list", "ruleset"])
+    if rc == 0:
+        table = ""
+        for l in nft.splitlines():
+            t = re.match(r"^table (\S+) (\S+)", l)
+            if t:
+                table = "%s %s" % t.groups()
+            m = re.search(r"tcp dport (\{[^}]*\}|\d+).*\bdnat\b.*?to (\S+)", l)
+            if m and "pvegw" not in table.lower() and set(ports) & _ports_in(m.group(1).strip("{} ").replace(" ", "")):
+                res.append(("port 80/443 forwarded away (nftables)", "fail", "nftables table %s forwards it to %s, so requests "
+                            "never reach nginx on this host: %s" % (table, m.group(2), l.strip()[:140])))
     rc, st = sh(["pve-firewall", "status"])
     if rc == 0 and "enabled" in st:
         for port in ports:
