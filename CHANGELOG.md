@@ -4,6 +4,19 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.2.2 - 2026-10-16
+- Fix: Let's Encrypt failed when another nginx site on the host (e.g. another panel) binds the public IP explicitly
+  (`listen <ip>:80`) - nginx then never used pve-gateway's blocks for that address. pve-gateway now detects such sites
+  (`nginx -T`) and listens on the same addresses, re-applies before each certificate request, and the watchdog follows
+  later changes.
+- Before asking Let's Encrypt, pve-gateway serves a test challenge and fetches it through the public IP like Let's
+  Encrypt does; if that fails it reports who answered instead (and doesn't use up the 5-failures-per-hour limit).
+- Domain test checks through the public IP (127.0.0.1 could hide the problem), reports other sites that claim the same
+  name or whether nginx loads pve-gateway's file at all; the red certificate status is clickable.
+
+## 1.2.1 - 2026-10-16
+- App logo (a gate with three servers) in the header, on the login page and as the browser favicon.
+
 ## 1.2.0 - 2026-10-16
 - Domains: aliases can redirect (301) to the main domain instead of serving the same site.
 - Domains: "Behind the Cloudflare proxy" option - nginx trusts Cloudflare's ranges and uses the real visitor IP
