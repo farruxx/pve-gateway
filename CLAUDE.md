@@ -22,7 +22,7 @@ Guidance for AI-assisted work on **pve-gateway**: a web UI that runs on a Proxmo
 | `README.md`, `wildcard.md` | User docs; keep them in sync with behavior changes |
 | `CHANGELOG.md` | Release notes, one `## X.Y.Z - date` section per version; shown in the UI's update card |
 
-`pve-gateway.py` is organised into sections marked `# ---- <name>`: config, validation, iptables, guests/interfaces, domains (nginx), diagnostics, monitoring, fail2ban, firewall, wireguard, updates, auth, HTTP, UI, main. Keep new code in the matching section.
+`pve-gateway.py` is organised into sections marked `# ---- <name>`: config, validation, iptables, guests/interfaces, domains (nginx), diagnostics, monitoring, fail2ban, firewall, wireguard, sdn, updates, auth, HTTP, UI, main. Keep new code in the matching section.
 
 ## Run and verify
 
@@ -31,7 +31,8 @@ Guidance for AI-assisted work on **pve-gateway**: a web UI that runs on a Proxmo
 ./dev.sh status               # any CLI command against the same mock state
 ./dev.sh test | debug | domains | show | apply
 ./dev.sh mock <scenario>      # break the mock host: unhook, ip-forward-off, forward-drop, pvefw-first,
-                              # foreign-dnat, traffic, nginx-stopped, nginx-test-fails, cert-expiring, reset
+                              # foreign-dnat, traffic, nginx-stopped, nginx-test-fails, cert-expiring,
+                              # no-dnsmasq, no-sdn, sdn-pending, reset (full list: ./dev.sh mock)
 rm -rf .dev                   # start over with fresh sample rules/domains/wildcards
 ```
 

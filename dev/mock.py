@@ -35,6 +35,9 @@ GUESTS = [
     # no guest agent, doesn't answer ARP, but cloud-init sets a static IP
     {"vmid": 107, "name": "ci-node", "type": "qemu", "status": "running", "ip": "10.10.10.17", "ports": [22, 9000],
      "agent": False, "no_arp": True, "silent": True, "cloudinit": True},
+    # on the SDN VNet "labnet", got its address from the Proxmox DHCP (dnsmasq) - found through the SDN IPAM
+    {"vmid": 108, "name": "builder", "type": "qemu", "status": "running", "ip": "10.20.30.101", "ports": [22], "agent": False,
+     "no_arp": True, "silent": True, "bridge": "labnet"},
 ]
 
 
@@ -59,7 +62,31 @@ SCENARIOS = {
     "no-fail2ban": "fail2ban is not installed (use the Install button)",
     "no-wireguard": "wireguard-tools is not installed (use the Install button)",
     "dnat-80": "another tool's iptables rule forwards ports 80/443 to a firewall VM instead of the host's nginx",
+    "no-dnsmasq": "dnsmasq is not installed (SDN DHCP needs it; use the Install button on the Network tab)",
+    "no-sdn": "old Proxmox VE (7.4) without the SDN API",
+    "sdn-pending": "an SDN change was made in the Proxmox UI and not applied yet",
 }
+
+
+def default_sdn():
+    """Proxmox SDN: one simple zone with DHCP, a VNet with a subnet, a PowerDNS plugin. cfg = edited, running = applied."""
+    cfg = {"zones": [{"zone": "lab", "type": "simple", "ipam": "pve", "dhcp": "dnsmasq", "dns": "pdns",
+                      "dnszone": "lab.example.com"}],
+           "vnets": [{"vnet": "labnet", "zone": "lab", "alias": "lab network", "type": "vnet"}],
+           "subnets": [{"subnet": "lab-10.20.30.0-24", "vnet": "labnet", "zone": "lab", "type": "subnet",
+                        "gateway": "10.20.30.1", "snat": 1, "dhcp-dns-server": "1.1.1.1",
+                        "dhcp-range": ["start-address=10.20.30.100,end-address=10.20.30.200"]}]}
+    sub = {"zone": "lab", "vnet": "labnet", "subnet": "10.20.30.0/24"}
+    return {"cfg": cfg, "running": json.loads(json.dumps(cfg)), "version": "8.2.4", "dnsmasq": True,
+            "dns": [{"dns": "pdns", "type": "powerdns", "url": "http://10.10.10.53:8081/api/v1/servers/localhost",
+                     "key": "mock-secret-api-key", "ttl": 300}],
+            "ipam": [dict(sub, ip="10.20.30.1", gateway=1),
+                     dict(sub, ip="10.20.30.101", mac=_mac(108), hostname="builder.lab.example.com", vmid=108),
+                     dict(sub, ip="10.20.30.50", mac="52:54:00:12:34:56")]}
+
+
+def _sdn_id(o):
+    return o.get("subnet") if o.get("type") == "subnet" else o.get("vnet") if o.get("type") == "vnet" else o.get("zone")
 
 PVEFW_OK = """[OPTIONS]
 enable: 1
@@ -165,6 +192,7 @@ def default_state():
                                               "nginx-botsearch": {"failed": 0, "failed_total": 31, "banned_total": 4,
                                                                   "ips": ["66.133.109.36"]}}},
         "nginx_test_fail": False,
+        "sdn": default_sdn(),
         "issued": {"cloud.example.com": {"names": ["cloud.example.com"], "expires": time.time() + 61 * 86400},
                    "wildcard.example.com": {"names": ["example.com", "*.example.com"], "expires": time.time() + 75 * 86400}},
     }
@@ -202,6 +230,12 @@ class Mock:
             with open(os.path.join(apt, "pve-enterprise.sources"), "w") as f:
                 f.write("Types: deb\nURIs: https://enterprise.proxmox.com/debian/pve\nSuites: bookworm\n"
                         "Components: pve-enterprise\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n")
+        ifs = os.path.join(self.root, "etc/network/interfaces")
+        if not os.path.exists(ifs):
+            os.makedirs(os.path.dirname(ifs))
+            with open(ifs, "w") as f:
+                f.write("auto lo\niface lo inet loopback\n\nauto vmbr0\niface vmbr0 inet static\n\taddress %s/24\n"
+                        "\tbridge-ports enp3s0\n\nsource /etc/network/interfaces.d/*\n" % HOST_IP)
         self.node = node
         self.lock = threading.RLock()
         os.makedirs(conf_dir, exist_ok=True)
@@ -386,7 +420,18 @@ server {
         return dict(SCENARIOS)
 
     def ifaces(self):
-        return ["enp3s0", "vmbr0", "vmbr1"]
+        return ["enp3s0", "vmbr0", "vmbr1"] + [v["vnet"] for v in self._sdn(self._load())["running"]["vnets"]]
+
+    def _sdn(self, st):
+        return st.setdefault("sdn", default_sdn())
+
+    def _sdn_addrs(self, st):
+        """[(vnet, gateway/prefix, network)] for applied subnets - SDN puts the gateway on the VNet bridge."""
+        sdn = self._sdn(st)
+        if not sdn.get("version", "").startswith("8"):
+            return []
+        return [(s["vnet"], "%s/%s" % (s["gateway"], s["subnet"].rsplit("-", 1)[1]),
+                 "%s/%s" % tuple(s["subnet"].split("-")[1:])) for s in sdn["running"]["subnets"] if s.get("gateway")]
 
     def tcp_probe(self, ip, port):
         """('ok'|'refused'|'timeout', ms) for a TCP connect from the host."""
@@ -444,6 +489,12 @@ server {
                                          % HOST_IP)
             elif name == "no-wireguard":
                 st["wg"] = {"installed": False, "up": []}
+            elif name == "no-dnsmasq":
+                self._sdn(st)["dnsmasq"] = False
+            elif name == "no-sdn":
+                self._sdn(st)["version"] = "7.4-17"
+            elif name == "sdn-pending":
+                self._sdn(st)["cfg"]["vnets"][0]["alias"] = "lab network (renamed)"
             elif name == "no-fail2ban":
                 st["f2b"] = {"installed": False, "jails": {}}
             elif name == "pvefw-no-http":
@@ -647,6 +698,7 @@ server {
                 "enp3s0           UP             ",
                 "vmbr0            UP             %s/24" % HOST_IP,
                 "vmbr1            UP             %s/24" % BRIDGE_IP,
+            ] + ["%-16s UP             %s" % (v, a) for v, a, n in self._sdn_addrs(st)] + [
                 "tap100i0         UNKNOWN        ",
                 "veth101i0@if2    UP             ",
             ]), False
@@ -656,7 +708,7 @@ server {
                 "10.10.10.0/24 dev vmbr1 proto kernel scope link src %s" % BRIDGE_IP,
                 "192.168.1.0/24 dev vmbr0 proto kernel scope link src %s" % HOST_IP,
                 "192.168.50.0/24 via 10.10.10.254 dev vmbr1",
-            ]), False
+            ] + ["%s dev %s proto kernel scope link src %s" % (n, v, a.split("/")[0]) for v, a, n in self._sdn_addrs(st)]), False
         return 1, "(mock) unsupported ip call", False
 
     def c_ping(self, st, a, data):
@@ -857,6 +909,9 @@ server {
 
     def c_apt_get(self, st, a, data):
         time.sleep(1.5)
+        if "dnsmasq" in a:
+            self._sdn(st)["dnsmasq"] = True
+            return 0, "Setting up dnsmasq (2.90-4) ...", True
         if "wireguard-tools" in a:
             st["wg"]["installed"] = True
             return 0, "Setting up wireguard-tools (1.0.20210914-1.1) ...", True
@@ -869,7 +924,9 @@ server {
         return 0, "", False
 
     def c_systemctl(self, st, a, data):
-        if a[-1].startswith("wg-quick@"):
+        if a[-1].startswith("dnsmasq@") and a[0] == "is-active" and not self._sdn(st)["dnsmasq"]:
+            return 4, "inactive", False
+        if a[-1].startswith(("wg-quick@", "dnsmasq")):
             return 0, "", False
         if a[-1] != "nginx":
             return 1, "(mock) only nginx is simulated", False
@@ -1030,7 +1087,170 @@ server {
         if re.match(r"^/nodes/[^/]+/firewall/options$", path) and verb == "set":
             fw["node_enable"] = int(opts.get("enable", 1))
             return 0, "", True
+        if path == "/version" or path.startswith("/cluster/sdn") or "/tasks/UPID:" in path:
+            return self._pvesh_sdn(st, verb, path, a)
         return 1, "(mock) unsupported pvesh call: %s %s" % (verb, path), False
+
+    def _pvesh_sdn(self, st, verb, path, a):
+        sdn = self._sdn(st)
+        if path == "/version":
+            return 0, json.dumps({"version": sdn["version"], "release": sdn["version"][:3], "repoid": "0123abcd"}), False
+        if "/tasks/UPID:" in path:
+            return 0, json.dumps({"status": "stopped", "exitstatus": "OK", "type": "reloadnetworkall"}), False
+        if not sdn["version"].startswith("8"):
+            return 255, "No '%s' handler defined for '%s'" % (verb, path), False
+        o, i = {}, 2
+        while i < len(a) - 1:
+            if a[i].startswith("--"):
+                if a[i] == "--dhcp-range":
+                    o.setdefault("dhcp-range", []).append(a[i + 1])
+                else:
+                    o[a[i][2:]] = a[i + 1]
+                i += 2
+            else:
+                i += 1
+        o.pop("output-format", None)
+        pending = o.pop("pending", None) == "1"
+        cfg, running = sdn["cfg"], sdn["running"]
+        if path == "/cluster/sdn" and verb == "set":
+            sdn["running"] = json.loads(json.dumps(cfg))
+            out = ["#version:%d" % int(time.time())]
+            for v in cfg["vnets"]:
+                out += ["", "auto %s" % v["vnet"], "iface %s" % v["vnet"]]
+                for x in cfg["subnets"]:
+                    if x["vnet"] == v["vnet"] and x.get("gateway"):
+                        out.append("\taddress %s/%s" % (x["gateway"], x["subnet"].rsplit("-", 1)[1]))
+                        if x.get("snat"):
+                            out.append("\tpost-up iptables -t nat -A POSTROUTING -s '%s/%s' -o vmbr0 -j SNAT --to-source %s"
+                                       % (tuple(x["subnet"].split("-")[1:]) + (HOST_IP,)))
+                out += ["\tbridge_ports none", "\tbridge_stp off", "\tbridge_fd 0"]
+            p = self.path_for("/etc/network/interfaces.d/sdn")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write("\n".join(out) + "\n")
+            time.sleep(1)
+            return 0, "UPID:%s:0001F2A3:00C0FFEE:6530A1B2:reloadnetworkall::root@pam:" % self.node, True
+        if path == "/cluster/sdn/dns" and verb == "get":
+            return 0, json.dumps(sdn["dns"]), False
+        if path == "/cluster/sdn/ipams/pve/status" and verb == "get":
+            return 0, json.dumps(sdn["ipam"]), False
+
+        def listing(kind, keep=lambda x: True):
+            items = [x for x in cfg[kind] if keep(x)]
+            if not pending:
+                return 0, json.dumps([dict(x, cidr="%s/%s" % tuple(x["subnet"].split("-")[1:])) if kind == "subnets" else x
+                                      for x in items]), False
+            run_ = {_sdn_id(x): x for x in running[kind] if keep(x)}
+            now = {_sdn_id(x): x for x in items}
+            out = []
+            for k in sorted(set(run_) | set(now)):
+                if k not in run_:
+                    out.append({"type": now[k].get("type"), kind[:-1]: k, "state": "new", "pending": now[k]})
+                elif k not in now:
+                    out.append(dict(run_[k], state="deleted"))
+                elif run_[k] != now[k]:
+                    out.append(dict(run_[k], state="changed", pending={x: y for x, y in now[k].items() if run_[k].get(x) != y}))
+                else:
+                    out.append(dict(run_[k]))
+            return 0, json.dumps(out), False
+
+        def find(kind, oid):
+            return next((x for x in cfg[kind] if _sdn_id(x) == oid), None)
+
+        def update(obj):
+            for k in o.pop("delete", "").split(","):
+                obj.pop(k, None)
+            obj.update({k: (int(v) if k == "snat" else v) for k, v in o.items()})
+            return 0, "", True
+
+        if path == "/cluster/sdn/zones":
+            if verb == "get":
+                return listing("zones")
+            if find("zones", o.get("zone")):
+                return 255, "sdn 'zones' config - zone ID '%s' already defined" % o.get("zone"), False
+            cfg["zones"].append(dict(o))
+            return 0, "", True
+        m = re.match(r"^/cluster/sdn/zones/([^/]+)$", path)
+        if m:
+            z = find("zones", m.group(1))
+            if not z:
+                return 255, "sdn zone '%s' does not exist" % m.group(1), False
+            if verb == "delete":
+                if any(v["zone"] == z["zone"] for v in cfg["vnets"]):
+                    return 255, "Can't delete zone %s: vnets are still using it" % z["zone"], False
+                cfg["zones"].remove(z)
+                return 0, "", True
+            return update(z)
+        if path == "/cluster/sdn/vnets":
+            if verb == "get":
+                return listing("vnets")
+            if find("vnets", o.get("vnet")):
+                return 255, "sdn 'vnets' config - vnet ID '%s' already defined" % o.get("vnet"), False
+            cfg["vnets"].append(dict(o, type="vnet"))
+            return 0, "", True
+        m = re.match(r"^/cluster/sdn/vnets/([^/]+)(?:/(subnets|ips)(?:/([^/]+))?)?$", path)
+        if not m or not find("vnets", m.group(1)):
+            return 255, "sdn vnet '%s' does not exist" % (m.group(1) if m else path), False
+        v = find("vnets", m.group(1))
+        if not m.group(2):
+            if verb == "delete":
+                if any(s["vnet"] == v["vnet"] for s in cfg["subnets"]):
+                    return 255, "Can't delete vnet %s: subnets are still defined" % v["vnet"], False
+                cfg["vnets"].remove(v)
+                return 0, "", True
+            return update(v)
+        if m.group(2) == "subnets" and not m.group(3):
+            if verb == "get":
+                return listing("subnets", lambda x: x["vnet"] == v["vnet"])
+            net, _, plen = o.pop("subnet").partition("/")
+            sid = "%s-%s-%s" % (v["zone"], net, plen)
+            if find("subnets", sid):
+                return 255, "sdn 'subnets' config - subnet ID '%s' already defined" % sid, False
+            cfg["subnets"].append(dict(o, subnet=sid, vnet=v["vnet"], zone=v["zone"], type="subnet",
+                                       snat=int(o.get("snat", 0))))
+            if o.get("gateway"):
+                sdn["ipam"].append({"zone": v["zone"], "vnet": v["vnet"], "subnet": "%s/%s" % (net, plen),
+                                    "ip": o["gateway"], "gateway": 1})
+            return 0, "", True
+        if m.group(2) == "subnets":
+            sub = find("subnets", m.group(3))
+            if not sub:
+                return 255, "sdn subnet '%s' does not exist" % m.group(3), False
+            cidr = "%s/%s" % tuple(sub["subnet"].split("-")[1:])
+            if verb == "delete":
+                if any(e["subnet"] == cidr and not e.get("gateway") for e in sdn["ipam"]):
+                    return 255, "cannot delete subnet '%s', not empty" % cidr, False
+                sdn["ipam"] = [e for e in sdn["ipam"] if e["subnet"] != cidr]
+                cfg["subnets"].remove(sub)
+                return 0, "", True
+            old_gw = sub.get("gateway")
+            update(sub)
+            for e in sdn["ipam"]:
+                if e["subnet"] == cidr and e.get("gateway"):
+                    e["ip"] = sub.get("gateway", old_gw)
+            return 0, "", True
+        if m.group(2) == "ips":
+            if verb == "create":
+                sub = next((x for x in cfg["subnets"] if x["vnet"] == v["vnet"] and
+                            o["ip"].startswith(x["subnet"].split("-")[1].rsplit(".", 1)[0] + ".")), None)
+                if any(e["ip"] == o["ip"] for e in sdn["ipam"]):
+                    return 255, "IP '%s' already exist" % o["ip"], False
+                e = {"zone": o["zone"], "vnet": v["vnet"], "subnet": "%s/%s" % tuple(sub["subnet"].split("-")[1:]) if sub else "",
+                     "ip": o["ip"], "mac": o["mac"]}
+                if o.get("vmid"):
+                    e["vmid"] = int(o["vmid"])
+                sdn["ipam"].append(e)
+                return 0, "", True
+            if verb == "delete":
+                before = len(sdn["ipam"])
+                sdn["ipam"] = [e for e in sdn["ipam"] if not (e["vnet"] == v["vnet"] and e["ip"] == o.get("ip"))]
+                return (0, "", True) if len(sdn["ipam"]) < before else (255, "IP '%s' not found" % o.get("ip"), False)
+        return 1, "(mock) unsupported pvesh call: %s %s" % (verb, path), False
+
+    def c_dnsmasq(self, st, a, data):
+        if not self._sdn(st)["dnsmasq"]:
+            return 127, "(command not found: dnsmasq)", False
+        return 0, "Dnsmasq version 2.90  Copyright (c) 2000-2024 Simon Kelley", False
 
     def c_ip6tables(self, st, a, data):
         return self.c_iptables(st, ["-t", "filter6"] + (a[2:] if a[:2] == ["-t", "filter"] else a), data)
@@ -1044,7 +1264,7 @@ server {
             if not g:
                 return 2, "Configuration file 'nodes/%s/qemu-server/%s.conf' does not exist" % (self.node, a[1]), False
             lines = ["boot: order=scsi0", "cores: 2", "memory: 4096", "name: " + g["name"],
-                     "net0: virtio=%s,bridge=vmbr1,firewall=1" % _mac(g["vmid"]).upper(), "ostype: l26",
+                     "net0: virtio=%s,bridge=%s,firewall=1" % (_mac(g["vmid"]).upper(), g.get("bridge", "vmbr1")), "ostype: l26",
                      "scsi0: local-lvm:vm-%d-disk-0,size=32G" % g["vmid"]]
             if g.get("agent"):
                 lines.insert(0, "agent: 1")

@@ -4,6 +4,17 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.8.0 - 2026-10-16
+- Network tab - DHCP, IPAM and DNS through Proxmox SDN (PVE 8.1+), using the Proxmox API, so everything also shows up in
+  the Proxmox UI: simple zones with DHCP (dnsmasq), VNets (bridges; shows which guests use them), subnets with
+  gateway, SNAT, DHCP ranges and the DNS server for clients, IPAM list with reservations (pick the guest's NIC), DNS
+  plugin and domain per zone. Changes stay pending until "Apply SDN changes". Install button for dnsmasq.
+- Overlap checks against host networks, other subnets and WireGuard tunnels. VNets that guests still use can't be deleted.
+- Guest IPs: guests that got an address from SDN DHCP are found through the IPAM (no guest agent needed).
+- Firewall: DHCP is allowed on DHCP VNets only (both backends), never on the uplink.
+- Debug: SDN checks (dnsmasq, interfaces.d included, pending changes, VNet bridges, DHCP servers) and raw SDN state.
+  DNS plugin API keys are never read into the API or the debug report.
+
 ## 1.7.0 - 2026-10-16
 - VPN tab - WireGuard: create tunnels (suggested free subnet, port, public endpoint, guest networks for clients),
   server keys generated on the host, up now and at boot (wg-quick@). Peers: devices (keys generated, client config

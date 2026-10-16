@@ -112,6 +112,8 @@ await shot("security", { hash: "#security", height: 760, setup: `
   document.querySelector('#f2bMyIp').textContent = '203.0.113.7';` });
 await shot("vpn", { hash: "#vpn", fit: true, setup: `
   ${waitFor("document.querySelectorAll('#wgTunnels tbody tr').length > 1")}` });
+await shot("network", { hash: "#network", fit: true, setup: `
+  ${waitFor("document.querySelectorAll('#sdnIpam tr').length > 1")}` });
 await shot("debug", { hash: "#debug", height: 900, setup: `
   ${waitFor("document.querySelectorAll('#checks li').length > 3")}
   ${CLEAN}

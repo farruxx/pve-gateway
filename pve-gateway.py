@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.7.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.8.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -715,8 +715,9 @@ def _clean(ips):
     return [i for i in dict.fromkeys(ips) if IPV4_RE.match(i) and not i.startswith(("127.", "169.254."))]
 
 
-def _guest_ips(g, neigh):
-    """{"ips", "source", "hint"}: guest agent / lxc first, then ARP by MAC, then static config."""
+def _guest_ips(g, neigh, ipam=None):
+    """{"ips", "source", "hint"}: guest agent / lxc first, then ARP by MAC, SDN IPAM by MAC, then static config."""
+    ipam = ipam or {}
     vmid, running = str(g["vmid"]), g.get("status") == "running"
     if g["type"] == "lxc":
         if running:
@@ -726,6 +727,10 @@ def _guest_ips(g, neigh):
                 return {"ips": ips, "source": "lxc", "hint": ""}
         rc, out = run(["pct", "config", vmid], check_only=True)
         ips = _clean(re.findall(r"\bip=(\d+\.\d+\.\d+\.\d+)", out)) if rc == 0 else []
+        if not ips and rc == 0:
+            ips = _clean(ip for mac in re.findall(r"hwaddr=([0-9A-Fa-f:]{17})", out) for ip in ipam.get(mac.lower(), []))
+            if ips:
+                return {"ips": ips, "source": "ipam", "hint": ""}
         return {"ips": ips, "source": "config" if ips else None,
                 "hint": "" if ips else "container uses DHCP and is not running"}
     rc, conf = run(["qm", "config", vmid], check_only=True)
@@ -747,6 +752,9 @@ def _guest_ips(g, neigh):
         ips = _clean(ip for mac in macs for ip in neigh.get(mac, []))
         if ips:
             return {"ips": ips, "source": "arp", "hint": ""}
+    ips = _clean(ip for mac in macs for ip in ipam.get(mac, []))
+    if ips:
+        return {"ips": ips, "source": "ipam", "hint": ""}
     ips = _clean(re.findall(r"^ipconfig\d+:.*\bip=(\d+\.\d+\.\d+\.\d+)", conf, re.M))
     if ips:
         return {"ips": ips, "source": "cloud-init", "hint": ""}
@@ -771,13 +779,17 @@ def list_guests():
     except ValueError:
         return []
     neigh = neighbors()
+    ipam = {}
+    for e in sdn_ipam() if SDN_CACHE["data"] is None or SDN_CACHE["data"]["available"] else []:
+        if e["mac"]:
+            ipam.setdefault(e["mac"], []).append(e["ip"])
     with ThreadPoolExecutor(8) as ex:
-        found = list(ex.map(lambda g: _guest_ips(g, neigh), items))
+        found = list(ex.map(lambda g: _guest_ips(g, neigh, ipam), items))
         missing = [i for i, (g, f) in enumerate(zip(items, found))
                    if not f["ips"] and g["type"] == "qemu" and g.get("status") == "running"]
         if missing and arp_sweep():
             neigh = neighbors()
-            for i, f in zip(missing, ex.map(lambda i: _guest_ips(items[i], neigh), missing)):
+            for i, f in zip(missing, ex.map(lambda i: _guest_ips(items[i], neigh, ipam), missing)):
                 found[i] = f
     data = sorted((dict({"vmid": g["vmid"], "name": g.get("name", ""), "type": g["type"],
                          "status": g.get("status", "")}, **f) for g, f in zip(items, found)),
@@ -1834,6 +1846,37 @@ def enterprise_repos():
     return found
 
 
+def sdn_checks(add):
+    """Only on hosts that use SDN zones: dnsmasq, pending changes, VNet bridges up, DHCP servers running."""
+    try:
+        sdn = sdn_state()
+    except ApiError as e:
+        return add("Proxmox SDN", "warn", str(e))
+    if not sdn["available"] or not sdn["zones"]:
+        return
+    dhcp = [z["zone"] for z in sdn["zones"] if z["dhcp"] and z["state"] != "deleted"]
+    if dhcp and sh(["dnsmasq", "--version"])[0] != 0:
+        add("SDN DHCP: dnsmasq", "fail", "zone(s) %s hand out DHCP but dnsmasq is missing - Network tab > Install dnsmasq "
+            "(or: apt install dnsmasq && systemctl disable --now dnsmasq)" % ", ".join(dhcp))
+    if not interfaces_sourced():
+        add("SDN: /etc/network/interfaces", "fail", "add 'source /etc/network/interfaces.d/*' at the end, then Apply on the Network tab")
+    add("SDN changes applied", _st(not sdn["pending"], warn=True),
+        "all applied" if not sdn["pending"] else "pending changes - Network tab > Apply SDN changes")
+    up = {n["iface"] for n in host_networks()}
+    for v in sdn["vnets"]:
+        if v["state"] in ("new", "deleted") or not v["subnets"]:
+            continue
+        add("SDN VNet %s" % v["vnet"], _st(v["vnet"] in up),
+            "bridge up, gateway %s" % ", ".join(x["gateway"] for x in v["subnets"]) if v["vnet"] in up else
+            "bridge has no address - Apply on the Network tab, or run: ifreload -a")
+    for z in dhcp:
+        if next(x for x in sdn["zones"] if x["zone"] == z)["state"] == "new":
+            continue
+        rc, out = sh(["systemctl", "is-active", "dnsmasq@%s" % z])
+        add("SDN DHCP server (zone %s)" % z, _st(rc == 0), "dnsmasq@%s %s" % (z, "running" if rc == 0 else
+            "not running - journalctl -u dnsmasq@%s" % z))
+
+
 def checks():
     cfg = STATE["cfg"]
     res = []
@@ -1893,6 +1936,7 @@ def checks():
             online = sum(1 for x in stt["peers"].values() if x["online"])
             add("WireGuard %s" % t["name"], _st(stt["up"]), "up, %d/%d peers online, UDP %d" % (online, len(t["peers"]), t["port"])
                 if stt["up"] else "down - try: wg-quick up %s; journalctl -u wg-quick@%s" % (t["name"], t["name"]))
+    sdn_checks(add)
     fw = cfg["firewall"]
     if fw["enabled"]:
         add("firewall", "ok", "%s backend, policy %s, %d rule(s)%s" % (
@@ -2027,6 +2071,10 @@ def sections():
         {"title": "Config " + conf_file(), "text": json.dumps(safe_cfg, indent=2)},
         {"title": "wg show (keys hidden)", "text": re.sub(r"(private key|preshared key): \S+", r"\1: (hidden)",
                                                            sh(["wg", "show"])[1]) if cfg["wireguard"]["tunnels"] else "(no tunnels)"},
+        {"title": "Proxmox SDN (zones, VNets, subnets, IPAM, DNS plugins without keys)",
+         "text": json.dumps(sdn_state(fresh=True), indent=1)},
+        {"title": "/etc/network/interfaces.d/sdn", "text": _read(MOCK.path_for("/etc/network/interfaces.d/sdn") if MOCK else
+                                                                 "/etc/network/interfaces.d/sdn") or "(not written - no SDN applied)"},
     ] + ([
         {"title": "nginx config " + cfg["nginx_conf"], "text": _read(nginx_conf_path(cfg)) or "(not written yet)"},
         {"title": "nginx -t", "text": sh(["nginx", "-t"])[1]},
@@ -2720,7 +2768,8 @@ def validate_fw(data, old, cfg):
 
 
 def fw_safety(cfg):
-    """Rules the firewall always keeps open (before the user's rules) so the host stays manageable."""
+    """Rules the firewall always keeps open (before the user's rules) so the host stays manageable.
+    (action, proto, ports, source, why, in-interface)"""
     f = cfg["firewall"]
     ui_src = cfg.get("ui_allow") or [""]
     rules = [("ACCEPT", "tcp", ["22"], "", "safety: SSH"), ("ACCEPT", "tcp", ["8006"], "", "safety: Proxmox UI")]
@@ -2734,6 +2783,9 @@ def fw_safety(cfg):
             rules.append(("ACCEPT", "udp", [str(t["port"])], "", "safety: WireGuard %s" % t["name"]))
     if f.get("allow_ping"):
         rules.append(("ACCEPT", "icmp", [], "", "ping"))
+    rules = [r + ("",) for r in rules]
+    if f.get("enabled"):  # guests on SDN VNets ask the host's dnsmasq for an address
+        rules += [("ACCEPT", "udp", ["67"], "", "safety: DHCP on %s" % v, v) for v in sdn_dhcp_vnets()]
     return rules
 
 
@@ -2749,10 +2801,10 @@ def fw_iptables(cfg, v6):
         out += ["-A %s -p ipv6-icmp -m icmp6 --icmpv6-type %s -j ACCEPT" % (CH_IN, t)
                 for t in ("neighbour-solicitation", "neighbour-advertisement", "router-advertisement", "packet-too-big")]
 
-    def emit(action, proto, ports, src, tag):
+    def emit(action, proto, ports, src, tag, iface=""):
         if src and (":" in src) != v6:
             return
-        base = "-A %s" % CH_IN + (" -s %s" % src if src else "")
+        base = "-A %s" % CH_IN + (" -i %s" % iface if iface else "") + (" -s %s" % src if src else "")
         target = "-j %s" % action + (" --reject-with %s" % ("icmp6-port-unreachable" if v6 else "icmp-port-unreachable")
                                      if action == "REJECT" else "")
         cm = '-m comment --comment "gw:fw:%s"' % tag
@@ -2764,8 +2816,8 @@ def fw_iptables(cfg, v6):
         else:
             out.append("%s -p %s -m multiport --dports %s %s %s" % (base, proto, ",".join(p.replace("-", ":") for p in ports),
                                                                      cm, target))
-    for action, proto, ports, src, why in fw_safety(cfg):
-        emit(action, proto, ports, src, "safety")
+    for action, proto, ports, src, why, iface in fw_safety(cfg):
+        emit(action, proto, ports, src, "safety", iface)
     for r in f["rules"]:
         if r["enabled"]:
             emit(r["action"], r["proto"], r["ports"], r["source"], r["id"])
@@ -2817,9 +2869,9 @@ def apply_fw_pve(cfg):
             return "cannot delete Proxmox firewall rule %d: %s" % (r["pos"], out)
     wanted = []
     if f["enabled"]:
-        wanted = [(a, p, ports, src, "safety: " + why.split(": ", 1)[-1]) for a, p, ports, src, why in fw_safety(cfg)]
-        wanted += [(r["action"], r["proto"], r["ports"], r["source"], r["comment"] or r["id"]) for r in f["rules"] if r["enabled"]]
-    for pos, (action, proto, ports, src, why) in enumerate(wanted):
+        wanted = [(a, p, ports, src, "safety: " + why.split(": ", 1)[-1], i) for a, p, ports, src, why, i in fw_safety(cfg)]
+        wanted += [(r["action"], r["proto"], r["ports"], r["source"], r["comment"] or r["id"], "") for r in f["rules"] if r["enabled"]]
+    for pos, (action, proto, ports, src, why, iface) in enumerate(wanted):
         cmd = ["pvesh", "create", "/nodes/%s/firewall/rules" % node, "--type", "in", "--action", action, "--enable", "1",
                "--pos", str(pos), "--comment", ("pvegw: " + why)[:60]]
         if proto == "icmp":
@@ -2828,6 +2880,8 @@ def apply_fw_pve(cfg):
             cmd += ["--proto", proto, "--dport", ",".join(p.replace("-", ":") for p in ports)]
         if src:
             cmd += ["--source", src]
+        if iface:
+            cmd += ["--iface", iface]
         rc, out = run(cmd)
         if rc != 0:
             return "cannot create Proxmox firewall rule (%s): %s" % (why, out[-200:])
@@ -2892,7 +2946,8 @@ def fw_confirm():
 
 def fw_state(cfg):
     f = cfg["firewall"]
-    res = {"settings": f, "safety": [{"action": a, "proto": p, "ports": po, "source": s, "why": w} for a, p, po, s, w in fw_safety(cfg)],
+    res = {"settings": f, "safety": [{"action": a, "proto": p, "ports": po, "source": s, "why": w, "iface": i}
+                                        for a, p, po, s, w, i in fw_safety(cfg)],
            "pending": max(0, int(FW_PENDING["deadline"] - time.time())) if FW_PENDING.get("deadline") else 0,
            "templates": {k: v[0] for k, v in FW_TEMPLATES.items()}, "other_rules": [], "pve_enabled": None}
     rc, st = sh(["pve-firewall", "status"])
@@ -3200,6 +3255,378 @@ def wg_save(new, old, user, what):
         save_config(new)
         STATE["cfg"] = new
     log("%s %s" % (user, what))
+
+
+# --------------------------------------------------------------------------- sdn (DHCP / IPAM / DNS)
+# Everything lives in Proxmox SDN (/etc/pve/sdn, cluster-wide), driven through pvesh - pve-gateway keeps no copy.
+# Edits are "pending" in Proxmox until applied (Apply = `pvesh set /cluster/sdn`, reloads the node networks).
+
+SDN_ID_RE = re.compile(r"^[a-z][a-z0-9]{1,7}$")  # Proxmox: zone / vnet ids, 2-8 chars
+SDN_SUBNET_RE = re.compile(r"^[a-z][a-z0-9]{1,7}-[0-9.]+-\d{1,2}$")  # <zone>-<network>-<prefix>
+MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
+SDN_JOB = {"state": None, "msg": ""}
+SDN_CACHE = {"t": 0, "data": None}
+NIC_CACHE = {"t": 0, "data": []}
+
+
+def sdn_error(out):
+    out = (out or "").strip()
+    if re.search(r"No '\w+' handler defined|Method '[^']+' not implemented|command not found", out):
+        return "Proxmox SDN isn't available here - it needs Proxmox VE 8.1 or newer (apt install libpve-network-perl on 8.0)"
+    return out.splitlines()[-1][:300] if out else "pvesh failed"
+
+
+def pvesh_get(path, *args):
+    rc, out = sh(["pvesh", "get", path, "--output-format", "json"] + list(args), timeout=20)
+    if rc != 0:
+        raise ApiError(sdn_error(out), 502)
+    try:
+        return json.loads(out or "null")
+    except ValueError:
+        raise ApiError("unexpected answer from pvesh get %s" % path, 502)
+
+
+def pvesh_do(verb, path, opts=None, delete=()):
+    """pvesh create|set|delete <path> --key value ... (list values repeat the option); --delete clears options."""
+    cmd = ["pvesh", verb, path]
+    for k, v in (opts or {}).items():
+        for x in v if isinstance(v, list) else [v]:
+            cmd += ["--" + k, str(x)]
+    if delete:
+        cmd += ["--delete", ",".join(delete)]
+    rc, out = run(cmd, timeout=60)
+    SDN_CACHE["t"] = 0
+    if rc != 0:
+        raise ApiError(sdn_error(out), 400)
+    return out
+
+
+def _dhcp_ranges(v):
+    """Proxmox returns dhcp-range as property strings or objects: -> [[start, end], ...]."""
+    res = []
+    for x in v if isinstance(v, list) else ([v] if v else []):
+        if isinstance(x, str):
+            x = dict(kv.split("=", 1) for kv in x.split(",") if "=" in kv)
+        if isinstance(x, dict) and x.get("start-address") and x.get("end-address"):
+            res.append([x["start-address"], x["end-address"]])
+    return res
+
+
+def pve_version():
+    try:
+        v = pvesh_get("/version").get("version", "")
+    except (ApiError, AttributeError):
+        return "", False
+    m = re.match(r"^(\d+)\.(\d+)", v)
+    return v, bool(m) and (int(m.group(1)), int(m.group(2))) >= (8, 1)
+
+
+def interfaces_sourced():
+    """SDN writes /etc/network/interfaces.d/sdn - the main file has to include that directory."""
+    p = MOCK.path_for("/etc/network/interfaces") if MOCK else "/etc/network/interfaces"
+    return bool(re.search(r"^\s*(source\s+/etc/network/interfaces\.d/\*|source-directory\s+/etc/network/interfaces\.d)",
+                          _read(p) or "", re.M))
+
+
+def guest_nics():
+    """[{vmid, name, nic, mac, bridge}] for every guest NIC - shows which guests sit on which VNet."""
+    if time.time() - NIC_CACHE["t"] < 30:
+        return NIC_CACHE["data"]
+    res = []
+    for g in list_guests():
+        rc, conf = run(["qm" if g["type"] == "qemu" else "pct", "config", str(g["vmid"])], check_only=True)
+        for nic, opts in re.findall(r"^(net\d+):\s*(\S+)", conf if rc == 0 else "", re.M):
+            mac = re.search(r"(?:^|,)(?:\w+|hwaddr)=([0-9A-Fa-f:]{17})", opts)
+            br = re.search(r"(?:^|,)bridge=([^,]+)", opts)
+            if mac and br:
+                res.append({"vmid": g["vmid"], "name": g["name"], "nic": nic, "mac": mac.group(1).lower(), "bridge": br.group(1)})
+    NIC_CACHE.update(t=time.time(), data=res)
+    return res
+
+
+def sdn_ipam():
+    """IPAM entries of the built-in Proxmox IPAM (gateways, DHCP leases, reservations)."""
+    try:
+        items = pvesh_get("/cluster/sdn/ipams/pve/status") or []
+    except ApiError:
+        return []
+    return [{"zone": x.get("zone", ""), "vnet": x.get("vnet", ""), "subnet": x.get("subnet", ""), "ip": x.get("ip", ""),
+             "mac": str(x.get("mac", "")).lower(), "hostname": x.get("hostname", ""), "vmid": x.get("vmid"),
+             "gateway": bool(x.get("gateway"))} for x in items if isinstance(x, dict) and x.get("ip")]
+
+
+def sdn_state(fresh=False):
+    """Zones, VNets (with subnets), IPAM and DNS plugins as the UI shows them; 10 s cache."""
+    if not fresh and SDN_CACHE["data"] and time.time() - SDN_CACHE["t"] < 10:
+        return SDN_CACHE["data"]
+    res = {"available": False, "error": "", "zones": [], "vnets": [], "ipam": [], "dns": [], "pending": False}
+    try:
+        zones = pvesh_get("/cluster/sdn/zones") or []
+    except ApiError as e:
+        res["error"] = str(e)
+        SDN_CACHE.update(t=time.time(), data=res)
+        return res
+    res["available"] = True
+
+    def states(path, key):  # {id: "new"|"changed"|"deleted"} for objects not applied yet
+        try:
+            return {x[key]: x["state"] for x in pvesh_get(path, "--pending", "1") or [] if x.get(key) and x.get("state")}
+        except ApiError:
+            return {}
+    zst, vst = states("/cluster/sdn/zones", "zone"), states("/cluster/sdn/vnets", "vnet")
+    for z in zones:
+        res["zones"].append({"zone": z.get("zone"), "type": z.get("type", ""), "dhcp": z.get("dhcp", ""), "ipam": z.get("ipam", ""),
+                             "dns": z.get("dns", ""), "reversedns": z.get("reversedns", ""), "dnszone": z.get("dnszone", ""),
+                             "state": zst.get(z.get("zone"), "")})
+    res["zones"] += [{"zone": k, "type": "", "dhcp": "", "ipam": "", "dns": "", "reversedns": "", "dnszone": "", "state": v}
+                     for k, v in zst.items() if v == "deleted"]
+    try:
+        vnets = pvesh_get("/cluster/sdn/vnets") or []
+    except ApiError as e:
+        vnets, res["error"] = [], str(e)
+    for v in vnets + [{"vnet": k, "zone": "", "deleted": True} for k, s in vst.items() if s == "deleted"]:
+        name = v.get("vnet")
+        subs, sst = [], {}
+        if not v.get("deleted"):
+            try:
+                subs = pvesh_get("/cluster/sdn/vnets/%s/subnets" % name) or []
+            except ApiError as e:
+                res["error"] = str(e)
+            sst = states("/cluster/sdn/vnets/%s/subnets" % name, "subnet")
+        res["vnets"].append({
+            "vnet": name, "zone": v.get("zone", ""), "alias": v.get("alias", ""), "tag": v.get("tag"),
+            "state": vst.get(name, ""),
+            "subnets": [{"id": s.get("subnet"), "cidr": s.get("cidr") or s.get("subnet", "").split("-", 1)[-1].replace("-", "/"),
+                         "gateway": s.get("gateway", ""), "snat": bool(s.get("snat")),
+                         "dhcp_range": _dhcp_ranges(s.get("dhcp-range")), "dns_server": s.get("dhcp-dns-server", ""),
+                         "state": sst.get(s.get("subnet"), "")} for s in subs]
+                       + [{"id": k, "cidr": k.split("-", 1)[-1].replace("-", "/"), "gateway": "", "snat": False, "dhcp_range": [],
+                           "dns_server": "", "state": "deleted"} for k, s in sst.items() if s == "deleted"]})
+    res["ipam"] = sdn_ipam()
+    try:  # never pass the plugin's API key on
+        res["dns"] = [{"dns": d.get("dns"), "type": d.get("type", ""), "url": d.get("url", "")} for d in pvesh_get("/cluster/sdn/dns") or []]
+    except ApiError:
+        pass
+    res["pending"] = any(x["state"] for x in res["zones"] + res["vnets"]) or \
+        any(s["state"] for v in res["vnets"] for s in v["subnets"])
+    SDN_CACHE.update(t=time.time(), data=res)
+    return res
+
+
+def sdn_dhcp_vnets():
+    """Applied VNets whose zone hands out DHCP - the host firewall must let DHCP requests in on them."""
+    try:
+        s = sdn_state()
+    except ApiError:
+        return []
+    dhcp = {z["zone"] for z in s["zones"] if z["dhcp"] and z["state"] != "new"}
+    return sorted(v["vnet"] for v in s["vnets"] if v["zone"] in dhcp and v["state"] != "new")
+
+
+def validate_sdn_zone(data, sdn, zid=None):
+    """-> (opts for pvesh, options to delete). New zones are always 'simple' (one host, no VLAN setup needed)."""
+    opts, delete = {}, []
+    if not zid:
+        zid = str(data.get("zone", "")).strip()
+        if not SDN_ID_RE.match(zid):
+            raise ApiError("zone id: 2-8 lowercase letters/digits, starting with a letter (e.g. lab)")
+        if any(z["zone"] == zid for z in sdn["zones"]):
+            raise ApiError("zone %s already exists" % zid)
+        opts.update(zone=zid, type="simple", ipam="pve")
+    if data.get("dhcp"):
+        opts["dhcp"] = "dnsmasq"
+    elif zid:
+        delete.append("dhcp")
+    plugins = {d["dns"] for d in sdn["dns"]}
+    for k in ("dns", "reversedns"):
+        v = str(data.get(k, "") or "").strip()
+        if v and v not in plugins:
+            raise ApiError("unknown DNS plugin %s - add it in Proxmox: Datacenter > SDN > Options > DNS" % v)
+        if v:
+            opts[k] = v
+        else:
+            delete.append(k)
+    dz = str(data.get("dnszone", "") or "").strip().lower().rstrip(".")
+    if dz and not HOSTNAME_RE.match(dz):
+        raise ApiError("DNS zone must be a domain, e.g. lab.example.com")
+    if (opts.get("dns") or opts.get("reversedns")) and not dz:
+        raise ApiError("set the DNS zone (domain) the guests' names are registered in")
+    if dz:
+        opts["dnszone"] = dz
+    else:
+        delete.append("dnszone")
+    return opts, [] if "type" in opts else delete
+
+
+def validate_sdn_vnet(data, sdn):
+    vid = str(data.get("vnet", "")).strip()
+    if not SDN_ID_RE.match(vid):
+        raise ApiError("VNet name: 2-8 lowercase letters/digits, starting with a letter (it becomes the bridge name)")
+    if any(v["vnet"] == vid for v in sdn["vnets"]):
+        raise ApiError("VNet %s already exists" % vid)
+    if vid in list_ifaces() or any(n["iface"] == vid for n in host_networks()):
+        raise ApiError("%s is already an interface on this host - pick another name" % vid)
+    zone = next((z for z in sdn["zones"] if z["zone"] == data.get("zone")), None)
+    if not zone or zone["state"] == "deleted":
+        raise ApiError("pick the zone this VNet belongs to")
+    if zone["type"] != "simple":
+        raise ApiError("zone %s is a %s zone - create its VNets in the Proxmox UI (they need a VLAN tag etc.)" % (zone["zone"], zone["type"]))
+    alias = str(data.get("alias", "") or "").strip()
+    if not NAME_RE.match(alias):
+        raise ApiError("description: up to 40 chars, letters/digits/space/_.:/@+- only")
+    return {"vnet": vid, "zone": zone["zone"]}, alias
+
+
+def _sdn_ip(v, net, what):
+    try:
+        ip = ipaddress.IPv4Address(str(v).strip())
+    except ValueError:
+        raise ApiError("%s must be an IPv4 address in %s" % (what, net))
+    if ip not in net or ip in (net.network_address, net.broadcast_address):
+        raise ApiError("%s %s is not a usable address in %s" % (what, ip, net))
+    return ip
+
+
+def validate_sdn_subnet(data, vnet, sdn, cfg, sid=None):
+    """-> pvesh opts. IPv4; must not clash with host networks, other subnets or WireGuard tunnels."""
+    if sid:
+        cur = next((s for s in vnet["subnets"] if s["id"] == sid), None)
+        net = ipaddress.IPv4Network(cur["cidr"])
+    else:
+        try:
+            net = ipaddress.IPv4Network(str(data.get("cidr", "")).strip(), strict=False)
+        except ValueError:
+            raise ApiError("subnet must be like 10.20.30.0/24")
+        if not 8 <= net.prefixlen <= 29:
+            raise ApiError("subnet size: /8 to /29")
+        if not net.is_private:
+            raise ApiError("use a private range (10.x, 172.16-31.x, 192.168.x) - guests get it via DHCP/NAT")
+        for v in sdn["vnets"]:
+            for s in v["subnets"]:
+                if s["state"] != "deleted" and ipaddress.ip_network(s["cidr"]).overlaps(net):
+                    raise ApiError("%s overlaps subnet %s on VNet %s" % (net, s["cidr"], v["vnet"]))
+        for n in host_networks():
+            if n["iface"] != vnet["vnet"] and ipaddress.ip_network(n["network"]).overlaps(net):
+                raise ApiError("%s overlaps the host network %s on %s" % (net, n["network"], n["iface"]))
+        for t in cfg["wireguard"]["tunnels"]:
+            if ipaddress.ip_interface(t["address"]).network.overlaps(net):
+                raise ApiError("%s overlaps WireGuard tunnel %s" % (net, t["name"]))
+    gw = _sdn_ip(data.get("gateway") or next(net.hosts()), net, "gateway")
+    opts = {"gateway": str(gw), "snat": 1 if data.get("snat", True) else 0}
+    ranges = []
+    for r in _as_list(data.get("dhcp_range", [])):
+        r = r.strip() if isinstance(r, str) else "-".join(r)
+        if not r:
+            continue
+        a, _, b = r.replace(" ", "").partition("-")
+        start, end = _sdn_ip(a, net, "DHCP range start"), _sdn_ip(b or a, net, "DHCP range end")
+        if start > end:
+            raise ApiError("DHCP range %s: the start must come before the end" % r)
+        if start <= gw <= end:
+            raise ApiError("DHCP range %s contains the gateway %s" % (r, gw))
+        ranges.append("start-address=%s,end-address=%s" % (start, end))
+    zone = next((z for z in sdn["zones"] if z["zone"] == vnet["zone"]), {})
+    if ranges and not zone.get("dhcp"):
+        raise ApiError("zone %s has DHCP off - turn it on in the zone first" % vnet["zone"])
+    dns = str(data.get("dns_server", "") or "").strip()
+    if dns and not _is_ip(dns):
+        raise ApiError("DNS server for DHCP clients must be an IP address")
+    if not sid:
+        opts.update(subnet=str(net), type="subnet")
+    delete = []
+    for k, v in (("dhcp-range", ranges), ("dhcp-dns-server", dns)):
+        if v:
+            opts[k] = v
+        elif sid:
+            delete.append(k)
+    return opts, delete
+
+
+def validate_sdn_ip(data, vnet, sdn):
+    """A fixed IP for a MAC address (DHCP reservation) in the Proxmox IPAM."""
+    try:
+        ip = ipaddress.IPv4Address(str(data.get("ip", "")).strip())
+    except ValueError:
+        raise ApiError("IP must be an IPv4 address")
+    sub = next((s for s in vnet["subnets"] if s["state"] != "deleted" and ip in ipaddress.ip_network(s["cidr"])), None)
+    if not sub:
+        raise ApiError("%s is not in a subnet of %s (%s)" % (ip, vnet["vnet"], ", ".join(s["cidr"] for s in vnet["subnets"]) or "none yet"))
+    _sdn_ip(ip, ipaddress.ip_network(sub["cidr"]), "IP")
+    if str(ip) == sub["gateway"]:
+        raise ApiError("%s is the gateway" % ip)
+    mac = str(data.get("mac", "")).strip().lower().replace("-", ":")
+    if not MAC_RE.match(mac):
+        raise ApiError("MAC must look like bc:24:11:12:34:56 (Proxmox shows it on the guest's network device)")
+    for e in sdn["ipam"]:
+        if e["ip"] == str(ip):
+            raise ApiError("%s is already used by %s" % (ip, e["hostname"] or e["mac"] or "the gateway"))
+        if e["mac"] == mac and e["vnet"] == vnet["vnet"]:
+            raise ApiError("%s already has %s - delete that entry first" % (mac, e["ip"]))
+    opts = {"zone": vnet["zone"], "ip": str(ip), "mac": mac}
+    if str(data.get("vmid", "") or "").strip():
+        try:
+            opts["vmid"] = int(data["vmid"])
+        except (TypeError, ValueError):
+            raise ApiError("VM ID must be a number")
+    return opts
+
+
+def sdn_apply():
+    """`pvesh set /cluster/sdn` starts a task that rewrites the SDN network config on every node; wait for it."""
+    if SDN_JOB.get("state") == "pending":
+        return
+    SDN_JOB.update(state="pending", msg="applying SDN configuration ...", t=time.time())
+
+    def job():
+        rc, out = run(["pvesh", "set", "/cluster/sdn"], timeout=120)
+        err = None if rc == 0 else sdn_error(out)
+        upid = re.search(r"UPID:\S+", out or "")
+        for _ in range(120) if upid and not err else []:
+            try:
+                st = pvesh_get("/nodes/%s/tasks/%s/status" % (node_name(), upid.group(0)))
+            except ApiError as e:
+                err = str(e)
+                break
+            if st.get("status") == "stopped":
+                if st.get("exitstatus") != "OK":
+                    err = "Proxmox reported: %s (see Datacenter > SDN in the Proxmox UI or the task log)" % st.get("exitstatus")
+                break
+            time.sleep(1)
+        NET_CACHE["data"], SDN_CACHE["t"], GUEST_CACHE["t"], NIC_CACHE["t"] = None, 0, 0, 0
+        SDN_JOB.update(state="error" if err else "ok", msg=err or "SDN configuration applied", t=time.time())
+        log("SDN apply: %s" % (err or "ok"), "error" if err else "info")
+        if not err and STATE["cfg"]["firewall"]["enabled"]:  # DHCP on new VNets
+            e2 = apply_fw(STATE["cfg"])
+            if e2:
+                log("firewall after SDN apply: %s" % e2, "warn")
+
+    threading.Thread(target=job, daemon=True).start()
+
+
+def dnsmasq_install():
+    """Proxmox runs one dnsmasq per zone (dnsmasq@<zone>); the default instance must stay off."""
+    if SDN_JOB.get("state") == "pending":
+        return
+    SDN_JOB.update(state="pending", msg="installing dnsmasq ...", t=time.time())
+
+    def job():
+        rc, out = run(["apt-get", "install", "-y", "-q", "dnsmasq"], timeout=600)
+        if rc == 0:
+            run(["systemctl", "disable", "--now", "dnsmasq"])
+        SDN_JOB.update(state="ok" if rc == 0 else "error", t=time.time(),
+                       msg="dnsmasq installed" if rc == 0 else "apt-get install failed: %s" % out[-300:])
+
+    threading.Thread(target=job, daemon=True).start()
+
+
+def sdn_info():
+    """GET /api/sdn: SDN state + host requirements + which guest NICs are on which VNet."""
+    s = dict(sdn_state())
+    ver, dhcp_ok = pve_version()
+    s.update(version=ver, dhcp_ok=dhcp_ok, dnsmasq=sh(["dnsmasq", "--version"])[0] == 0, sourced=interfaces_sourced(), job=SDN_JOB)
+    vnets = {v["vnet"] for v in s["vnets"]}
+    s["nics"] = [n for n in guest_nics() if n["bridge"] in vnets] if s["available"] else []
+    return s
 
 
 # --------------------------------------------------------------------------- updates
@@ -3557,6 +3984,19 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/wireguard/tunnels(?:/([0-9a-f]{1,16}))?(?:/peers(?:/([0-9a-f]{1,16}))?(/config)?)?$", path)
         if m:
             return self.wireguard_api(method, path, m.group(1), m.group(2), bool(m.group(3)), user)
+        if path == "/api/sdn" and method == "GET":
+            return self.send(200, sdn_info())
+        if path == "/api/sdn/install" and method == "POST":
+            dnsmasq_install()
+            log("%s started the dnsmasq installation" % user)
+            return self.send(200, {"ok": True})
+        if path == "/api/sdn/apply" and method == "POST":
+            sdn_apply()
+            log("%s applied the SDN configuration" % user)
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/sdn/(zones|vnets)(?:/([a-z][a-z0-9]{1,7}))?(?:/(subnets|ips)(?:/([0-9a-z.-]{1,40}))?)?$", path)
+        if m:
+            return self.sdn_api(method, m.group(1), m.group(2), m.group(3), m.group(4), user)
         if path == "/api/firewall" and method == "GET":
             return self.send(200, dict(fw_state(cfg), client_ip=self.client_ip()))
         if path == "/api/firewall" and method == "PUT":
@@ -3919,6 +4359,101 @@ class Handler(BaseHTTPRequestHandler):
             result["peer"] = peer["id"]
         return self.send(200, result)
 
+    def sdn_api(self, method, kind, oid, sub, sid, user):
+        with LOCK:
+            sdn = sdn_state(fresh=True)
+            if not sdn["available"]:
+                raise ApiError(sdn["error"])
+            if kind == "zones":
+                z = next((x for x in sdn["zones"] if x["zone"] == oid), None) if oid else None
+                if sub or (oid and not z):
+                    raise ApiError("zone not found", 404)
+                if method == "POST" and not oid:
+                    opts, _ = validate_sdn_zone(self.body(), sdn)
+                    pvesh_do("create", "/cluster/sdn/zones", opts)
+                    what = "created SDN zone %s" % opts["zone"]
+                elif method == "PUT" and z:
+                    opts, delete = validate_sdn_zone(self.body(), sdn, oid)
+                    pvesh_do("set", "/cluster/sdn/zones/" + oid, opts, delete)
+                    what = "changed SDN zone %s" % oid
+                elif method == "DELETE" and z:
+                    left = [v["vnet"] for v in sdn["vnets"] if v["zone"] == oid and v["state"] != "deleted"]
+                    if left:
+                        raise ApiError("zone %s still has VNets (%s) - delete them first" % (oid, ", ".join(left)))
+                    pvesh_do("delete", "/cluster/sdn/zones/" + oid)
+                    what = "deleted SDN zone %s" % oid
+                else:
+                    raise ApiError("method not allowed", 405)
+                log("%s %s" % (user, what))
+                return self.send(200, {"ok": True})
+            v = next((x for x in sdn["vnets"] if x["vnet"] == oid), None) if oid else None
+            if oid and not v:
+                raise ApiError("VNet not found", 404)
+            base = "/cluster/sdn/vnets/%s" % oid
+            if not sub:
+                if method == "POST" and not oid:
+                    opts, alias = validate_sdn_vnet(self.body(), sdn)
+                    if alias:
+                        opts["alias"] = alias
+                    pvesh_do("create", "/cluster/sdn/vnets", opts)
+                    what = "created SDN VNet %s" % opts["vnet"]
+                elif method == "PUT" and v:
+                    alias = str(self.body().get("alias", "") or "").strip()
+                    if not NAME_RE.match(alias):
+                        raise ApiError("description: up to 40 chars, letters/digits/space/_.:/@+- only")
+                    pvesh_do("set", base, {"alias": alias} if alias else {}, [] if alias else ["alias"])
+                    what = "changed SDN VNet %s" % oid
+                elif method == "DELETE" and v:
+                    nics = ["%s (%s)" % (n["name"] or n["vmid"], n["nic"]) for n in guest_nics() if n["bridge"] == oid]
+                    if nics:
+                        raise ApiError("still used by %s - move those network devices to another bridge first" % ", ".join(nics))
+                    if any(s_["state"] != "deleted" for s_ in v["subnets"]):
+                        raise ApiError("delete the subnets of %s first" % oid)
+                    pvesh_do("delete", base)
+                    what = "deleted SDN VNet %s" % oid
+                else:
+                    raise ApiError("method not allowed", 405)
+            elif sub == "subnets" and v:
+                s_ = next((x for x in v["subnets"] if x["id"] == sid), None) if sid else None
+                if sid and (not s_ or not SDN_SUBNET_RE.match(sid)):
+                    raise ApiError("subnet not found", 404)
+                if method == "POST" and not sid:
+                    opts, _ = validate_sdn_subnet(self.body(), v, sdn, STATE["cfg"])
+                    pvesh_do("create", base + "/subnets", opts)
+                    what = "added subnet %s to VNet %s" % (opts["subnet"], oid)
+                elif method == "PUT" and s_:
+                    opts, delete = validate_sdn_subnet(self.body(), v, sdn, STATE["cfg"], sid)
+                    pvesh_do("set", base + "/subnets/" + sid, opts, delete)
+                    what = "changed subnet %s" % s_["cidr"]
+                elif method == "DELETE" and s_:
+                    pvesh_do("delete", base + "/subnets/" + sid)
+                    what = "deleted subnet %s" % s_["cidr"]
+                else:
+                    raise ApiError("method not allowed", 405)
+            elif sub == "ips" and v:
+                if method == "POST" and not sid:
+                    opts = validate_sdn_ip(self.body(), v, sdn)
+                    pvesh_do("create", base + "/ips", opts)
+                    what = "reserved %s for %s on %s" % (opts["ip"], opts["mac"], oid)
+                elif method == "DELETE" and sid:
+                    e = next((x for x in sdn["ipam"] if x["vnet"] == oid and x["ip"] == sid), None)
+                    if not e:
+                        raise ApiError("no IPAM entry for %s on %s" % (sid, oid), 404)
+                    if e["gateway"]:
+                        raise ApiError("that is the subnet's gateway - change the subnet instead")
+                    opts = {"zone": v["zone"], "ip": sid}
+                    if e["mac"]:
+                        opts["mac"] = e["mac"]
+                    pvesh_do("delete", base + "/ips", opts)
+                    what = "removed IPAM entry %s on %s" % (sid, oid)
+                else:
+                    raise ApiError("method not allowed", 405)
+            else:
+                raise ApiError("not found", 404)
+        GUEST_CACHE["t"] = 0
+        log("%s %s" % (user, what))
+        return self.send(200, {"ok": True})
+
     def wildcards_api(self, method, wid, cfg, user):
         with LOCK:
             wcs = list(cfg["wildcards"])
@@ -4091,7 +4626,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="app" hidden>
   <header>
     <h1 class="brand"><img src="/favicon.svg" alt="" width="26" height="26">PVE Gateway</h1>
-    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#monitor" data-view="monitor">Monitor</a><a href="#security" data-view="security">Security</a><a href="#vpn" data-view="vpn">VPN</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
+    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#monitor" data-view="monitor">Monitor</a><a href="#security" data-view="security">Security</a><a href="#vpn" data-view="vpn">VPN</a><a href="#network" data-view="network">Network</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
     <div id="status" class="chips"></div>
     <span class="spacer"></span>
     <span id="who" class="muted"></span>
@@ -4259,6 +4794,27 @@ INDEX_HTML = r"""<!doctype html>
     <p class="muted small">Clients reach the tunnel network and the routes you list (e.g. the guest bridges). With NAT on, guests see
       this host's bridge address, so they need no route back to the VPN. The WireGuard port is opened in pve-gateway's firewall automatically.</p>
   </main>
+  <main id="view-network" hidden>
+    <div class="sub-head" style="margin-top:0"><h2>Network: DHCP, IPAM &amp; DNS</h2><span id="sdnState"></span><span class="spacer"></span>
+      <button type="button" id="sdnInstall" hidden>Install dnsmasq</button>
+      <button type="button" id="sdnNewZone" class="ghost" hidden>+ Zone</button></div>
+    <p id="sdnMsg" class="muted small"></p>
+    <div id="sdnPending" class="card pending-bar" hidden><span>Changes are saved in Proxmox but not active yet.</span>
+      <span class="spacer"></span><button type="button" id="sdnApply">Apply SDN changes</button></div>
+    <ul id="sdnReq" class="checks card" hidden></ul>
+    <div id="sdnZones"></div>
+    <div id="sdnIpamBox" hidden>
+      <div class="sub-head"><h2>IPAM</h2><span class="muted small">addresses Proxmox has handed out or reserved</span><span class="spacer"></span>
+        <button type="button" id="sdnNewIp" class="ghost">+ Reservation</button></div>
+      <div class="card scroll"><table>
+        <thead><tr><th>IP</th><th>VNet</th><th>MAC</th><th>Guest / name</th><th>Type</th><th></th></tr></thead>
+        <tbody id="sdnIpam"></tbody></table></div>
+    </div>
+    <p class="muted small">Uses Proxmox SDN (Datacenter &gt; SDN), so everything also shows up in the Proxmox UI. A VNet is a bridge:
+      set a guest's network device to it (Hardware &gt; Network Device &gt; Bridge). With DHCP on, guests get an address from the subnet's
+      range and Proxmox records it in the IPAM. With SNAT on, they reach the internet through this host, and you forward ports to them on the Ports tab.
+      DNS names need a DNS plugin (PowerDNS), set up in the Proxmox UI under Datacenter &gt; SDN &gt; Options.</p>
+  </main>
   <main id="view-settings" hidden>
     <div class="card form-card">
       <h2>Updates</h2>
@@ -4383,6 +4939,66 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <p id="fwFormErr" class="err"></p>
     <div class="actions"><button type="button" id="fwCancel" class="ghost">Cancel</button><button type="submit">OK</button></div>
+  </form>
+</dialog>
+
+<dialog id="sdnZDlg">
+  <form id="sdnZForm" class="form">
+    <h2 id="sdnZTitle">New zone</h2>
+    <div class="grid">
+      <label>Zone ID<input name="zone" maxlength="8" placeholder="e.g. lab" spellcheck="false"></label>
+      <label class="check"><input type="checkbox" name="dhcp" checked> DHCP (dnsmasq)</label>
+      <label>DNS plugin<select name="dns"></select></label>
+      <label>Reverse DNS plugin<select name="reversedns"></select></label>
+      <label class="wide">DNS zone (domain for guest names)<input name="dnszone" placeholder="optional, e.g. lab.example.com" spellcheck="false"></label>
+    </div>
+    <p class="muted small">New zones are "simple" zones: isolated bridges on this host, with no VLAN setup needed. The Proxmox IPAM keeps track of the addresses.</p>
+    <p id="sdnZErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" data-close>Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="sdnVDlg">
+  <form id="sdnVForm" class="form">
+    <h2 id="sdnVTitle">New VNet</h2>
+    <div class="grid">
+      <label>Name (bridge)<input name="vnet" maxlength="8" placeholder="e.g. labnet" spellcheck="false"></label>
+      <label>Zone<select name="zone"></select></label>
+      <label class="wide">Description<input name="alias" maxlength="40" placeholder="optional"></label>
+    </div>
+    <p id="sdnVErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" data-close>Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="sdnSDlg">
+  <form id="sdnSForm" class="form">
+    <h2 id="sdnSTitle">New subnet</h2>
+    <div class="grid">
+      <label>Subnet<input name="cidr" placeholder="10.20.30.0/24" spellcheck="false"></label>
+      <label>Gateway (this host)<input name="gateway" placeholder="first address" spellcheck="false"></label>
+      <label class="wide dhcp-only">DHCP ranges (start-end, one per line)<textarea name="dhcp_range" rows="2" spellcheck="false" placeholder="10.20.30.100-10.20.30.200"></textarea></label>
+      <label class="dhcp-only">DNS server for DHCP clients<input name="dns_server" placeholder="optional, e.g. 1.1.1.1" spellcheck="false"></label>
+      <label class="check"><input type="checkbox" name="snat" checked> SNAT (internet through this host)</label>
+    </div>
+    <p id="sdnSErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" data-close>Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="sdnIDlg">
+  <form id="sdnIForm" class="form">
+    <h2>New IP reservation</h2>
+    <div class="grid">
+      <label>VNet<select name="vnet"></select></label>
+      <label>Guest network device<select name="nic"></select></label>
+      <label>MAC address<input name="mac" placeholder="bc:24:11:12:34:56" spellcheck="false"></label>
+      <label>IP address<input name="ip" spellcheck="false"></label>
+      <label>VM / CT ID<input name="vmid" inputmode="numeric" placeholder="optional"></label>
+    </div>
+    <p class="muted small">The guest always gets this address from DHCP. A running guest picks it up when it renews its lease (or after a restart).</p>
+    <p id="sdnIErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" data-close>Cancel</button><button type="submit">Save</button></div>
   </form>
 </dialog>
 
@@ -4557,6 +5173,9 @@ form > .hint{margin:12px 0 0}
 #wcFields:empty{display:none}
 .names a{color:var(--fg);text-decoration:none;font-weight:500}.names a:hover{text-decoration:underline}
 .names .alias{display:block;color:var(--muted);font-size:12px}
+.pending-bar{display:flex;align-items:center;gap:10px;padding:10px 14px;margin-bottom:12px;border-color:var(--warn);background:var(--warn-bg);color:var(--warn)}
+#view-network .sub-head{flex-wrap:wrap}#view-network .sub-head button{white-space:nowrap}
+tr.sub td:first-child{padding-left:22px}#sdnZones td .chip{margin-left:6px;font-family:inherit}
 .mockbar{padding:12px 14px;margin-bottom:12px;display:flex;flex-direction:column;gap:6px;border-style:dashed;border-color:var(--warn)}
 .mockbtns{display:flex;flex-wrap:wrap;gap:6px}.mockbtns button{padding:4px 10px;font-size:12px}
 @media (max-width:560px){.grid{grid-template-columns:1fr}header,main{padding-left:16px;padding-right:16px}}
@@ -4623,6 +5242,7 @@ async function load() {
     if (!document.hidden && view === 'monitor' && !$('#monDlg').open) loadMonitor();
     if (!document.hidden && view === 'security') { loadSecurity(); if (!$('#fwDlg').open) loadFirewall(); }
     if (!document.hidden && view === 'vpn' && ![...document.querySelectorAll('dialog')].some(x => x.open)) loadVpn();
+    if (!document.hidden && view === 'network' && ![...document.querySelectorAll('dialog')].some(x => x.open)) loadNetwork();
   }, 5000);
 }
 
@@ -4712,7 +5332,7 @@ async function fillGuests(sel = $('#ruleForm').guest) {
   sel.replaceChildren(el('option', {value: '', textContent: guests.length ? '— pick a guest to fill its IP —' : '— no guests found —'}));
   for (const g of guests) {
     const label = g.vmid + ' ' + (g.name || '') + ' (' + (g.type === 'lxc' ? 'CT' : 'VM') + (g.status !== 'running' ? ', ' + g.status : '') + ')';
-    const src = {agent: '', lxc: '', arp: ' · from ARP', 'cloud-init': ' · cloud-init', config: ' · config'}[g.source] || '';
+    const src = {agent: '', lxc: '', arp: ' · from ARP', ipam: ' · SDN IPAM', 'cloud-init': ' · cloud-init', config: ' · config'}[g.source] || '';
     if (!g.ips.length) sel.append(el('option', {value: '', disabled: true, title: g.hint || '',
       textContent: label + ' — IP unknown' + (g.hint && g.status === 'running' ? ' (' + (/agent/.test(g.hint) ? 'no guest agent' : g.hint) + ')' : '')}));
     for (const ip of g.ips) sel.append(el('option', {value: ip, textContent: label + ' — ' + ip + src}));
@@ -5294,6 +5914,152 @@ $('#wgPCancel').onclick = () => $('#wgPDlg').close();
 $('#wgNewTunnel').onclick = () => openWgTunnel(null);
 $('#wgInstall').onclick = async () => { await api('POST', '/api/wireguard/install', {}).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); };
 
+// ---- Network: Proxmox SDN (zones, VNets, subnets with DHCP, IPAM, DNS)
+let SDN = null, sdnZEdit = null, sdnSEdit = null, sdnSVnet = null, sdnErr = '';
+const sdnState = s => s ? el('span', {class: 'chip warn', textContent: s, title: 'not applied yet - click Apply SDN changes'}) : null;
+async function loadNetwork() {
+  try { SDN = await api('GET', '/api/sdn'); renderNetwork(); } catch (e) { $('#sdnMsg').textContent = e.message; }
+  if (SDN && SDN.job && SDN.job.state === 'pending' && view === 'network') setTimeout(loadNetwork, 1000);  // apply / install running
+}
+function renderNetwork() {
+  const s = SDN, job = s.job || {};
+  $('#sdnState').replaceChildren(el('span', {class: 'chip ' + (s.available ? 'ok' : 'bad'),
+    textContent: s.available ? 'Proxmox SDN' + (s.version ? ' · PVE ' + s.version : '') : 'SDN not available'}));
+  $('#sdnNewZone').hidden = !s.available;
+  $('#sdnInstall').hidden = !s.available || s.dnsmasq; $('#sdnInstall').disabled = job.state === 'pending';
+  $('#sdnPending').hidden = !s.pending; $('#sdnApply').disabled = job.state === 'pending';
+  $('#sdnMsg').className = sdnErr ? 'err' : 'muted small';
+  $('#sdnMsg').textContent = sdnErr || (!s.available || s.error) ? sdnErr || s.error : job.state === 'pending' || job.state === 'error' || (job.state === 'ok' && Date.now() / 1000 - job.t < 15) ? job.msg :
+    !s.zones.length ? 'No zone yet - click + Zone, then add a VNet and a subnet with a DHCP range.' : '';
+  const req = [];
+  if (s.available && !s.dhcp_ok) req.push({status: 'warn', name: 'DHCP needs Proxmox VE 8.1 or newer', detail: 'This host runs ' + (s.version || 'an older version') + '. Zones and VNets work; DHCP ranges do not.'});
+  if (s.available && !s.dnsmasq) req.push({status: s.zones.some(z => z.dhcp) ? 'fail' : 'warn', name: 'dnsmasq is not installed', detail: 'Proxmox uses it for SDN DHCP - click Install dnsmasq (or run: apt install dnsmasq && systemctl disable --now dnsmasq).'});
+  if (s.available && !s.sourced) req.push({status: 'fail', name: '/etc/network/interfaces does not include interfaces.d', detail: 'Add this line at the end, or SDN bridges never come up:\nsource /etc/network/interfaces.d/*'});
+  $('#sdnReq').hidden = !req.length; renderChecks($('#sdnReq'), req);
+  const nicsOn = v => s.nics.filter(n => n.bridge === v);
+  $('#sdnZones').replaceChildren(...s.zones.map(z => {
+    const vnets = s.vnets.filter(v => v.zone === z.zone || (v.state === 'deleted' && !v.zone && z.state === 'deleted'));
+    const rows = [];
+    for (const v of vnets) {
+      const g = nicsOn(v.vnet);
+      rows.push(el('tr', {class: v.state === 'deleted' ? 'off' : ''},
+        el('td', {class: 'names'}, el('b', {class: 'mono', textContent: v.vnet}), v.alias ? el('span', {class: 'alias', textContent: v.alias}) : null, sdnState(v.state)),
+        el('td', {colSpan: 4, class: 'small', textContent: g.length ? 'Guests: ' + g.map(n => (n.name || n.vmid) + ' (' + n.nic + ')').join(', ') : v.state === 'deleted' ? '' : 'no guest uses it yet'}),
+        el('td', {class: 'num'}, v.state === 'deleted' || z.type !== 'simple' ? null : el('button', {class: 'link', textContent: '+ Subnet', onclick: () => openSdnSubnet(v, null)}),
+          v.state === 'deleted' ? null : el('button', {class: 'link', textContent: 'Edit', onclick: () => editSdnVnet(v)}),
+          v.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/vnets/' + v.vnet, null, 'Delete VNet ' + v.vnet + '?')}))));
+      for (const sb of v.subnets) rows.push(el('tr', {class: 'sub' + (sb.state === 'deleted' ? ' off' : '')},
+        el('td', {class: 'mono', textContent: '└ ' + sb.cidr}, sdnState(sb.state)),
+        el('td', {class: 'mono', textContent: sb.gateway || '—'}),
+        el('td', {class: 'mono small', textContent: sb.dhcp_range.length ? sb.dhcp_range.map(r => r.join(' – ')).join(', ') : z.dhcp ? 'no range (static only)' : '—'}),
+        el('td', {class: 'mono small', textContent: sb.dns_server || '—'}),
+        el('td', {}, sb.snat ? el('span', {class: 'tag', textContent: 'snat'}) : null),
+        el('td', {class: 'num'}, sb.state === 'deleted' ? null : el('button', {class: 'link', textContent: 'Edit', onclick: () => openSdnSubnet(v, sb)}),
+          sb.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/vnets/' + v.vnet + '/subnets/' + sb.id, null, 'Delete subnet ' + sb.cidr + '?')}))));
+    }
+    return el('div', {class: 'card form-card', style: 'margin-bottom:14px;max-width:none'},
+      el('div', {class: 'sub-head', style: 'margin:0'}, el('h2', {textContent: 'Zone ' + z.zone}),
+        el('span', {class: 'tag', textContent: z.type || '?'}),
+        el('span', {class: 'chip ' + (z.dhcp ? 'ok' : 'warn'), textContent: z.dhcp ? 'DHCP' : 'no DHCP'}),
+        z.dns ? el('span', {class: 'chip ok', textContent: 'DNS ' + z.dns + (z.dnszone ? ' · ' + z.dnszone : '')}) : null,
+        sdnState(z.state), el('span', {class: 'spacer'}),
+        z.state === 'deleted' || z.type !== 'simple' ? null : el('button', {class: 'ghost', textContent: '+ VNet', onclick: () => openSdnVnet(z.zone)}),
+        z.state === 'deleted' ? null : el('button', {class: 'link', textContent: 'Edit', onclick: () => openSdnZone(z)}),
+        z.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/zones/' + z.zone, null, 'Delete zone ' + z.zone + '?')})),
+      z.type && z.type !== 'simple' ? el('p', {class: 'hint', textContent: 'A ' + z.type + ' zone - VNets and subnets are shown here, but create them in the Proxmox UI (they need VLAN/VXLAN settings).'}) : null,
+      rows.length ? el('div', {class: 'scroll'}, el('table', {},
+        el('thead', {}, el('tr', {}, ...['VNet / subnet', 'Gateway', 'DHCP range', 'DNS for clients', '', ''].map(h => el('th', {textContent: h})))),
+        el('tbody', {}, ...rows))) : el('p', {class: 'muted pad', textContent: z.state === 'deleted' ? '' : 'No VNet yet - click + VNet.'}));
+  }));
+  $('#sdnIpamBox').hidden = !s.available || !s.vnets.length;
+  const guest = id => s.nics.find(n => n.vmid === id);
+  $('#sdnIpam').replaceChildren(...s.ipam.slice().sort((a, b) => a.vnet.localeCompare(b.vnet) || ipNum(a.ip) - ipNum(b.ip)).map(e => {
+    const g = e.vmid ? guest(e.vmid) : null;
+    return el('tr', {},
+      el('td', {class: 'mono', textContent: e.ip}), el('td', {class: 'mono', textContent: e.vnet}),
+      el('td', {class: 'mono small', textContent: e.mac || '—'}),
+      el('td', {class: 'names'}, e.gateway ? 'this host' : g ? (g.name || '') + ' (' + e.vmid + ')' : e.vmid ? String(e.vmid) : '—',
+        e.hostname ? el('span', {class: 'alias', textContent: e.hostname}) : null),
+      el('td', {}, el('span', {class: 'tag', textContent: e.gateway ? 'gateway' : e.vmid ? 'guest' : 'reserved'})),
+      el('td', {class: 'num'}, e.gateway ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () =>
+        sdnDo('DELETE', '/api/sdn/vnets/' + e.vnet + '/ips/' + e.ip, null, 'Remove ' + e.ip + ' from the IPAM? A guest that still uses it keeps it until its lease ends.')})));
+  }));
+}
+function ipNum(ip) { return ip.split('.').reduce((a, x) => a * 256 + (+x || 0), 0); }
+async function sdnDo(method, url, body, ask) {
+  if (ask && !confirm(ask)) return;
+  sdnErr = '';
+  try { await api(method, url, body || {}); } catch (e) { sdnErr = e.message; }
+  loadNetwork();
+}
+async function sdnSubmit(e, dlg, errEl, method, url, data) {
+  e.preventDefault();
+  try { await api(method, url, data); $(dlg).close(); sdnErr = ''; loadNetwork(); } catch (err) { $(errEl).textContent = err.message; }
+}
+function plugins(sel, cur) {
+  sel.replaceChildren(el('option', {value: '', textContent: SDN.dns.length ? 'none' : 'none (no DNS plugin in Proxmox)'}),
+    ...SDN.dns.map(d => el('option', {value: d.dns, textContent: d.dns + ' (' + d.type + ')'})));
+  sel.value = cur || '';
+}
+function openSdnZone(z) {
+  sdnZEdit = z ? z.zone : null; const f = $('#sdnZForm');
+  $('#sdnZTitle').textContent = z ? 'Edit zone ' + z.zone : 'New zone'; $('#sdnZErr').textContent = '';
+  f.zone.value = z ? z.zone : ''; f.zone.disabled = !!z; f.dhcp.checked = z ? !!z.dhcp : SDN.dhcp_ok;
+  plugins(f.dns, z && z.dns); plugins(f.reversedns, z && z.reversedns); f.dnszone.value = z ? z.dnszone : '';
+  $('#sdnZDlg').showModal();
+}
+$('#sdnZForm').addEventListener('submit', e => { const f = e.target;
+  sdnSubmit(e, '#sdnZDlg', '#sdnZErr', sdnZEdit ? 'PUT' : 'POST', '/api/sdn/zones' + (sdnZEdit ? '/' + sdnZEdit : ''),
+    {zone: f.zone.value.trim(), dhcp: f.dhcp.checked, dns: f.dns.value, reversedns: f.reversedns.value, dnszone: f.dnszone.value.trim()}); });
+function openSdnVnet(zone) {
+  const f = $('#sdnVForm'); $('#sdnVErr').textContent = '';
+  f.zone.replaceChildren(...SDN.zones.filter(z => z.type === 'simple' && z.state !== 'deleted').map(z => el('option', {value: z.zone, textContent: z.zone})));
+  f.zone.value = zone; f.vnet.value = ''; f.alias.value = ''; $('#sdnVDlg').showModal(); f.vnet.focus();
+}
+$('#sdnVForm').addEventListener('submit', e => { const f = e.target;
+  sdnSubmit(e, '#sdnVDlg', '#sdnVErr', 'POST', '/api/sdn/vnets', {vnet: f.vnet.value.trim(), zone: f.zone.value, alias: f.alias.value.trim()}); });
+function editSdnVnet(v) {
+  const alias = prompt('Description of VNet ' + v.vnet, v.alias || '');
+  if (alias !== null) sdnDo('PUT', '/api/sdn/vnets/' + v.vnet, {alias});
+}
+function openSdnSubnet(v, sb) {
+  sdnSVnet = v; sdnSEdit = sb ? sb.id : null; const f = $('#sdnSForm');
+  const z = SDN.zones.find(x => x.zone === v.zone) || {};
+  $('#sdnSTitle').textContent = sb ? 'Edit subnet ' + sb.cidr : 'New subnet on ' + v.vnet; $('#sdnSErr').textContent = '';
+  f.cidr.value = sb ? sb.cidr : ''; f.cidr.disabled = !!sb; f.gateway.value = sb ? sb.gateway : '';
+  f.dhcp_range.value = sb ? sb.dhcp_range.map(r => r.join('-')).join('\n') : ''; f.dns_server.value = sb ? sb.dns_server : '';
+  f.snat.checked = sb ? sb.snat : true;
+  for (const x of document.querySelectorAll('#sdnSForm .dhcp-only')) x.hidden = !z.dhcp;
+  $('#sdnSDlg').showModal();
+}
+$('#sdnSForm').cidr.addEventListener('change', e => {  // suggest gateway .1 and a DHCP range in the upper half
+  const f = $('#sdnSForm'), m = e.target.value.trim().match(/^(\d+\.\d+\.\d+)\.\d+\/24$/);
+  if (m && !f.gateway.value) f.gateway.value = m[1] + '.1';
+  if (m && !f.dhcp_range.value && !f.dhcp_range.closest('label').hidden) f.dhcp_range.value = m[1] + '.100-' + m[1] + '.200';
+});
+$('#sdnSForm').addEventListener('submit', e => { const f = e.target;
+  sdnSubmit(e, '#sdnSDlg', '#sdnSErr', sdnSEdit ? 'PUT' : 'POST', '/api/sdn/vnets/' + sdnSVnet.vnet + '/subnets' + (sdnSEdit ? '/' + sdnSEdit : ''),
+    {cidr: f.cidr.value.trim(), gateway: f.gateway.value.trim(), dhcp_range: f.dhcp_range.value.split(/[\n,]+/).map(x => x.trim()).filter(Boolean),
+     dns_server: f.dns_server.value.trim(), snat: f.snat.checked}); });
+function sdnNics() {
+  const f = $('#sdnIForm'), list = SDN.nics.filter(n => n.bridge === f.vnet.value);
+  f.nic.replaceChildren(el('option', {value: '', textContent: list.length ? 'type the MAC yourself' : 'no guest on this VNet - type the MAC'}),
+    ...list.map((n, i) => el('option', {value: i, textContent: (n.name || n.vmid) + ' ' + n.nic + ' (' + n.mac + ')'})));
+  f.nic.onchange = () => { const n = list[f.nic.value]; if (n) { f.mac.value = n.mac; f.vmid.value = n.vmid; } };
+}
+$('#sdnNewIp').onclick = () => {
+  const f = $('#sdnIForm'); $('#sdnIErr').textContent = '';
+  f.vnet.replaceChildren(...SDN.vnets.filter(v => v.state !== 'deleted' && v.subnets.length).map(v => el('option', {value: v.vnet, textContent: v.vnet + ' (' + v.subnets.map(x => x.cidr).join(', ') + ')'})));
+  f.mac.value = ''; f.ip.value = ''; f.vmid.value = ''; sdnNics(); $('#sdnIDlg').showModal();
+};
+$('#sdnIForm').vnet.addEventListener('change', sdnNics);
+$('#sdnIForm').addEventListener('submit', e => { const f = e.target;
+  sdnSubmit(e, '#sdnIDlg', '#sdnIErr', 'POST', '/api/sdn/vnets/' + f.vnet.value + '/ips', {ip: f.ip.value.trim(), mac: f.mac.value.trim(), vmid: f.vmid.value.trim()}); });
+$('#sdnNewZone').onclick = () => openSdnZone(null);
+$('#sdnApply').onclick = () => sdnDo('POST', '/api/sdn/apply');
+$('#sdnInstall').onclick = () => sdnDo('POST', '/api/sdn/install');
+for (const b of document.querySelectorAll('[data-close]')) b.onclick = () => b.closest('dialog').close();
+
 // ---- security: firewall (edits go to a draft; Apply activates it with a 60 s keep/revert window)
 let FW = null, FWD = null, fwEditing = null, fwTick = null;
 async function loadFirewall(force) {
@@ -5538,10 +6304,11 @@ $('#saveSettings').onclick = async () => {
 };
 
 function setView() {
-  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings', '#monitor': 'monitor', '#security': 'security', '#vpn': 'vpn'}[location.hash] || 'rules';
+  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings', '#monitor': 'monitor', '#security': 'security', '#vpn': 'vpn', '#network': 'network'}[location.hash] || 'rules';
   for (const a of document.querySelectorAll('.tabs a')) a.classList.toggle('on', a.dataset.view === view);
-  for (const v of ['rules', 'domains', 'monitor', 'security', 'vpn', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
+  for (const v of ['rules', 'domains', 'monitor', 'security', 'vpn', 'network', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
   if (view === 'vpn' && !$('#app').hidden) loadVpn();
+  if (view === 'network' && !$('#app').hidden) loadNetwork();
   if (view === 'security' && !$('#app').hidden) { loadSecurity(); loadFirewall(); }
   if (view === 'monitor' && !$('#app').hidden) { loadMonitor(); fillScanTargets(); }
   if (view === 'settings' && !$('#app').hidden) loadSettings();

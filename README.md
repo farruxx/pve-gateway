@@ -21,8 +21,8 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 | **Settings**: only the IPs/networks you list can reach the web UI | **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report |
 | ![Health checks, alerts and port scanner](docs/screenshots/monitor.png) | ![Fail2ban jails and settings](docs/screenshots/security.png) |
 | **Monitor**: health checks with uptime and history, alerts (e-mail, webhook, Telegram), port scanner | **Security**: firewall (own iptables or Proxmox firewall), fail2ban jails and banned IPs |
-| ![WireGuard tunnel with peers](docs/screenshots/vpn.png) | |
-| **VPN**: WireGuard tunnel, devices with downloadable configs, sites, live status | |
+| ![WireGuard tunnel with peers](docs/screenshots/vpn.png) | ![Proxmox SDN zones, VNets, DHCP and IPAM](docs/screenshots/network.png) |
+| **VPN**: WireGuard tunnel, devices with downloadable configs, sites, live status | **Network**: Proxmox SDN zones and VNets, subnets with DHCP, IPAM reservations, DNS |
 
 <sub>Screenshots use sample data from the built-in mock mode (`./dev.sh`). Regenerate them with `dev/screenshots.sh`.</sub>
 
@@ -78,7 +78,7 @@ curl -fsSL https://raw.githubusercontent.com/farruxx/pve-gateway/master/install.
 
 ### Guest IPs
 
-The guest picker fills in a VM's IP from the **QEMU guest agent** if one is running. Without the agent it falls back to the host's **ARP table**, matching the VM's MAC address, and then to a **cloud-init** `ipconfig`.
+The guest picker fills in a VM's IP from the **QEMU guest agent** if one is running. Without the agent it falls back to the host's **ARP table**, matching the VM's MAC address, then to the **SDN IPAM** (guests on a DHCP VNet, see [Network](#network-dhcp-ipam-and-dns-proxmox-sdn)), and then to a **cloud-init** `ipconfig`.
 
 A VM whose gateway is another router (for example a firewall VM) never talks to the host itself, so it isn't in the ARP table. For those, the picker briefly probes the addresses on the host's private bridges, at most every 5 minutes and never the uplink, so they answer ARP and show up. For containers, the IP comes from LXC or the container config. If a VM still shows *IP unknown*:
 - install the agent in the VM (`apt install qemu-guest-agent`),
@@ -189,7 +189,7 @@ Service logs: `journalctl -u pve-gateway -f`. To keep verbose logging on permane
 
 ## Local development (macOS)
 
-`--mock` runs everything against a simulated Proxmox host. It needs no root, no iptables and no Proxmox. The mock fakes `iptables`, `iptables-restore`/`-save`, `ip`, `ping`, `ss`, `conntrack`, `pve-firewall`, `pvesh`, `qm`, `pct` and `lxc-info`. The mock code lives in [`dev/mock.py`](dev/mock.py) and is never installed on a host.
+`--mock` runs everything against a simulated Proxmox host. It needs no root, no iptables and no Proxmox. The mock fakes `iptables`, `iptables-restore`/`-save`, `ip`, `ping`, `ss`, `conntrack`, `pve-firewall`, `pvesh` (including SDN), `qm`, `pct`, `lxc-info`, `dnsmasq` and more. The mock code lives in [`dev/mock.py`](dev/mock.py) and is never installed on a host.
 
 ```bash
 ./dev.sh
@@ -226,9 +226,12 @@ To break the host on purpose, run a scenario. They're also available as buttons 
 | `nginx-stopped` | stops nginx, so domain tests fail |
 | `nginx-test-fails` | makes the next `nginx -t` fail, showing the rollback |
 | `cert-expiring` | makes every certificate expire in 5 days |
+| `no-dnsmasq` | dnsmasq is missing, so SDN DHCP can't work (Install button on the Network tab) |
+| `no-sdn` | an old Proxmox VE (7.4) without the SDN API |
+| `sdn-pending` | an SDN change made elsewhere that isn't applied yet |
 | `reset` | wipes the simulated iptables |
 
-The simulated guests are 100 web, 101 db, 102 game (stopped), 103 nextcloud, 104 win11 (no guest agent, ignores ping) and 105 office-gw (behind a gateway). The sample rules show every test outcome. The sample domains are `cloud.example.com` (HTTPS working), `app.example.com` (HTTP only, with an alias) and `broken.invalid` (no DNS and nothing listening upstream). The sample wildcard is `*.example.com` (Cloudflare), used by `status.example.com`. The mock certbot fails for names ending in `.invalid` and succeeds after 2 s for everything else. For wildcards, the API token `bad` gets Cloudflare's "invalid credentials" error, and only the Cloudflare, DigitalOcean and RFC 2136 plugins count as installed, so OVH shows the "plugin missing" message. Generated nginx files end up under `.dev/mock-fs/`. Delete `.dev/` to start over.
+The simulated guests are 100 web, 101 db, 102 game (stopped), 103 nextcloud, 104 win11 (no guest agent, ignores ping), 105 office-gw (behind a gateway) and 108 builder (on the SDN VNet `labnet`, found through the IPAM). The sample SDN has zone `lab` (DHCP, PowerDNS plugin), VNet `labnet` and subnet `10.20.30.0/24`. The sample rules show every test outcome. The sample domains are `cloud.example.com` (HTTPS working), `app.example.com` (HTTP only, with an alias) and `broken.invalid` (no DNS and nothing listening upstream). The sample wildcard is `*.example.com` (Cloudflare), used by `status.example.com`. The mock certbot fails for names ending in `.invalid` and succeeds after 2 s for everything else. For wildcards, the API token `bad` gets Cloudflare's "invalid credentials" error, and only the Cloudflare, DigitalOcean and RFC 2136 plugins count as installed, so OVH shows the "plugin missing" message. Generated nginx files end up under `.dev/mock-fs/`. Delete `.dev/` to start over.
 
 `--dry-run` is different. It's meant for a **real** host: read-only commands run for real, and changes are only logged.
 
@@ -256,6 +259,18 @@ The **VPN** tab sets up WireGuard on the host:
 - **Peer details:** optional pre-shared keys, and live status per peer: online, last handshake, endpoint and traffic.
 
 Peer changes are applied with `wg syncconf`, so connected clients stay connected. There are no free-form `PostUp` lines. NAT for VPN clients (*NAT to guest networks*) and forwarding are pve-gateway iptables rules, and the WireGuard port opens automatically in pve-gateway's firewall. Private keys stay in `/etc/pve-gateway/wireguard/` and `/etc/wireguard/` (mode 0600); they never appear in `config.json`, the API or the debug report.
+
+## Network: DHCP, IPAM and DNS (Proxmox SDN)
+
+The **Network** tab manages [Proxmox SDN](https://pve.proxmox.com/pve-docs/chapter-pvesdn.html) through the Proxmox API, so everything also shows up under *Datacenter → SDN* in the Proxmox UI. pve-gateway keeps no copy of it. It needs Proxmox VE 8.1 or newer.
+
+- **Zones:** new zones are *simple* zones: isolated bridges on this host, with no VLAN setup needed. Each zone can hand out **DHCP** (Proxmox runs one dnsmasq per zone; the **Install dnsmasq** button installs it and turns off the default instance). The built-in Proxmox IPAM keeps track of addresses. VLAN, VXLAN and EVPN zones made in the Proxmox UI are listed but not edited.
+- **VNets** become bridges named after the VNet. To connect a guest, set its network device's bridge to the VNet (*Hardware → Network Device → Bridge*). The tab shows which guests use which VNet, and refuses to delete a VNet that still has guests.
+- **Subnets:** gateway (this host's address on the VNet), **SNAT** (guests reach the internet through the host), DHCP ranges and the DNS server handed to DHCP clients. Subnets that overlap host networks, other subnets or WireGuard tunnels are refused.
+- **IPAM:** every address Proxmox handed out (with the guest and hostname) or reserved. **+ Reservation** pins an IP to a MAC address, and you can pick the guest's NIC instead of typing the MAC.
+- **DNS:** pick a Proxmox SDN DNS plugin (PowerDNS) and a domain per zone, and Proxmox registers the guests' names. Add the plugin itself in the Proxmox UI (*Datacenter → SDN → Options*), so its API key stays in Proxmox; pve-gateway never reads or shows it.
+
+Changes are pending in Proxmox until you click **Apply SDN changes**, the same as in the Proxmox UI. Apply reloads the SDN networks. When pve-gateway's firewall is on, DHCP (UDP 67) is allowed on the DHCP VNets only, never on the uplink. Guests that got their address from SDN DHCP are found through the IPAM in the guest picker, so you can forward ports to them on the Ports tab. The Debug tab checks dnsmasq, `source /etc/network/interfaces.d/*`, pending changes, VNet bridges and the per-zone DHCP servers.
 
 ## Firewall
 
