@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.8.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.8.1"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -4867,8 +4867,9 @@ INDEX_HTML = r"""<!doctype html>
       <label class="wide">Aliases<input name="aliases" placeholder="www.example.com (optional, space separated)" autocapitalize="off" spellcheck="false"></label>
       <label class="check wide"><input type="checkbox" name="alias_redirect"> Aliases redirect (301) to the main domain instead of showing the same site</label>
       <label class="wide">Guest<select name="guest"><option value="">— pick a guest to fill its IP —</option></select></label>
-      <label>Upstream IP<input name="ip" required placeholder="10.10.10.10"></label>
+      <label>Upstream IP<input name="ip" required placeholder="type it or pick a guest" spellcheck="false"></label>
       <label>Upstream port<input name="port" required value="80" inputmode="numeric"></label>
+      <p class="hint wide ip-hint" hidden></p>
       <label class="check wide"><input type="checkbox" name="upstream_https"> Upstream uses HTTPS (self-signed certificates are accepted)</label>
       <label>HTTPS<select name="tls"><option value="letsencrypt">Let's Encrypt (automatic)</option>
         <option value="wildcard">Wildcard certificate (DNS)</option><option value="none">None (HTTP only)</option></select></label>
@@ -5064,8 +5065,9 @@ INDEX_HTML = r"""<!doctype html>
       <label>Protocol<select name="proto"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP + UDP</option></select></label>
       <label>Host port<input name="ext_port" required placeholder="8080 or 8000-8010"></label>
       <label class="wide">Guest<select name="guest"><option value="">— pick a guest to fill its IP —</option></select></label>
-      <label>Destination IP<input name="ip" required placeholder="10.10.10.10"></label>
+      <label>Destination IP<input name="ip" required placeholder="type it or pick a guest" spellcheck="false"></label>
       <label>Destination port<input name="int_port" placeholder="same as host port"></label>
+      <p class="hint wide ip-hint" hidden></p>
       <label>Allowed source<input name="source" placeholder="any (or 203.0.113.0/24)"></label>
       <label>Incoming interface<select name="iface"><option value="">any</option></select></label>
       <label class="check wide"><input type="checkbox" name="masq"> Masquerade (SNAT) &mdash; needed if the guest's gateway is not this host, or to reach it via the public IP from other guests</label>
@@ -5333,8 +5335,8 @@ async function fillGuests(sel = $('#ruleForm').guest) {
   for (const g of guests) {
     const label = g.vmid + ' ' + (g.name || '') + ' (' + (g.type === 'lxc' ? 'CT' : 'VM') + (g.status !== 'running' ? ', ' + g.status : '') + ')';
     const src = {agent: '', lxc: '', arp: ' · from ARP', ipam: ' · SDN IPAM', 'cloud-init': ' · cloud-init', config: ' · config'}[g.source] || '';
-    if (!g.ips.length) sel.append(el('option', {value: '', disabled: true, title: g.hint || '',
-      textContent: label + ' — IP unknown' + (g.hint && g.status === 'running' ? ' (' + (/agent/.test(g.hint) ? 'no guest agent' : g.hint) + ')' : '')}));
+    if (!g.ips.length) sel.append(el('option', {value: '?' + g.vmid, title: g.hint || '',  // selectable: you type the IP
+      textContent: label + ' — IP unknown, type it' + (g.hint && g.status === 'running' ? ' (' + (/agent/.test(g.hint) ? 'no guest agent' : g.hint) + ')' : '')}));
     for (const ip of g.ips) sel.append(el('option', {value: ip, textContent: label + ' — ' + ip + src}));
   }
 }
@@ -5344,6 +5346,7 @@ function openDlg(r) {
   const f = $('#ruleForm');
   $('#dlgTitle').textContent = r ? 'Edit rule' : 'Add rule';
   $('#formErr').textContent = '';
+  f.querySelector('.ip-hint').hidden = true;
   const iface = f.iface; iface.replaceChildren(el('option', {value: '', textContent: 'any'}));
   for (const i of S.ifaces) iface.append(el('option', {value: i, textContent: netLabel(i)}));
   r = r || {proto: 'tcp', enabled: true};
@@ -5355,13 +5358,20 @@ function openDlg(r) {
   fillGuests();
 }
 
-$('#ruleForm').guest.addEventListener('change', e => {
-  const f = $('#ruleForm');
-  if (e.target.value) {
-    f.ip.value = e.target.value;
-    if (!f.name.value) f.name.value = e.target.selectedOptions[0].textContent.split(' (')[0].replace(/^\d+ /, '').slice(0, 40);
-  }
-});
+// Picking a guest fills its IP; for a guest whose IP wasn't detected, focus the field and say why.
+function pickGuest(f, setName) {
+  const v = f.guest.value, hint = f.querySelector('.ip-hint');
+  hint.hidden = !v.startsWith('?');
+  if (!v) return;
+  if (setName && !f.name.value) f.name.value = f.guest.selectedOptions[0].textContent.split(' (')[0].replace(/^\d+ /, '').slice(0, 40);
+  if (!v.startsWith('?')) { f.ip.value = v; return; }
+  const g = (guests || []).find(x => x.vmid === +v.slice(1)) || {};
+  f.ip.value = ''; f.ip.focus();
+  const why = (g.hint || '').replace(/ \(or type the IP\)$/, '');
+  hint.textContent = 'IP of ' + (g.name || 'this guest') + ' not detected' + (why ? ': ' + why : '') +
+    '. Type it in the IP field - inside the guest, `ip -4 addr` shows it.';
+}
+$('#ruleForm').guest.addEventListener('change', () => pickGuest($('#ruleForm'), true));
 
 $('#ruleForm').addEventListener('submit', async e => {
   e.preventDefault();
@@ -5518,7 +5528,7 @@ function openDomDlg(d) {
   editingDom = d ? d.id : null;
   const f = $('#domForm');
   $('#domTitle').textContent = d ? 'Edit domain' : 'Add domain';
-  $('#domErr').textContent = '';
+  $('#domErr').textContent = ''; f.querySelector('.ip-hint').hidden = true;
   d = d || {tls: 'letsencrypt', force_https: true, headers: true, enabled: true, port: 80, max_body: '100m', aliases: [], source: []};
   for (const k of ['alias_redirect', 'hsts', 'headers', 'cloudflare']) f[k].checked = !!d[k];
   f.domain.value = d.domain || ''; f.aliases.value = (d.aliases || []).join(' ');
@@ -5551,7 +5561,7 @@ $('#domForm').aliases.addEventListener('input', toggleLe);
 $('#domForm').upstream_https.addEventListener('change', e => {
   const p = $('#domForm').port; if (e.target.checked && p.value === '80') p.value = '443'; else if (!e.target.checked && p.value === '443') p.value = '80';
 });
-$('#domForm').guest.addEventListener('change', e => { if (e.target.value) $('#domForm').ip.value = e.target.value; });
+$('#domForm').guest.addEventListener('change', () => pickGuest($('#domForm'), false));
 $('#domForm').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, d = {};

@@ -4,6 +4,10 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.8.1 - 2026-10-16
+- Add rule / Add domain: guests whose IP wasn't detected can now be picked too. That fills the name, focuses the
+  IP field and says why the IP is unknown, so you can type it yourself.
+
 ## 1.8.0 - 2026-10-16
 - Network tab - DHCP, IPAM and DNS through Proxmox SDN (PVE 8.1+), using the Proxmox API, so everything also shows up in
   the Proxmox UI: simple zones with DHCP (dnsmasq), VNets (bridges; shows which guests use them), subnets with
