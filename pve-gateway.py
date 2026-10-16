@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.1.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.2.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -82,6 +82,7 @@ DEFAULTS = {
     # Updates: branch/tag on GitHub to check and install from; daily background check.
     "update_ref": "master",
     "update_check": True,
+    "auto_update": False,  # install new versions automatically after the daily check
 }
 
 LOCK = threading.RLock()
@@ -559,6 +560,21 @@ def host_networks():
     return nets
 
 
+def host_ipv6():
+    """Public (global) IPv6 addresses of the host."""
+    rc, out = sh(["ip", "-6", "-br", "addr"])
+    res = []
+    for f in (line.split() for line in out.splitlines()) if rc == 0 else []:
+        for cidr in f[2:]:
+            try:
+                a = ipaddress.IPv6Interface(cidr).ip
+            except ValueError:
+                continue
+            if a.is_global:
+                res.append(str(a))
+    return res
+
+
 def neighbors():
     """{mac: [ipv4, ...]} from the host's ARP table - finds guests without a guest agent."""
     rc, out = sh(["ip", "-4", "neigh"])
@@ -733,6 +749,10 @@ def validate_domain(data, others, cfg, did=None, check_rules=True):
     if d["tls"] not in ("none", "letsencrypt", "wildcard"):
         raise ApiError("tls must be 'none', 'letsencrypt' or 'wildcard'")
     d["force_https"] = bool(data.get("force_https", True))
+    d["alias_redirect"] = bool(data.get("alias_redirect", False))  # aliases 301 to the main domain instead of serving
+    d["cloudflare"] = bool(data.get("cloudflare", False))          # behind Cloudflare proxy: trust CF-Connecting-IP
+    d["headers"] = bool(data.get("headers", False))                # nosniff / frame / referrer headers
+    d["hsts"] = bool(data.get("hsts", False))
     d["max_body"] = str(data.get("max_body", "100m") or "100m").strip().lower()
     if not BODY_RE.match(d["max_body"]):
         raise ApiError("max upload size: number with optional k/m/g, 0 = unlimited (e.g. 100m)")
@@ -915,7 +935,26 @@ def cert_info(cfg, name, fresh=False):
     return info
 
 
-def nginx_proxy_block(d):
+# Cloudflare's proxy ranges (https://www.cloudflare.com/ips/), trusted for CF-Connecting-IP on "behind Cloudflare" domains
+CLOUDFLARE_NETS = [
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+    "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+]
+SEC_HEADERS = [("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "SAMEORIGIN"),
+               ("Referrer-Policy", "strict-origin-when-cross-origin")]
+
+
+def is_cloudflare(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a in ipaddress.ip_network(n) for n in CLOUDFLARE_NETS)
+
+
+def nginx_proxy_block(d, tls=False):
     up = "%s://%s:%d" % ("https" if d["upstream_https"] else "http", d["ip"], d["port"])
     lines = ["    client_max_body_size %s;" % d["max_body"], "", "    location / {"]
     lines += ["        allow %s;" % c for c in d["source"]] + (["        deny all;"] if d["source"] else [])
@@ -934,6 +973,11 @@ def nginx_proxy_block(d):
     ]
     if d["upstream_https"]:
         lines += ["        proxy_ssl_server_name on;", "        proxy_ssl_verify off;  # guests usually have self-signed certs"]
+    headers = list(SEC_HEADERS) if d.get("headers") else []
+    if tls and d.get("hsts"):
+        headers.append(("Strict-Transport-Security", "max-age=15552000"))
+    for name, value in headers:  # replace the guest's own copy instead of sending the header twice
+        lines += ["        proxy_hide_header %s;" % name, '        add_header %s "%s" always;' % (name, value)]
     return lines + ["    }"]
 
 
@@ -946,30 +990,38 @@ def build_nginx(cfg):
     ssl_listen = "ssl" if new_h2 else "ssl http2"
     acme = ["    location ^~ /.well-known/acme-challenge/ {", "        root %s;" % cfg["acme_webroot"],
             "        default_type text/plain;", "    }"]
+    listen80 = ["    listen 80;"] + (["    listen [::]:80;"] if v6 else [])
+    listen443 = ["    listen 443 %s;" % ssl_listen] + (["    listen [::]:443 %s;" % ssl_listen] if v6 else []) + \
+        (["    http2 on;"] if new_h2 else [])
     for d in cfg["domains"]:
         if not d["enabled"]:
             continue
         cname = domain_cert(cfg, d)[0]
         tls = cert_info(cfg, cname)["exists"]
-        names = " ".join(_names(d))
+        crt, key = cert_paths(cfg, cname) if tls else (None, None)
+        ssl = ["    ssl_certificate %s;" % crt, "    ssl_certificate_key %s;" % key, "    ssl_protocols TLSv1.2 TLSv1.3;",
+               "    ssl_session_cache shared:pvegw_ssl:10m;", "    ssl_session_timeout 1d;"] if tls else []
+        realip = (["    set_real_ip_from %s;" % n for n in CLOUDFLARE_NETS] +
+                  ["    real_ip_header CF-Connecting-IP;"]) if d.get("cloudflare") else []
+        redirect_aliases = d.get("alias_redirect") and d["aliases"]
+        names = d["domain"] if redirect_aliases else " ".join(_names(d))
         out += ["", "# %s -> %s:%d  (id %s)" % (d["domain"], d["ip"], d["port"], d["id"]),
-                "server {", "    listen 80;"] + (["    listen [::]:80;"] if v6 else []) + [
-                "    server_name %s;" % names] + acme
+                "server {"] + listen80 + ["    server_name %s;" % names] + realip + acme
         if tls and d["force_https"]:
             out += ["    location / {", "        return 301 https://$host$request_uri;", "    }"]
         else:
             out += nginx_proxy_block(d)
         out.append("}")
         if tls:
-            crt, key = cert_paths(cfg, cname)
-            out += ["server {", "    listen 443 %s;" % ssl_listen] + (["    listen [::]:443 %s;" % ssl_listen] if v6 else []) + \
-                (["    http2 on;"] if new_h2 else []) + [
-                "    server_name %s;" % names,
-                "    ssl_certificate %s;" % crt,
-                "    ssl_certificate_key %s;" % key,
-                "    ssl_protocols TLSv1.2 TLSv1.3;",
-                "    ssl_session_cache shared:pvegw_ssl:10m;",
-                "    ssl_session_timeout 1d;"] + nginx_proxy_block(d) + ["}"]
+            out += ["server {"] + listen443 + ["    server_name %s;" % names] + ssl + realip + nginx_proxy_block(d, True) + ["}"]
+        if redirect_aliases:  # aliases answer with a permanent redirect to the main domain (still in the certificate)
+            target = "%s://%s$request_uri" % ("https" if tls else "http", d["domain"])
+            names = " ".join(d["aliases"])
+            out += ["server {"] + listen80 + ["    server_name %s;" % names] + acme + [
+                "    location / {", "        return 301 %s;" % target, "    }", "}"]
+            if tls:
+                out += ["server {"] + listen443 + ["    server_name %s;" % names] + ssl + [
+                    "    return 301 %s;" % target, "}"]
     return "\n".join(out) + "\n"
 
 
@@ -1148,6 +1200,93 @@ def http_check(host, tls):
         return 0, str(e)
 
 
+def name_covered(names, host):
+    """Does a certificate with these DNS names cover host? (wildcards: one label)"""
+    return any(n == host or (n.startswith("*.") and host.endswith(n[1:]) and "." not in host[:-len(n) + 1])
+               for n in names)
+
+
+def served_cert(host, v6=False):
+    """The certificate nginx actually serves for host: {"names", "days", "fingerprint"} or {"error"}."""
+    rc, out = run(["openssl", "s_client", "-connect", "[::1]:443" if v6 else "127.0.0.1:443", "-servername", host],
+                  data="", check_only=True, timeout=10)
+    m = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", out or "", re.S)
+    if not m:
+        lines = [x for x in (out or "").strip().splitlines() if x.strip()]
+        return {"error": (lines[-1] if lines else "no certificate served")[:200]}
+    rc, info = run(["openssl", "x509", "-noout", "-enddate", "-fingerprint", "-sha256", "-ext", "subjectAltName"],
+                   data=m.group(0) + "\n", check_only=True, timeout=10)
+    res = {"names": re.findall(r"DNS:([^,\s]+)", info or "")}
+    fp = re.search(r"Fingerprint=([0-9A-F:]+)", info or "")
+    res["fingerprint"] = fp.group(1) if fp else ""
+    end = re.search(r"notAfter=(.+)", info or "")
+    if end:
+        try:
+            exp = calendar.timegm(time.strptime(end.group(1).strip().replace("  ", " "), "%b %d %H:%M:%S %Y %Z"))
+            res["days"] = int((exp - time.time()) // 86400)
+        except ValueError:
+            pass
+    return res
+
+
+def check_served(cfg, d, add):
+    """Health of the certificate nginx serves for every name of the domain, on IPv4 and IPv6."""
+    v4 = served_cert(d["domain"])
+    if v4.get("error"):
+        add("served certificate", "fail", "nginx doesn't serve HTTPS for %s: %s" % (d["domain"], v4["error"]))
+        return
+    missing = [n for n in _names(d) if not name_covered(v4["names"], n)]
+    days = v4.get("days")
+    if missing:
+        add("served certificate", "fail", "the certificate nginx serves (%s) doesn't cover %s - browsers will warn"
+            % (", ".join(v4["names"][:4]) or "no names", ", ".join(missing)))
+    else:
+        add("served certificate", _st(days is None or days >= 14, warn=True), "covers %s%s" % (
+            ", ".join(_names(d)), "" if days is None else ", expires in %d days" % days))
+    if cfg.get("nginx_ipv6", True):
+        v6 = served_cert(d["domain"], v6=True)
+        if v6.get("error"):
+            add("served certificate (IPv6)", "warn", "IPv6 listener: %s" % v6["error"])
+        elif v6.get("fingerprint") != v4.get("fingerprint"):
+            add("served certificate (IPv6)", "warn", "IPv4 and IPv6 serve different certificates - check other nginx "
+                "sites listening on [::]:443 for the same name")
+        else:
+            add("served certificate (IPv6)", "ok", "same certificate as IPv4")
+
+
+def check_dns(d, n, add):
+    public4 = [x["ip"] for x in host_networks() if x["public"]]
+    public6 = host_ipv6()
+    ips = resolve(n)
+    v4 = [i for i in ips if ":" not in i]
+    v6 = [i for i in ips if ":" in i]
+    cf = [i for i in ips if is_cloudflare(i)]
+    if not ips:
+        return add("DNS %s" % n, "fail", "does not resolve - create an A record pointing to %s"
+                   % (" / ".join(public4) if public4 else "your public IP"))
+    if cf:
+        if d.get("cloudflare"):
+            return add("DNS %s" % n, "ok", "proxied by Cloudflare (%s) - Cloudflare's origin record must point to %s"
+                       % (", ".join(cf[:2]), " / ".join(public4) or "this host"))
+        return add("DNS %s" % n, "warn", "resolves to Cloudflare (%s, orange cloud): enable 'Behind Cloudflare' for "
+                   "real visitor IPs, or set the record to DNS only" % ", ".join(cf[:2]))
+    if not v4:
+        add("DNS %s" % n, "warn", "only AAAA records (%s) - add an A record for IPv4 visitors" % ", ".join(v6))
+    elif not public4:
+        add("DNS %s" % n, "ok", "resolves to %s - this host has no public IPv4, so that must be your router "
+            "forwarding ports 80/443 here" % ", ".join(v4))
+    elif set(v4) & set(public4):
+        add("DNS %s" % n, "ok", "resolves to %s (this host)" % ", ".join(v4))
+    else:
+        add("DNS %s" % n, "warn", "resolves to %s, but this host's public IP is %s - fix the A record, unless "
+            "a router or proxy in front forwards 80/443 here" % (", ".join(v4), ", ".join(public4)))
+    if v6 and not set(v6) & set(public6):
+        add("AAAA %s" % n, "warn", "AAAA record %s %s - IPv6 visitors will fail: fix or delete the AAAA record" % (
+            ", ".join(v6), "but this host's IPv6 is " + ", ".join(public6) if public6 else "but this host has no public IPv6"))
+    elif v6:
+        add("AAAA %s" % n, "ok", "resolves to %s (this host)" % ", ".join(v6))
+
+
 def test_domain(d):
     cfg = STATE["cfg"]
     steps = []
@@ -1156,25 +1295,14 @@ def test_domain(d):
         steps.append({"name": name, "status": status, "detail": detail})
 
     add("domain enabled", _st(d["enabled"]))
-    public = [x["ip"] for x in host_networks() if x["public"]]
     for n in _names(d):
-        ips = resolve(n)
-        if not ips:
-            add("DNS %s" % n, "fail", "does not resolve - create an A record pointing to %s"
-                % (" / ".join(public) if public else "your public IP"))
-        elif not public:
-            add("DNS %s" % n, "ok", "resolves to %s - this host has no public IP, so that must be your router "
-                "forwarding ports 80/443 here" % ", ".join(ips))
-        elif set(ips) & set(public):
-            add("DNS %s" % n, "ok", "resolves to %s (this host)" % ", ".join(ips))
-        else:
-            add("DNS %s" % n, "warn", "resolves to %s, but this host's public IP is %s - fix the A record, unless "
-                "a router or proxy in front forwards 80/443 here" % (", ".join(ips), ", ".join(public)))
+        check_dns(d, n, add)
     rc, out = sh(["systemctl", "is-active", "nginx"])
     add("nginx running", _st(out.strip() == "active"), out.strip() if out else "")
     try:
         with open(nginx_conf_path(cfg)) as f:
-            present = ("server_name %s" % " ".join(_names(d))) in f.read()
+            main = d["domain"] if d.get("alias_redirect") and d["aliases"] else " ".join(_names(d))
+            present = ("server_name %s;" % main) in f.read()
     except OSError:
         present = False
     add("in nginx config", _st(present or not d["enabled"]), cfg["nginx_conf"])
@@ -1194,6 +1322,8 @@ def test_domain(d):
         else:
             add("certificate", "warn" if job and job["state"] == "pending" else "fail",
                 job["msg"] if job else "not issued yet - click Cert")
+    if tls:
+        check_served(cfg, d, add)
     for proto_tls in ([False, True] if tls else [False]):
         status, text = http_check(d["domain"], proto_tls)
         name = "request via nginx (%s)" % ("https" if proto_tls else "http")
@@ -1203,6 +1333,10 @@ def test_domain(d):
             add(name, "fail", text)
         else:
             add(name, "ok" if status < 500 else "warn", text)
+    if d.get("alias_redirect"):
+        for a in d["aliases"]:
+            status, text = http_check(a, tls)
+            add("alias %s" % a, _st(status in (301, 308)), text + ("" if status in (301, 308) else " - expected a 301 to " + d["domain"]))
     if d["tls"] == "none":
         add("TLS", "info", "HTTP only - pick Let's Encrypt to get HTTPS")
     return steps
@@ -1246,6 +1380,59 @@ def loaded_rule_ids():
     return ids
 
 
+# services that should not be reachable from the internet (port -> what)
+RISKY_PORTS = {111: "rpcbind", 2049: "NFS", 139: "SMB", 445: "SMB", 3306: "MySQL/MariaDB", 5432: "PostgreSQL",
+               6379: "Redis", 11211: "memcached", 27017: "MongoDB", 9200: "Elasticsearch", 2375: "Docker API",
+               8086: "InfluxDB", 9090: "Prometheus", 9100: "node_exporter", 10250: "kubelet", 5000: "Docker registry"}
+
+
+def exposed_services():
+    """[(proto, port, bind, process)] listening on all interfaces or a public address (not loopback / LAN)."""
+    rc, out = sh(["ss", "-Hlntup"])
+    res = []
+    for f in (line.split() for line in out.splitlines()) if rc == 0 else []:
+        if len(f) < 5:
+            continue
+        addr, _, port = f[4].rpartition(":")
+        addr = addr.strip("[]").split("%")[0]
+        if not port.isdigit():
+            continue
+        if addr in ("0.0.0.0", "*", "::"):
+            scope = "all interfaces"
+        else:
+            try:
+                a = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if not a.is_global:
+                continue
+            scope = addr
+        proc = re.search(r'\(\("([^"]+)"', " ".join(f))
+        res.append((f[0], int(port), scope, proc.group(1) if proc else "?"))
+    return res
+
+
+def apt_dirs():
+    base = "/etc/apt"
+    return MOCK.path_for(base) if MOCK else base
+
+
+def enterprise_repos():
+    """apt source files with an enabled enterprise.proxmox.com entry."""
+    found = []
+    d = os.path.join(apt_dirs(), "sources.list.d")
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        text = _read(os.path.join(d, name)) or ""
+        if name.endswith(".sources"):
+            for stanza in re.split(r"\n\s*\n", text):
+                if "enterprise.proxmox.com" in stanza and not re.search(r"^Enabled:\s*(no|false)", stanza, re.M | re.I):
+                    found.append(name)
+                    break
+        elif name.endswith(".list") and re.search(r"^[^#\n]*enterprise\.proxmox\.com", text, re.M):
+            found.append(name)
+    return found
+
+
 def checks():
     cfg = STATE["cfg"]
     res = []
@@ -1287,6 +1474,18 @@ def checks():
     if rc == 0 and "enabled" in out and cfg.get("forward_accept", True) and any(r["enabled"] for r in cfg["rules"]):
         add("forwarded ports vs pve-firewall", "info", "forwarded traffic is accepted before pve-firewall, so guest "
             "firewall rules don't filter it - limit access with each rule's Allowed source")
+    for proto, port, scope, proc in exposed_services():
+        what = RISKY_PORTS.get(port) or ("VNC" if 5900 <= port <= 5999 else None)
+        if what:
+            add("exposed %s/%d" % (proto, port), "warn", "%s (%s) listens on %s - reachable from the internet unless the "
+                "Proxmox firewall blocks it; bind it to localhost or block the port" % (what, proc, scope))
+    repos = enterprise_repos()
+    if repos:
+        rc, sub = sh(["pvesubscription", "get"])
+        if rc == 0 and not re.search(r"status:\s*active", sub, re.I):
+            add("apt repositories", "warn", "Proxmox enterprise repos are enabled (%s) but there is no subscription, so "
+                "apt update fails with 401 - switch to no-subscription: curl -fsSL %s/master/install.sh | sh -s -- fix-repos"
+                % (", ".join(repos), REPO_RAW))
     info = update_info()
     if info["available"]:
         add("pve-gateway version", "warn", "%s installed, %s available - update in Settings or run: pve-gateway update"
@@ -1601,7 +1800,13 @@ def update_checker():
     time.sleep(5 if MOCK else 120)
     while True:
         if STATE["cfg"].get("update_check", True):
-            check_update()
+            info = check_update()
+            if info["available"] and STATE["cfg"].get("auto_update") and not MOCK:
+                try:
+                    log("auto-update: installing %s" % info["latest"])
+                    run_update()
+                except ApiError as e:
+                    log("auto-update failed: %s" % e, "error")
         time.sleep(86400)
 
 
@@ -1844,12 +2049,27 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, run_update())
         if path == "/api/settings" and method == "GET":
             return self.send(200, {"ui_allow": cfg.get("ui_allow", []), "allowed_hosts": cfg.get("allowed_hosts", []),
-                                   "client_ip": self.client_ip(), "own_hosts": sorted(own_hostnames())})
+                                   "client_ip": self.client_ip(), "own_hosts": sorted(own_hostnames()),
+                                   "allowed_users": cfg.get("allowed_users", []), "auth": "local" if cfg.get("pass_hash") else "pve",
+                                   "auto_update": bool(cfg.get("auto_update"))})
         if path == "/api/settings" and method == "PUT":
             d = self.body()
             with LOCK:
-                new = dict(STATE["cfg"], ui_allow=parse_networks(d.get("ui_allow", [])),
-                           allowed_hosts=parse_hostnames(d.get("allowed_hosts", [])))
+                new = dict(STATE["cfg"])
+                if "ui_allow" in d:
+                    new["ui_allow"] = parse_networks(d["ui_allow"])
+                if "allowed_hosts" in d:
+                    new["allowed_hosts"] = parse_hostnames(d["allowed_hosts"])
+                if "auto_update" in d:
+                    new["auto_update"] = bool(d["auto_update"])
+                if "allowed_users" in d:
+                    users = [u.strip() for u in _as_list(d["allowed_users"]) if u.strip()]
+                    bad = [u for u in users if not re.match(r"^[\w.-]{1,64}@[\w.-]{1,64}$", u)]
+                    if bad:
+                        raise ApiError("invalid Proxmox user '%s' (format: name@realm, e.g. admin@pve)" % bad[0])
+                    if not new.get("pass_hash") and user not in users:
+                        raise ApiError("this would lock you out: keep %s in the allowed users" % user)
+                    new["allowed_users"] = users
                 if not ui_client_allowed(self.client_ip(), new):
                     raise ApiError("this would lock you out: your IP %s is not in the allowed list" % self.client_ip())
                 if not host_allowed(self.headers.get("Host"), new):
@@ -1857,8 +2077,9 @@ class Handler(BaseHTTPRequestHandler):
                                    % self.headers.get("Host"))
                 save_config(new)
                 STATE["cfg"] = new
-            log("%s set web UI access: allow %s, hosts %s" % (user, ", ".join(new["ui_allow"]) or "anyone",
-                                                               ", ".join(new["allowed_hosts"]) or "-"))
+            log("%s changed settings: allow %s, hosts %s, users %s, auto-update %s" % (
+                user, ", ".join(new["ui_allow"]) or "anyone", ", ".join(new["allowed_hosts"]) or "-",
+                ", ".join(new.get("allowed_users", [])), "on" if new.get("auto_update") else "off"))
             return self.send(200, {"ok": True})
         if path == "/api/guests" and method == "GET":
             return self.send(200, {"guests": list_guests()})
@@ -2203,6 +2424,7 @@ INDEX_HTML = r"""<!doctype html>
       <p id="updStatus" class="muted"></p>
       <div id="updChanges" class="changes"></div>
       <p id="updErr" class="err"></p>
+      <label class="check"><input type="checkbox" id="autoUpd"> Install new versions automatically (checked once a day)</label>
       <div class="actions"><a id="updLink" class="muted small" target="_blank" rel="noopener">changes on GitHub</a>
         <span class="spacer"></span><button type="button" class="ghost" id="updCheck">Check now</button>
         <button type="button" id="updRun" hidden>Update</button></div>
@@ -2214,6 +2436,7 @@ INDEX_HTML = r"""<!doctype html>
         of an ssh tunnel - and <code>pve-gateway ui-allow any</code> on the host resets it.</p>
       <label>Allowed source IPs / networks<textarea id="uiAllow" rows="4" spellcheck="false" placeholder="203.0.113.7&#10;10.20.0.0/24"></textarea></label>
       <p class="hint">Your IP: <b id="myIp" class="mono"></b> <button type="button" class="link" id="addMyIp">+ add it</button></p>
+      <label id="usersRow">Proxmox users allowed to sign in<textarea id="uiUsers" rows="2" spellcheck="false" placeholder="root@pam&#10;admin@pve"></textarea></label>
       <label>Extra hostnames for this UI<textarea id="uiHosts" rows="2" spellcheck="false" placeholder="pve.example.com"></textarea></label>
       <p class="hint" id="ownHosts"></p>
       <p id="setErr" class="err"></p>
@@ -2245,6 +2468,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="grid">
       <label class="wide">Domain<input name="domain" required placeholder="cloud.example.com" autocapitalize="off" spellcheck="false"></label>
       <label class="wide">Aliases<input name="aliases" placeholder="www.example.com (optional, space separated)" autocapitalize="off" spellcheck="false"></label>
+      <label class="check wide"><input type="checkbox" name="alias_redirect"> Aliases redirect (301) to the main domain instead of showing the same site</label>
       <label class="wide">Guest<select name="guest"><option value="">— pick a guest to fill its IP —</option></select></label>
       <label>Upstream IP<input name="ip" required placeholder="10.10.10.10"></label>
       <label>Upstream port<input name="port" required value="80" inputmode="numeric"></label>
@@ -2254,6 +2478,9 @@ INDEX_HTML = r"""<!doctype html>
       <label class="le-only">Let's Encrypt email<input name="acme_email" type="email" placeholder="expiry notices (optional)"></label>
       <p id="wcHint" class="hint wide" hidden></p>
       <label class="check wide tls-on"><input type="checkbox" name="force_https" checked> Redirect HTTP to HTTPS</label>
+      <label class="check wide tls-on"><input type="checkbox" name="hsts"> HSTS: browsers insist on HTTPS for this domain for 180 days</label>
+      <label class="check wide"><input type="checkbox" name="headers" checked> Security headers (nosniff, same-origin framing, referrer policy)</label>
+      <label class="check wide"><input type="checkbox" name="cloudflare"> Behind the Cloudflare proxy (orange cloud): pass the real visitor IP to the guest and to "Allowed sources"</label>
       <label>Max upload size<input name="max_body" value="100m" placeholder="100m, 2g, 0 = unlimited"></label>
       <label>Allowed sources<input name="source" placeholder="anyone (or 203.0.113.0/24 …)"></label>
       <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled</label>
@@ -2671,7 +2898,10 @@ function renderDomains() {
       el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: d.enabled, title: d.enabled ? 'Disable' : 'Enable',
         onchange: e => saveDomain(d.id, Object.assign({}, d, {enabled: e.target.checked}))})),
       el('td', {class: 'names'}, el('a', {href: (d.tls !== 'none' ? 'https://' : 'http://') + d.domain, target: '_blank', rel: 'noopener', textContent: d.domain}),
-        ...d.aliases.map(a => el('span', {class: 'alias', textContent: a}))),
+        ...d.aliases.map(a => el('span', {class: 'alias', textContent: d.alias_redirect ? '↳ ' + a + ' → 301' : a})),
+        (d.cloudflare || d.hsts) ? el('span', {class: 'alias'},
+          d.cloudflare ? el('span', {class: 'tag', textContent: 'cloudflare'}) : null, ' ',
+          d.hsts ? el('span', {class: 'tag', textContent: 'hsts'}) : null) : null),
       el('td', {class: 'arrow', textContent: '→'}),
       el('td', {class: 'mono', textContent: (d.upstream_https ? 'https://' : 'http://') + d.ip + ':' + d.port}),
       el('td', {}, tlsCell(d)),
@@ -2713,7 +2943,8 @@ function openDomDlg(d) {
   const f = $('#domForm');
   $('#domTitle').textContent = d ? 'Edit domain' : 'Add domain';
   $('#domErr').textContent = '';
-  d = d || {tls: 'letsencrypt', force_https: true, enabled: true, port: 80, max_body: '100m', aliases: [], source: []};
+  d = d || {tls: 'letsencrypt', force_https: true, headers: true, enabled: true, port: 80, max_body: '100m', aliases: [], source: []};
+  for (const k of ['alias_redirect', 'hsts', 'headers', 'cloudflare']) f[k].checked = !!d[k];
   f.domain.value = d.domain || ''; f.aliases.value = (d.aliases || []).join(' ');
   f.ip.value = d.ip || ''; f.port.value = d.port || 80; f.upstream_https.checked = !!d.upstream_https;
   f.tls.value = d.tls; f.force_https.checked = d.force_https !== false; f.max_body.value = d.max_body || '100m';
@@ -2750,6 +2981,7 @@ $('#domForm').addEventListener('submit', async e => {
   const f = e.target, d = {};
   for (const k of ['domain', 'aliases', 'ip', 'port', 'tls', 'max_body', 'source', 'acme_email']) d[k] = f[k].value.trim();
   d.upstream_https = f.upstream_https.checked; d.force_https = f.force_https.checked; d.enabled = f.enabled.checked;
+  for (const k of ['alias_redirect', 'hsts', 'headers', 'cloudflare']) d[k] = f[k].checked;
   const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
   try {
     await api(editingDom ? 'PUT' : 'POST', editingDom ? '/api/domains/' + editingDom : '/api/domains', d);
@@ -2924,6 +3156,10 @@ async function waitForRestart(ver) {
   $('#updErr').textContent = 'The update did not finish within 3 minutes - on the host run: journalctl -u pve-gateway-update';
 }
 $('#updCheck').onclick = () => loadUpdate(true);
+$('#autoUpd').onchange = async e => {
+  try { await api('PUT', '/api/settings', {auto_update: e.target.checked}); }
+  catch (err) { e.target.checked = !e.target.checked; $('#updErr').textContent = err.message; }
+};
 $('#updRun').onclick = async () => {
   const b = $('#updRun');
   if (!confirm(b.textContent + ' now? pve-gateway restarts for a few seconds; port rules and domains keep working.')) return;
@@ -2942,6 +3178,8 @@ async function loadSettings() {
   try {
     const d = await api('GET', '/api/settings');
     $('#uiAllow').value = d.ui_allow.join('\n'); $('#uiHosts').value = d.allowed_hosts.join('\n');
+    $('#uiUsers').value = d.allowed_users.join('\n'); $('#usersRow').hidden = d.auth !== 'pve';
+    $('#autoUpd').checked = d.auto_update;
     $('#myIp').textContent = d.client_ip; $('#uiPort').textContent = location.port || (location.protocol === 'https:' ? 443 : 80);
     $('#ownHosts').textContent = 'Always allowed: any IP address, ' + d.own_hosts.join(', ') + '.';
     $('#setErr').textContent = '';
@@ -2954,7 +3192,9 @@ $('#addMyIp').onclick = () => {
 $('#saveSettings').onclick = async () => {
   $('#setErr').textContent = '';
   try {
-    await api('PUT', '/api/settings', {ui_allow: $('#uiAllow').value, allowed_hosts: $('#uiHosts').value});
+    const body = {ui_allow: $('#uiAllow').value, allowed_hosts: $('#uiHosts').value};
+    if (!$('#usersRow').hidden) body.allowed_users = $('#uiUsers').value;
+    await api('PUT', '/api/settings', body);
     $('#setMsg').textContent = 'Saved'; setTimeout(() => $('#setMsg').textContent = '', 3000);
     loadSettings(); load().catch(() => {});
   } catch (e) { $('#setErr').textContent = e.message; }

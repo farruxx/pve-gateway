@@ -52,7 +52,7 @@ For **wildcard certificates**, also add your DNS provider's certbot plugin, for 
 curl -fsSL https://raw.githubusercontent.com/farruxx/pve-gateway/master/install.sh | sh -s -- --with-dns cloudflare
 ```
 
-**Updating:** in **Settings → Updates**, click **Update to vX.Y.Z**. pve-gateway checks GitHub once a day and shows a badge in the header when a new version is out, together with what changed (from [CHANGELOG.md](CHANGELOG.md)). From a shell, run `pve-gateway update`, or re-run the install command. Your rules, domains and certificates are kept either way.
+**Updating:** in **Settings → Updates**, click **Update to vX.Y.Z**, or tick *Install new versions automatically*. pve-gateway checks GitHub once a day and shows a badge in the header when a new version is out, together with what changed (from [CHANGELOG.md](CHANGELOG.md)). From a shell, run `pve-gateway update`, or re-run the install command. Your rules, domains and certificates are kept either way.
 
 - **No Proxmox subscription?** That's the normal case and it's handled for you. Without a subscription, the Proxmox *enterprise* repositories answer `401 Unauthorized`. When the installer sees that, it switches apt to the free **no-subscription** repositories:
   - the enterprise entries (pve and ceph) are disabled, not deleted;
@@ -86,7 +86,16 @@ The **Domains** tab maps hostnames to guests: `cloud.example.com` → `10.10.10.
 
 - Everything goes into a single generated file, `/etc/nginx/conf.d/pve-gateway.conf`. Other nginx sites are left alone. Each change is checked with `nginx -t` before reload; if the check fails, the previous file is restored and the error is shown in the UI.
 - **Let's Encrypt** (optional, per domain) uses `certbot certonly --webroot`. The certificate is requested in the background right after saving, and certbot's own systemd timer renews it, reloading nginx through a deploy hook. *Cert* re-requests it on demand, and *Test* checks DNS, nginx, the upstream, the certificate and a real request through nginx.
-- **Per domain options:** aliases (extra hostnames), an HTTPS upstream (self-signed certificates are accepted), redirect HTTP to HTTPS, max upload size, and allowed source IPs/CIDRs. WebSockets always work.
+- **Per domain options:**
+  - aliases (extra hostnames), served as the same site or **redirected with a 301** to the main domain;
+  - an HTTPS upstream (self-signed certificates are accepted);
+  - redirect HTTP to HTTPS, and optional **HSTS**;
+  - **security headers** (nosniff, same-origin framing, referrer policy);
+  - max upload size, and allowed source IPs/CIDRs;
+  - **Behind Cloudflare**: for domains behind the orange cloud, nginx trusts Cloudflare's address ranges, so logs, the guest and *Allowed sources* see the real visitor IP.
+
+  WebSockets always work.
+- **Test** checks DNS (A, AAAA and Cloudflare-proxied records), nginx and the upstream. It also checks the certificate nginx **actually serves**: it must cover every name, not be close to expiry, and be the same over IPv4 and IPv6. Aliases set to redirect must answer with a 301.
 - **Requirements:** each domain's DNS A record must point to the host's public IP. If the host sits behind a router, the router has to forward TCP 80 and 443 to it.
 - While any domain is enabled, port-forward rules can't take TCP 80 or 443, because those ports belong to nginx. The reverse is enforced too.
 
@@ -228,6 +237,8 @@ The UI runs as root, can change the host's firewall and nginx, and logs in with 
   - Only one login per IP is checked at a time, so parallel guessing doesn't help.
   - Proxmox accounts with **two-factor (TOTP)** work: the login asks for the code.
 - **Sessions** are tied to the IP and browser they were created from, so a copied cookie is useless elsewhere. Browsers don't separate cookies by port, so a guest service you open on the same host IP could otherwise see it.
+- **Allowed Proxmox users:** only `root@pam` by default. Add more users in **Settings** (format `name@realm`).
+- **Exposure check:** the Debug tab warns about risky services (rpcbind, databases, Redis, Docker API, VNC, …) listening on all interfaces, and about enterprise repositories enabled without a subscription.
 - **Hostname check:** the UI only answers to IP addresses, this host's own names, and hostnames you add (Settings, or `pve-gateway ui-host pve.example.com`). This blocks DNS-rebinding attacks.
 
 ## Config: `/etc/pve-gateway/config.json`
