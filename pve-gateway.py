@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.5.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.8.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -87,6 +87,10 @@ DEFAULTS = {
     "monitors": [],
     "alerts": {"email": "", "webhook": "", "telegram_token": "", "telegram_chat": "", "fail_after": 2, "cert_days": 14},
     # fail2ban: pve-gateway writes /etc/fail2ban/jail.d/pve-gateway.local only after "managed" is switched on
+    # Host firewall (inbound): backend "custom" = pve-gateway's own iptables/ip6tables chain, "pve" = Proxmox firewall
+    "firewall": {"backend": "custom", "enabled": False, "policy": "accept", "allow_ping": True, "rules": []},
+    # WireGuard tunnels; private keys live in <config dir>/wireguard/*.key (0600), never in config.json
+    "wireguard": {"tunnels": []},
     "fail2ban": {"managed": False, "bantime": "1h", "findtime": "10m", "maxretry": 5, "ignoreip": [],
                  "jails": {"sshd": True, "proxmox": True, "pve-gateway": True, "nginx-botsearch": True, "recidive": True}},
 }
@@ -155,6 +159,25 @@ def load_config():
             log("skipping invalid check %r: %s" % (m.get("name") or m.get("id"), e), "warn")
     cfg["monitors"] = mons
     cfg["alerts"] = dict(DEFAULTS["alerts"], **(cfg.get("alerts") or {}))
+    try:
+        cfg["firewall"] = validate_fw(dict(DEFAULTS["firewall"], **(cfg.get("firewall") or {})),
+                                      json.loads(json.dumps(DEFAULTS["firewall"])), cfg)
+    except ApiError as e:
+        log("firewall settings invalid (%s) - firewall disabled" % e, "error")
+        cfg["firewall"] = json.loads(json.dumps(DEFAULTS["firewall"]))
+    wg = {"tunnels": []}
+    for t in (cfg.get("wireguard") or {}).get("tunnels", []):
+        try:
+            nt = validate_wg_tunnel(t, wg["tunnels"], cfg, t.get("id"))
+            nt["public_key"] = t.get("public_key", "")
+            for p in t.get("peers", []):
+                np_ = validate_wg_peer(p, nt, p.get("id"))
+                np_["public_key"] = p.get("public_key", "")
+                nt["peers"].append(np_)
+            wg["tunnels"].append(nt)
+        except (ApiError, ValueError) as e:
+            log("skipping invalid WireGuard tunnel %r: %s" % (t.get("name"), e), "warn")
+    cfg["wireguard"] = wg
     f2b = json.loads(json.dumps(DEFAULTS["fail2ban"]))
     f2b.update({k: v for k, v in (cfg.get("fail2ban") or {}).items() if k != "jails"})
     f2b["jails"].update((cfg.get("fail2ban") or {}).get("jails") or {})
@@ -430,6 +453,14 @@ def build_ruleset(cfg):
         # rule from another tool further down can't forward these ports to a guest. (Our hook is kept at #1.)
         nat.append('-A %s -p tcp -m addrtype --dst-type LOCAL -m multiport --dports 80,443 '
                    '-m comment --comment "gw:domains" -j ACCEPT' % CH_PRE)
+    for t in cfg.get("wireguard", {}).get("tunnels", []):
+        if t["enabled"]:  # VPN clients may reach guests; replies come back as established traffic
+            net = str(ipaddress.ip_interface(t["address"]).network)
+            flt.append('-A %s -i %s -m comment --comment "gw:wg" -j ACCEPT' % (CH_FWD, t["name"]))
+            flt.append('-A %s -o %s -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "gw:wg" -j ACCEPT'
+                       % (CH_FWD, t["name"]))
+            if t["nat"]:  # guests see the host's bridge address, so they don't need a route back to the VPN
+                nat.append('-A %s -s %s ! -d %s -m comment --comment "gw:wg" -j MASQUERADE' % (CH_POST, net, net))
     for r in cfg["rules"]:
         if not r["enabled"]:
             continue
@@ -551,7 +582,12 @@ def watchdog():
             if not DRY_RUN and not hooks_active():
                 log("hooks missing (iptables flushed?), re-applying rules", "warn")
                 apply_rules()
-            elif not DRY_RUN and owns_web_ports(STATE["cfg"]) and hook_position("nat", "PREROUTING", CH_PRE) not in (None, 1):
+            fw = STATE["cfg"]["firewall"]
+            if not DRY_RUN and fw["enabled"] and fw["backend"] == "custom" and \
+                    run(["iptables", "-C", "INPUT", "-j", CH_IN], check_only=True)[0] != 0:
+                log("firewall hook missing, re-applying", "warn")
+                apply_fw(STATE["cfg"])
+            if not DRY_RUN and owns_web_ports(STATE["cfg"]) and hook_position("nat", "PREROUTING", CH_PRE) not in (None, 1):
                 # another tool inserted rules above ours; they could DNAT 80/443 away from nginx
                 log("moving pve-gateway's nat hook back to the top of PREROUTING", "warn")
                 with LOCK:
@@ -679,8 +715,9 @@ def _clean(ips):
     return [i for i in dict.fromkeys(ips) if IPV4_RE.match(i) and not i.startswith(("127.", "169.254."))]
 
 
-def _guest_ips(g, neigh):
-    """{"ips", "source", "hint"}: guest agent / lxc first, then ARP by MAC, then static config."""
+def _guest_ips(g, neigh, ipam=None):
+    """{"ips", "source", "hint"}: guest agent / lxc first, then ARP by MAC, SDN IPAM by MAC, then static config."""
+    ipam = ipam or {}
     vmid, running = str(g["vmid"]), g.get("status") == "running"
     if g["type"] == "lxc":
         if running:
@@ -690,6 +727,10 @@ def _guest_ips(g, neigh):
                 return {"ips": ips, "source": "lxc", "hint": ""}
         rc, out = run(["pct", "config", vmid], check_only=True)
         ips = _clean(re.findall(r"\bip=(\d+\.\d+\.\d+\.\d+)", out)) if rc == 0 else []
+        if not ips and rc == 0:
+            ips = _clean(ip for mac in re.findall(r"hwaddr=([0-9A-Fa-f:]{17})", out) for ip in ipam.get(mac.lower(), []))
+            if ips:
+                return {"ips": ips, "source": "ipam", "hint": ""}
         return {"ips": ips, "source": "config" if ips else None,
                 "hint": "" if ips else "container uses DHCP and is not running"}
     rc, conf = run(["qm", "config", vmid], check_only=True)
@@ -711,6 +752,9 @@ def _guest_ips(g, neigh):
         ips = _clean(ip for mac in macs for ip in neigh.get(mac, []))
         if ips:
             return {"ips": ips, "source": "arp", "hint": ""}
+    ips = _clean(ip for mac in macs for ip in ipam.get(mac, []))
+    if ips:
+        return {"ips": ips, "source": "ipam", "hint": ""}
     ips = _clean(re.findall(r"^ipconfig\d+:.*\bip=(\d+\.\d+\.\d+\.\d+)", conf, re.M))
     if ips:
         return {"ips": ips, "source": "cloud-init", "hint": ""}
@@ -735,13 +779,17 @@ def list_guests():
     except ValueError:
         return []
     neigh = neighbors()
+    ipam = {}
+    for e in sdn_ipam() if SDN_CACHE["data"] is None or SDN_CACHE["data"]["available"] else []:
+        if e["mac"]:
+            ipam.setdefault(e["mac"], []).append(e["ip"])
     with ThreadPoolExecutor(8) as ex:
-        found = list(ex.map(lambda g: _guest_ips(g, neigh), items))
+        found = list(ex.map(lambda g: _guest_ips(g, neigh, ipam), items))
         missing = [i for i, (g, f) in enumerate(zip(items, found))
                    if not f["ips"] and g["type"] == "qemu" and g.get("status") == "running"]
         if missing and arp_sweep():
             neigh = neighbors()
-            for i, f in zip(missing, ex.map(lambda i: _guest_ips(items[i], neigh), missing)):
+            for i, f in zip(missing, ex.map(lambda i: _guest_ips(items[i], neigh, ipam), missing)):
                 found[i] = f
     data = sorted((dict({"vmid": g["vmid"], "name": g.get("name", ""), "type": g["type"],
                          "status": g.get("status", "")}, **f) for g, f in zip(items, found)),
@@ -1798,6 +1846,37 @@ def enterprise_repos():
     return found
 
 
+def sdn_checks(add):
+    """Only on hosts that use SDN zones: dnsmasq, pending changes, VNet bridges up, DHCP servers running."""
+    try:
+        sdn = sdn_state()
+    except ApiError as e:
+        return add("Proxmox SDN", "warn", str(e))
+    if not sdn["available"] or not sdn["zones"]:
+        return
+    dhcp = [z["zone"] for z in sdn["zones"] if z["dhcp"] and z["state"] != "deleted"]
+    if dhcp and sh(["dnsmasq", "--version"])[0] != 0:
+        add("SDN DHCP: dnsmasq", "fail", "zone(s) %s hand out DHCP but dnsmasq is missing - Network tab > Install dnsmasq "
+            "(or: apt install dnsmasq && systemctl disable --now dnsmasq)" % ", ".join(dhcp))
+    if not interfaces_sourced():
+        add("SDN: /etc/network/interfaces", "fail", "add 'source /etc/network/interfaces.d/*' at the end, then Apply on the Network tab")
+    add("SDN changes applied", _st(not sdn["pending"], warn=True),
+        "all applied" if not sdn["pending"] else "pending changes - Network tab > Apply SDN changes")
+    up = {n["iface"] for n in host_networks()}
+    for v in sdn["vnets"]:
+        if v["state"] in ("new", "deleted") or not v["subnets"]:
+            continue
+        add("SDN VNet %s" % v["vnet"], _st(v["vnet"] in up),
+            "bridge up, gateway %s" % ", ".join(x["gateway"] for x in v["subnets"]) if v["vnet"] in up else
+            "bridge has no address - Apply on the Network tab, or run: ifreload -a")
+    for z in dhcp:
+        if next(x for x in sdn["zones"] if x["zone"] == z)["state"] == "new":
+            continue
+        rc, out = sh(["systemctl", "is-active", "dnsmasq@%s" % z])
+        add("SDN DHCP server (zone %s)" % z, _st(rc == 0), "dnsmasq@%s %s" % (z, "running" if rc == 0 else
+            "not running - journalctl -u dnsmasq@%s" % z))
+
+
 def checks():
     cfg = STATE["cfg"]
     res = []
@@ -1851,6 +1930,20 @@ def checks():
             add("apt repositories", "warn", "Proxmox enterprise repos are enabled (%s) but there is no subscription, so "
                 "apt update fails with 401 - switch to no-subscription: curl -fsSL %s/master/install.sh | sh -s -- fix-repos"
                 % (", ".join(repos), REPO_RAW))
+    for t in cfg["wireguard"]["tunnels"]:
+        if t["enabled"]:
+            stt = wg_status(t)
+            online = sum(1 for x in stt["peers"].values() if x["online"])
+            add("WireGuard %s" % t["name"], _st(stt["up"]), "up, %d/%d peers online, UDP %d" % (online, len(t["peers"]), t["port"])
+                if stt["up"] else "down - try: wg-quick up %s; journalctl -u wg-quick@%s" % (t["name"], t["name"]))
+    sdn_checks(add)
+    fw = cfg["firewall"]
+    if fw["enabled"]:
+        add("firewall", "ok", "%s backend, policy %s, %d rule(s)%s" % (
+            "pve-gateway" if fw["backend"] == "custom" else "Proxmox", fw["policy"], len(fw["rules"]),
+            " - waiting for confirmation" if FW_PENDING.get("deadline") else ""))
+        if fw["backend"] == "custom" and sh(["pve-firewall", "status"])[1].find("enabled") >= 0:
+            add("two firewalls", "info", "the Proxmox firewall is also enabled; pve-gateway's rules run first (INPUT #1)")
     if f2b_installed():
         rc, out = sh(["fail2ban-client", "status"])
         add("fail2ban", _st(rc == 0, warn=True), (re.search(r"Jail list:\s*(.*)", out).group(1) or "no jails")
@@ -1976,6 +2069,12 @@ def sections():
         {"title": "Routes", "text": sh(["ip", "-4", "route"])[1]},
         {"title": "Listening sockets on host", "text": sh(["ss", "-Hlntup"])[1]},
         {"title": "Config " + conf_file(), "text": json.dumps(safe_cfg, indent=2)},
+        {"title": "wg show (keys hidden)", "text": re.sub(r"(private key|preshared key): \S+", r"\1: (hidden)",
+                                                           sh(["wg", "show"])[1]) if cfg["wireguard"]["tunnels"] else "(no tunnels)"},
+        {"title": "Proxmox SDN (zones, VNets, subnets, IPAM, DNS plugins without keys)",
+         "text": json.dumps(sdn_state(fresh=True), indent=1)},
+        {"title": "/etc/network/interfaces.d/sdn", "text": _read(MOCK.path_for("/etc/network/interfaces.d/sdn") if MOCK else
+                                                                 "/etc/network/interfaces.d/sdn") or "(not written - no SDN applied)"},
     ] + ([
         {"title": "nginx config " + cfg["nginx_conf"], "text": _read(nginx_conf_path(cfg)) or "(not written yet)"},
         {"title": "nginx -t", "text": sh(["nginx", "-t"])[1]},
@@ -2577,6 +2676,959 @@ def f2b_install():
     threading.Thread(target=job, daemon=True).start()
 
 
+# --------------------------------------------------------------------------- firewall
+
+CH_IN = "PVEGW_IN"
+FW_ACTIONS = ("ACCEPT", "DROP", "REJECT")
+FW_PROTOS = ("tcp", "udp", "icmp", "any")
+FW_PENDING = {}   # {"old": firewall cfg, "deadline": ts, "timer": Timer} while a change waits for confirmation
+FW_TEMPLATES = {
+    "web": ("Web server (HTTP/HTTPS)", [("ACCEPT", "tcp", "80,443", "")]),
+    "mail": ("Mail server", [("ACCEPT", "tcp", "25,465,587,110,995,143,993", "")]),
+    "dns": ("DNS server", [("ACCEPT", "tcp", "53", ""), ("ACCEPT", "udp", "53", "")]),
+    "wireguard": ("WireGuard VPN", [("ACCEPT", "udp", "51820", "")]),
+    "ssh": ("SSH", [("ACCEPT", "tcp", "22", "")]),
+    "proxmox": ("Proxmox web UI + console (8006, 3128, 5900-5999)", [("ACCEPT", "tcp", "8006,3128,5900-5999", "")]),
+    "database-lan": ("Databases from private networks only", [("ACCEPT", "tcp", "3306,5432,6379,27017", n) for n in
+                                                            ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")] +
+                     [("DROP", "tcp", "3306,5432,6379,27017", "")]),
+}
+PRIVATE_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+
+
+def fw_ports(spec):
+    """'22,80,8000-8100' -> normalised list of 'a' / 'a-b' (max 15 entries, iptables multiport)."""
+    out = []
+    if isinstance(spec, (list, tuple)):
+        spec = ",".join(str(x) for x in spec)
+    for part in re.split(r"[\s,]+", str(spec or "").strip()):
+        if part:
+            a, b = parse_ports(part)
+            out.append(str(a) if a == b else "%d-%d" % (a, b))
+    if len(out) > 15:
+        raise ApiError("at most 15 ports/ranges per rule")
+    return out
+
+
+def validate_fw_rule(data, cfg, rid=None):
+    if not isinstance(data, dict):
+        raise ApiError("rule must be an object")
+    r = {"id": rid or uuid.uuid4().hex[:8], "enabled": bool(data.get("enabled", True))}
+    r["action"] = str(data.get("action", "ACCEPT")).upper()
+    if r["action"] not in FW_ACTIONS:
+        raise ApiError("action must be ACCEPT, DROP or REJECT")
+    r["proto"] = str(data.get("proto", "tcp")).lower()
+    if r["proto"] not in FW_PROTOS:
+        raise ApiError("protocol must be tcp, udp, icmp or any")
+    r["ports"] = fw_ports(data.get("ports")) if r["proto"] in ("tcp", "udp") else []
+    if r["proto"] in ("tcp", "udp") and not r["ports"]:
+        raise ApiError("give the port(s) for a %s rule, e.g. 80,443 or 8000-8100" % r["proto"])
+    src = str(data.get("source", "") or "").strip()
+    if src:
+        try:
+            src = str(ipaddress.ip_network(src, strict=False))
+        except ValueError:
+            raise ApiError("source must be an IP address or network")
+        if src in ("0.0.0.0/0", "::/0"):  # = everyone
+            src = ""
+    r["source"] = src
+    r["comment"] = str(data.get("comment", "") or "").strip()
+    if not re.match(r"^[A-Za-z0-9 _.:/@+(),-]{0,50}$", r["comment"]):  # no quotes: it ends up in an iptables comment
+        raise ApiError("comment: max 50 chars, letters/digits/space and _.:/@+(),- only")
+    if r["action"] != "ACCEPT" and not r["source"] and r["enabled"]:  # never lock the admin out
+        vital = {22, 8006, int(cfg.get("port", 8099))}
+        covered = set()
+        for p in r["ports"] or (["1-65535"] if r["proto"] == "any" else []):
+            a, b = parse_ports(p)
+            covered |= {x for x in vital if a <= x <= b}
+        if covered:
+            raise ApiError("a %s rule for everyone on port %s would lock you out - give a source network"
+                           % (r["action"], ", ".join(map(str, sorted(covered)))))
+    return r
+
+
+def validate_fw(data, old, cfg):
+    f = json.loads(json.dumps(old))
+    if "backend" in data:
+        if data["backend"] not in ("custom", "pve"):
+            raise ApiError("backend must be custom or pve")
+        f["backend"] = data["backend"]
+    if "policy" in data:
+        if data["policy"] not in ("accept", "drop"):
+            raise ApiError("policy must be accept or drop")
+        f["policy"] = data["policy"]
+    for k in ("enabled", "allow_ping"):
+        if k in data:
+            f[k] = bool(data[k])
+    if "rules" in data:
+        if not isinstance(data["rules"], list) or len(data["rules"]) > 200:
+            raise ApiError("rules must be a list (max 200)")
+        f["rules"] = [validate_fw_rule(r, cfg, r.get("id") if isinstance(r, dict) else None) for r in data["rules"]]
+    return f
+
+
+def fw_safety(cfg):
+    """Rules the firewall always keeps open (before the user's rules) so the host stays manageable.
+    (action, proto, ports, source, why, in-interface)"""
+    f = cfg["firewall"]
+    ui_src = cfg.get("ui_allow") or [""]
+    rules = [("ACCEPT", "tcp", ["22"], "", "safety: SSH"), ("ACCEPT", "tcp", ["8006"], "", "safety: Proxmox UI")]
+    rules += [("ACCEPT", "tcp", [str(cfg.get("port", 8099))], s, "safety: pve-gateway UI") for s in ui_src]
+    if owns_web_ports(cfg):
+        rules.append(("ACCEPT", "tcp", ["80", "443"], "", "safety: domains (nginx)"))
+    if os.path.exists("/etc/pve/corosync.conf") and not MOCK:
+        rules.append(("ACCEPT", "udp", ["5405-5412"], "", "safety: cluster (corosync)"))
+    for t in cfg.get("wireguard", {}).get("tunnels", []):
+        if t["enabled"]:
+            rules.append(("ACCEPT", "udp", [str(t["port"])], "", "safety: WireGuard %s" % t["name"]))
+    if f.get("allow_ping"):
+        rules.append(("ACCEPT", "icmp", [], "", "ping"))
+    rules = [r + ("",) for r in rules]
+    if f.get("enabled"):  # guests on SDN VNets ask the host's dnsmasq for an address
+        rules += [("ACCEPT", "udp", ["67"], "", "safety: DHCP on %s" % v, v) for v in sdn_dhcp_vnets()]
+    return rules
+
+
+def fw_iptables(cfg, v6):
+    """iptables-restore payload for the PVEGW_IN chain (one address family)."""
+    f = cfg["firewall"]
+    out = ["*filter", ":%s - [0:0]" % CH_IN]
+    if not f["enabled"]:
+        return "\n".join(out + ["COMMIT"]) + "\n"
+    out += ["-A %s -i lo -j ACCEPT" % CH_IN, "-A %s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" % CH_IN,
+            "-A %s -m conntrack --ctstate INVALID -j DROP" % CH_IN]
+    if v6:  # neighbour discovery etc. - IPv6 breaks without it
+        out += ["-A %s -p ipv6-icmp -m icmp6 --icmpv6-type %s -j ACCEPT" % (CH_IN, t)
+                for t in ("neighbour-solicitation", "neighbour-advertisement", "router-advertisement", "packet-too-big")]
+
+    def emit(action, proto, ports, src, tag, iface=""):
+        if src and (":" in src) != v6:
+            return
+        base = "-A %s" % CH_IN + (" -i %s" % iface if iface else "") + (" -s %s" % src if src else "")
+        target = "-j %s" % action + (" --reject-with %s" % ("icmp6-port-unreachable" if v6 else "icmp-port-unreachable")
+                                     if action == "REJECT" else "")
+        cm = '-m comment --comment "gw:fw:%s"' % tag
+        if proto == "icmp":
+            out.append("%s -p %s %s %s" % (base, "ipv6-icmp -m icmp6 --icmpv6-type echo-request" if v6 else
+                                           "icmp -m icmp --icmp-type echo-request", cm, target))
+        elif proto == "any":
+            out.append("%s %s %s" % (base, cm, target))
+        else:
+            out.append("%s -p %s -m multiport --dports %s %s %s" % (base, proto, ",".join(p.replace("-", ":") for p in ports),
+                                                                     cm, target))
+    for action, proto, ports, src, why, iface in fw_safety(cfg):
+        emit(action, proto, ports, src, "safety", iface)
+    for r in f["rules"]:
+        if r["enabled"]:
+            emit(r["action"], r["proto"], r["ports"], r["source"], r["id"])
+    if f["policy"] == "drop":
+        out.append('-A %s -m comment --comment "gw:fw:policy" -j DROP' % CH_IN)
+    return "\n".join(out + ["COMMIT"]) + "\n"
+
+
+def apply_fw_custom(cfg):
+    for v6, restore, ipt in ((False, "iptables-restore", "iptables"), (True, "ip6tables-restore", "ip6tables")):
+        rc, out = run([restore, "--noflush"], fw_iptables(cfg, v6))
+        if rc != 0:
+            return "%s failed: %s" % (restore, out)
+        hooked = run([ipt, "-C", "INPUT", "-j", CH_IN], check_only=True)[0] == 0
+        if cfg["firewall"]["enabled"] and not hooked:
+            rc, out = run([ipt, "-I", "INPUT", "1", "-j", CH_IN])
+            if rc != 0:
+                return "cannot hook INPUT: %s" % out
+        elif not cfg["firewall"]["enabled"] and hooked:
+            run([ipt, "-D", "INPUT", "-j", CH_IN])
+    return None
+
+
+def node_name():
+    return socket.gethostname().split(".")[0]
+
+
+def pve_fw_rules():
+    """All rules of this node's Proxmox firewall (ordered)."""
+    rc, out = sh(["pvesh", "get", "/nodes/%s/firewall/rules" % node_name(), "--output-format", "json"])
+    if rc != 0:
+        raise ApiError("cannot read the Proxmox firewall rules: %s" % out[-200:], 500)
+    try:
+        return sorted(json.loads(out), key=lambda r: r.get("pos", 0))
+    except ValueError:
+        raise ApiError("unexpected answer from pvesh", 500)
+
+
+def apply_fw_pve(cfg):
+    """Replace pve-gateway's rules (comment pvegw:...) at the top of the node firewall, set options."""
+    f, node = cfg["firewall"], node_name()
+    try:
+        ours = [r for r in pve_fw_rules() if str(r.get("comment", "")).startswith("pvegw:")]
+    except ApiError as e:
+        return str(e)
+    for r in sorted(ours, key=lambda r: -r["pos"]):
+        rc, out = run(["pvesh", "delete", "/nodes/%s/firewall/rules/%d" % (node, r["pos"])])
+        if rc != 0:
+            return "cannot delete Proxmox firewall rule %d: %s" % (r["pos"], out)
+    wanted = []
+    if f["enabled"]:
+        wanted = [(a, p, ports, src, "safety: " + why.split(": ", 1)[-1], i) for a, p, ports, src, why, i in fw_safety(cfg)]
+        wanted += [(r["action"], r["proto"], r["ports"], r["source"], r["comment"] or r["id"], "") for r in f["rules"] if r["enabled"]]
+    for pos, (action, proto, ports, src, why, iface) in enumerate(wanted):
+        cmd = ["pvesh", "create", "/nodes/%s/firewall/rules" % node, "--type", "in", "--action", action, "--enable", "1",
+               "--pos", str(pos), "--comment", ("pvegw: " + why)[:60]]
+        if proto == "icmp":
+            cmd += ["--macro", "Ping"]
+        elif proto != "any":
+            cmd += ["--proto", proto, "--dport", ",".join(p.replace("-", ":") for p in ports)]
+        if src:
+            cmd += ["--source", src]
+        if iface:
+            cmd += ["--iface", iface]
+        rc, out = run(cmd)
+        if rc != 0:
+            return "cannot create Proxmox firewall rule (%s): %s" % (why, out[-200:])
+    if f["enabled"]:
+        for path, opts in (("/nodes/%s/firewall/options" % node, ["--enable", "1"]),
+                           ("/cluster/firewall/options", ["--enable", "1", "--policy_in", f["policy"].upper()])):
+            rc, out = run(["pvesh", "set", path] + opts)
+            if rc != 0:
+                return "cannot set Proxmox firewall options: %s" % out[-200:]
+    return None
+
+
+def apply_fw(cfg, old=None):
+    """Apply the firewall with the selected backend; when the backend changed, clear the previous one first."""
+    if old and old.get("backend") != cfg["firewall"]["backend"]:
+        prev = dict(cfg, firewall=dict(old, enabled=False))
+        (apply_fw_pve if old["backend"] == "pve" else apply_fw_custom)(prev)
+    with LOCK:
+        err = (apply_fw_pve if cfg["firewall"]["backend"] == "pve" else apply_fw_custom)(cfg)
+    if not err:
+        f = cfg["firewall"]
+        log("firewall (%s): %s, policy %s, %d rule(s)" % (f["backend"], "on" if f["enabled"] else "off", f["policy"], len(f["rules"])))
+    return err
+
+
+def fw_change(new_cfg, user):
+    """Apply now; keep it only if confirmed within 60 s (otherwise the previous firewall comes back)."""
+    old_fw = (FW_PENDING.get("old") if FW_PENDING else None) or STATE["cfg"]["firewall"]
+    if FW_PENDING.get("timer"):
+        FW_PENDING["timer"].cancel()
+    err = apply_fw(new_cfg, STATE["cfg"]["firewall"])
+    if err:
+        apply_fw(STATE["cfg"], new_cfg["firewall"])
+        raise ApiError(err, 500)
+    STATE["cfg"] = new_cfg
+    risky = new_cfg["firewall"]["enabled"]
+
+    def revert():
+        log("firewall change was not confirmed within 60 s - restoring the previous firewall", "warn")
+        cur = STATE["cfg"]["firewall"]
+        STATE["cfg"] = dict(STATE["cfg"], firewall=old_fw)
+        apply_fw(STATE["cfg"], cur)
+        FW_PENDING.clear()
+
+    if risky:
+        t = threading.Timer(60, revert)
+        t.daemon = True
+        t.start()
+        FW_PENDING.update(old=old_fw, deadline=time.time() + 60, timer=t)
+    else:
+        FW_PENDING.clear()
+        save_config(new_cfg)
+    log("%s changed the firewall%s" % (user, " (waiting for confirmation)" if risky else ""))
+
+
+def fw_confirm():
+    if FW_PENDING.get("timer"):
+        FW_PENDING["timer"].cancel()
+    FW_PENDING.clear()
+    save_config(STATE["cfg"])
+
+
+def fw_state(cfg):
+    f = cfg["firewall"]
+    res = {"settings": f, "safety": [{"action": a, "proto": p, "ports": po, "source": s, "why": w, "iface": i}
+                                        for a, p, po, s, w, i in fw_safety(cfg)],
+           "pending": max(0, int(FW_PENDING["deadline"] - time.time())) if FW_PENDING.get("deadline") else 0,
+           "templates": {k: v[0] for k, v in FW_TEMPLATES.items()}, "other_rules": [], "pve_enabled": None}
+    rc, st = sh(["pve-firewall", "status"])
+    res["pve_enabled"] = rc == 0 and "enabled" in st
+    if f["backend"] == "pve":
+        try:
+            res["other_rules"] = [r for r in pve_fw_rules() if not str(r.get("comment", "")).startswith("pvegw:")]
+        except ApiError as e:
+            res["error"] = str(e)
+    return res
+
+
+def fw_template_rules(name):
+    if name == "risky-lan":
+        ports = sorted({port for proto, port, scope, proc in exposed_services()
+                        if RISKY_PORTS.get(port) or 5900 <= port <= 5999})
+        if not ports:
+            raise ApiError("no risky services listen on all interfaces right now")
+        spec = ",".join(map(str, ports[:15]))
+        return [{"action": "ACCEPT", "proto": "tcp", "ports": spec, "source": n, "comment": "risky ports: LAN"} for n in PRIVATE_NETS] + \
+               [{"action": "DROP", "proto": "tcp", "ports": spec, "source": "", "comment": "risky ports: not from internet"}]
+    if name not in FW_TEMPLATES:
+        raise ApiError("unknown template")
+    label, rules = FW_TEMPLATES[name]
+    return [{"action": a, "proto": p, "ports": ports, "source": src, "comment": label[:40]} for a, p, ports, src in rules]
+
+
+# --------------------------------------------------------------------------- wireguard
+
+WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$")  # base64 of 32 bytes
+WG_NAME_RE = re.compile(r"^[a-z][a-z0-9]{0,14}$")
+WG_JOB = {"state": None, "msg": ""}
+
+
+def wg_secret(name, value=None):
+    """Read or write <config dir>/wireguard/<name> (0600)."""
+    d = os.path.join(CONF_DIR, "wireguard")
+    p = os.path.join(d, name)
+    if value is None:
+        return (_read(p) or "").strip()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(p + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(value.strip() + "\n")
+    os.replace(p + ".tmp", p)
+
+
+def wg_forget(name):
+    try:
+        os.remove(os.path.join(CONF_DIR, "wireguard", name))
+    except OSError:
+        pass
+
+
+def wg_installed():
+    return sh(["wg", "--version"])[0] == 0
+
+
+def wg_genkey():
+    rc, priv = run(["wg", "genkey"], check_only=True)
+    if rc != 0 or not WG_KEY_RE.match(priv.strip()):
+        raise ApiError("cannot generate a WireGuard key (is wireguard-tools installed?)", 500)
+    return priv.strip(), wg_pubkey(priv.strip())
+
+
+def wg_pubkey(priv):
+    rc, pub = run(["wg", "pubkey"], data=priv + "\n", check_only=True)
+    if rc != 0 or not WG_KEY_RE.match(pub.strip()):
+        raise ApiError("cannot derive the WireGuard public key", 500)
+    return pub.strip()
+
+
+def wg_defaults(cfg):
+    """Suggestions for a new tunnel: a free 10.99.x.0/24, port 51820, the public endpoint, guest networks."""
+    used = [ipaddress.ip_network(n["network"]) for n in host_networks()]
+    used += [ipaddress.ip_interface(t["address"]).network for t in cfg["wireguard"]["tunnels"]]
+    sub = next(n for n in ipaddress.ip_network("10.99.0.0/16").subnets(new_prefix=24) if not any(n.overlaps(u) for u in used))
+    ports = {t["port"] for t in cfg["wireguard"]["tunnels"]}
+    nets = host_networks()
+    pub = [n["ip"] for n in nets if n["public"]] or [n["ip"] for n in nets if n["wan"]]
+    return {"name": "wg%d" % len(cfg["wireguard"]["tunnels"]), "address": "%s/24" % next(sub.hosts()),
+            "port": next(p for p in range(51820, 52000) if p not in ports), "endpoint": pub[0] if pub else "",
+            "client_routes": [n["network"] for n in nets if not n["public"] and not n["wan"]]}
+
+
+def validate_wg_tunnel(data, others, cfg, tid=None):
+    t = {"id": tid or uuid.uuid4().hex[:8], "enabled": bool(data.get("enabled", True)), "nat": bool(data.get("nat", True))}
+    t["name"] = str(data.get("name", "")).strip()
+    if not WG_NAME_RE.match(t["name"]):
+        raise ApiError("interface name: lowercase letters/digits, e.g. wg0")
+    try:
+        itf = ipaddress.IPv4Interface(str(data.get("address", "")).strip())
+    except ValueError:
+        raise ApiError("tunnel address must be like 10.99.0.1/24")
+    if itf.network.prefixlen > 30 or itf.ip in (itf.network.network_address, itf.network.broadcast_address):
+        raise ApiError("tunnel address: a host address in a /30 or bigger network, e.g. 10.99.0.1/24")
+    t["address"] = str(itf)
+    try:
+        t["port"] = int(data.get("port", 51820))
+    except (TypeError, ValueError):
+        raise ApiError("port must be a number")
+    if not 1 <= t["port"] <= 65535:
+        raise ApiError("port out of range")
+    t["endpoint"] = str(data.get("endpoint", "") or "").strip().lower()
+    if t["endpoint"] and not (HOSTNAME_RE.match(t["endpoint"]) or _is_ip(t["endpoint"])):
+        raise ApiError("endpoint: this host's public hostname or IP that clients connect to")
+    t["client_routes"] = parse_networks(data.get("client_routes", []))
+    t["dns"] = [x for x in _as_list(data.get("dns", [])) if x.strip()]
+    if any(not _is_ip(x) for x in t["dns"]):
+        raise ApiError("DNS servers must be IP addresses")
+    for o in others:
+        if o["name"] == t["name"]:
+            raise ApiError("a tunnel named %s already exists" % t["name"])
+        if o["port"] == t["port"]:
+            raise ApiError("port %d is used by tunnel %s" % (t["port"], o["name"]))
+        if ipaddress.ip_interface(o["address"]).network.overlaps(itf.network):
+            raise ApiError("%s overlaps tunnel %s" % (itf.network, o["name"]))
+    for n in host_networks():
+        if ipaddress.ip_network(n["network"]).overlaps(itf.network):
+            raise ApiError("%s overlaps the host network on %s - pick another subnet" % (itf.network, n["iface"]))
+    t["peers"] = []
+    return t
+
+
+def validate_wg_peer(data, tunnel, pid=None):
+    p = {"id": pid or uuid.uuid4().hex[:8], "enabled": bool(data.get("enabled", True)), "psk": bool(data.get("psk", True))}
+    p["name"] = str(data.get("name", "")).strip()
+    if not p["name"] or not NAME_RE.match(p["name"]):
+        raise ApiError("name: 1-40 chars, letters/digits/space/_.:/@+- only")
+    p["kind"] = "site" if data.get("kind") == "site" else "device"
+    net = ipaddress.ip_interface(tunnel["address"]).network
+    taken = {ipaddress.ip_interface(tunnel["address"]).ip} | {ipaddress.ip_interface(x["address"]).ip
+                                                             for x in tunnel["peers"] if x["id"] != p["id"]}
+    addr = str(data.get("address", "") or "").strip()
+    if not addr:  # next free address in the tunnel
+        ip = next((h for h in net.hosts() if h not in taken), None)
+        if ip is None:
+            raise ApiError("the tunnel subnet is full")
+    else:
+        try:
+            ip = ipaddress.IPv4Interface(addr if "/" in addr else addr + "/32").ip
+        except ValueError:
+            raise ApiError("address must be an IP in %s" % net)
+        if ip not in net or ip in taken or ip in (net.network_address, net.broadcast_address):
+            raise ApiError("%s is not a free address in %s" % (ip, net))
+    p["address"] = "%s/32" % ip
+    p["allowed_ips"] = parse_networks(data.get("allowed_ips", [])) if p["kind"] == "site" else []
+    p["public_key"] = str(data.get("public_key", "") or "").strip()
+    if p["kind"] == "site" and not WG_KEY_RE.match(p["public_key"]):
+        raise ApiError("paste the site's WireGuard public key (44 characters ending in =)")
+    p["endpoint"] = str(data.get("endpoint", "") or "").strip()
+    if p["endpoint"]:
+        host, _, port = p["endpoint"].rpartition(":")
+        if not port.isdigit() or not 1 <= int(port) <= 65535 or not (HOSTNAME_RE.match(host.lower()) or _is_ip(host.strip("[]"))):
+            raise ApiError("endpoint must be host:port, e.g. office.example.com:51820")
+    try:
+        p["keepalive"] = int(data.get("keepalive", 25 if p["kind"] == "device" else 0) or 0)
+    except (TypeError, ValueError):
+        raise ApiError("keepalive must be seconds")
+    if not 0 <= p["keepalive"] <= 3600:
+        raise ApiError("keepalive: 0-3600 seconds")
+    for o in tunnel["peers"]:
+        if o["id"] != p["id"] and p["public_key"] and o["public_key"] == p["public_key"]:
+            raise ApiError("this public key is already used by peer %s" % o["name"])
+    return p
+
+
+def wg_server_conf(t):
+    out = ["# Generated by pve-gateway %s - managed in the web UI (VPN tab); changes here are overwritten." % VERSION,
+           "[Interface]", "Address = %s" % t["address"], "ListenPort = %d" % t["port"],
+           "PrivateKey = %s" % wg_secret(t["id"] + ".key")]
+    for p in t["peers"]:
+        if not p["enabled"] or not p["public_key"]:
+            continue
+        out += ["", "# %s (%s)" % (p["name"], p["kind"]), "[Peer]", "PublicKey = %s" % p["public_key"]]
+        psk = wg_secret(p["id"] + ".psk") if p["psk"] else ""
+        if psk:
+            out.append("PresharedKey = %s" % psk)
+        out.append("AllowedIPs = %s" % ", ".join([p["address"]] + p["allowed_ips"]))
+        if p["endpoint"]:
+            out.append("Endpoint = %s" % p["endpoint"])
+        if p["keepalive"] and p["kind"] == "site":
+            out.append("PersistentKeepalive = %d" % p["keepalive"])
+    return "\n".join(out) + "\n"
+
+
+def wg_client_conf(t, p):
+    priv = wg_secret(p["id"] + ".key")
+    if not priv:
+        raise ApiError("this device's private key isn't stored (it was created elsewhere) - nothing to download", 404)
+    net = str(ipaddress.ip_interface(t["address"]).network)
+    endpoint = t["endpoint"] or wg_defaults(STATE["cfg"])["endpoint"]
+    out = ["# %s - WireGuard config from pve-gateway (tunnel %s)" % (p["name"], t["name"]), "[Interface]",
+           "PrivateKey = %s" % priv, "Address = %s" % p["address"]]
+    if t["dns"]:
+        out.append("DNS = %s" % ", ".join(t["dns"]))
+    out += ["", "[Peer]", "PublicKey = %s" % t["public_key"]]
+    psk = wg_secret(p["id"] + ".psk") if p["psk"] else ""
+    if psk:
+        out.append("PresharedKey = %s" % psk)
+    out += ["Endpoint = %s:%d" % (("[%s]" % endpoint) if ":" in endpoint else endpoint, t["port"]),
+            "AllowedIPs = %s" % ", ".join([net] + t["client_routes"]),
+            "PersistentKeepalive = %d" % (p["keepalive"] or 25)]
+    return "\n".join(out) + "\n"
+
+
+def wg_conf_path(t):
+    p = "/etc/wireguard/%s.conf" % t["name"]
+    return MOCK.path_for(p) if MOCK else p
+
+
+def wg_is_up(name):
+    return sh(["wg", "show", name])[0] == 0
+
+
+def apply_wg(cfg, old=None):
+    """Write /etc/wireguard/<name>.conf (0600), bring tunnels up/down, sync peers without dropping sessions."""
+    if not cfg["wireguard"]["tunnels"] and not (old and old["wireguard"]["tunnels"]):
+        return None
+    if not wg_installed():
+        return "wireguard-tools is not installed - click Install or run: apt install wireguard-tools"
+    names = {t["name"] for t in cfg["wireguard"]["tunnels"]}
+    for t in (old or {}).get("wireguard", {}).get("tunnels", []):
+        if t["name"] not in names:  # tunnel removed
+            if wg_is_up(t["name"]):
+                run(["wg-quick", "down", t["name"]])
+            run(["systemctl", "disable", "wg-quick@%s" % t["name"]])
+            try:
+                os.remove(wg_conf_path(t))
+            except OSError:
+                pass
+    for t in cfg["wireguard"]["tunnels"]:
+        if DRY_RUN:
+            log("[dry-run] would write %s" % wg_conf_path(t))
+            continue
+        path = wg_conf_path(t)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(wg_server_conf(t))
+        os.replace(path + ".tmp", path)
+        up = wg_is_up(t["name"])
+        if t["enabled"]:
+            if up:  # reload peers in place: established sessions keep running
+                rc, stripped = run(["wg-quick", "strip", t["name"]], check_only=True)
+                tmp = os.path.join(os.path.dirname(path), ".%s.strip" % t["name"])
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(stripped + "\n")
+                rc, out = run(["wg", "syncconf", t["name"], tmp])
+                os.remove(tmp)
+            else:
+                rc, out = run(["wg-quick", "up", t["name"]])
+            if rc != 0:
+                return "WireGuard %s: %s" % (t["name"], out[-300:])
+            run(["systemctl", "enable", "wg-quick@%s" % t["name"]])
+        else:
+            if up:
+                run(["wg-quick", "down", t["name"]])
+            run(["systemctl", "disable", "wg-quick@%s" % t["name"]])
+    log("wireguard: %s" % ", ".join("%s %s (%d peers)" % (t["name"], "up" if t["enabled"] else "down", len(t["peers"]))
+                                    for t in cfg["wireguard"]["tunnels"]) or "no tunnels")
+    return None
+
+
+def wg_status(t):
+    """{"up", "peers": {public_key: {"endpoint", "handshake", "rx", "tx", "online"}}}"""
+    rc, out = sh(["wg", "show", t["name"], "dump"])
+    res = {"up": rc == 0, "peers": {}}
+    for line in out.splitlines()[1:] if rc == 0 else []:
+        f = line.split("\t")
+        if len(f) >= 8:
+            hs = int(f[4]) if f[4].isdigit() else 0
+            res["peers"][f[0]] = {"endpoint": "" if f[2] == "(none)" else f[2], "handshake": hs,
+                                  "rx": int(f[5]) if f[5].isdigit() else 0, "tx": int(f[6]) if f[6].isdigit() else 0,
+                                  "online": bool(hs) and time.time() - hs < 180}
+    return res
+
+
+def wg_install():
+    if WG_JOB.get("state") == "pending":
+        return
+    WG_JOB.update(state="pending", msg="installing wireguard-tools ...")
+
+    def job():
+        rc, out = run(["apt-get", "install", "-y", "-q", "wireguard-tools"], timeout=600)
+        WG_JOB.update(state="ok" if rc == 0 else "error",
+                      msg="wireguard-tools installed" if rc == 0 else "apt-get install failed: %s" % out[-300:])
+
+    threading.Thread(target=job, daemon=True).start()
+
+
+def wg_save(new, old, user, what):
+    """Apply WireGuard + the iptables side (NAT / forwarding / firewall port), then save."""
+    with LOCK:
+        err = apply_wg(new, old)
+        if err:
+            apply_wg(old, new)
+            raise ApiError(err, 500)
+        err = apply_rules(new)
+        if not err and new["firewall"]["enabled"]:
+            err = apply_fw(new)
+        if err:
+            raise ApiError(err, 500)
+        save_config(new)
+        STATE["cfg"] = new
+    log("%s %s" % (user, what))
+
+
+# --------------------------------------------------------------------------- sdn (DHCP / IPAM / DNS)
+# Everything lives in Proxmox SDN (/etc/pve/sdn, cluster-wide), driven through pvesh - pve-gateway keeps no copy.
+# Edits are "pending" in Proxmox until applied (Apply = `pvesh set /cluster/sdn`, reloads the node networks).
+
+SDN_ID_RE = re.compile(r"^[a-z][a-z0-9]{1,7}$")  # Proxmox: zone / vnet ids, 2-8 chars
+SDN_SUBNET_RE = re.compile(r"^[a-z][a-z0-9]{1,7}-[0-9.]+-\d{1,2}$")  # <zone>-<network>-<prefix>
+MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
+SDN_JOB = {"state": None, "msg": ""}
+SDN_CACHE = {"t": 0, "data": None}
+NIC_CACHE = {"t": 0, "data": []}
+
+
+def sdn_error(out):
+    out = (out or "").strip()
+    if re.search(r"No '\w+' handler defined|Method '[^']+' not implemented|command not found", out):
+        return "Proxmox SDN isn't available here - it needs Proxmox VE 8.1 or newer (apt install libpve-network-perl on 8.0)"
+    return out.splitlines()[-1][:300] if out else "pvesh failed"
+
+
+def pvesh_get(path, *args):
+    rc, out = sh(["pvesh", "get", path, "--output-format", "json"] + list(args), timeout=20)
+    if rc != 0:
+        raise ApiError(sdn_error(out), 502)
+    try:
+        return json.loads(out or "null")
+    except ValueError:
+        raise ApiError("unexpected answer from pvesh get %s" % path, 502)
+
+
+def pvesh_do(verb, path, opts=None, delete=()):
+    """pvesh create|set|delete <path> --key value ... (list values repeat the option); --delete clears options."""
+    cmd = ["pvesh", verb, path]
+    for k, v in (opts or {}).items():
+        for x in v if isinstance(v, list) else [v]:
+            cmd += ["--" + k, str(x)]
+    if delete:
+        cmd += ["--delete", ",".join(delete)]
+    rc, out = run(cmd, timeout=60)
+    SDN_CACHE["t"] = 0
+    if rc != 0:
+        raise ApiError(sdn_error(out), 400)
+    return out
+
+
+def _dhcp_ranges(v):
+    """Proxmox returns dhcp-range as property strings or objects: -> [[start, end], ...]."""
+    res = []
+    for x in v if isinstance(v, list) else ([v] if v else []):
+        if isinstance(x, str):
+            x = dict(kv.split("=", 1) for kv in x.split(",") if "=" in kv)
+        if isinstance(x, dict) and x.get("start-address") and x.get("end-address"):
+            res.append([x["start-address"], x["end-address"]])
+    return res
+
+
+def pve_version():
+    try:
+        v = pvesh_get("/version").get("version", "")
+    except (ApiError, AttributeError):
+        return "", False
+    m = re.match(r"^(\d+)\.(\d+)", v)
+    return v, bool(m) and (int(m.group(1)), int(m.group(2))) >= (8, 1)
+
+
+def interfaces_sourced():
+    """SDN writes /etc/network/interfaces.d/sdn - the main file has to include that directory."""
+    p = MOCK.path_for("/etc/network/interfaces") if MOCK else "/etc/network/interfaces"
+    return bool(re.search(r"^\s*(source\s+/etc/network/interfaces\.d/\*|source-directory\s+/etc/network/interfaces\.d)",
+                          _read(p) or "", re.M))
+
+
+def guest_nics():
+    """[{vmid, name, nic, mac, bridge}] for every guest NIC - shows which guests sit on which VNet."""
+    if time.time() - NIC_CACHE["t"] < 30:
+        return NIC_CACHE["data"]
+    res = []
+    for g in list_guests():
+        rc, conf = run(["qm" if g["type"] == "qemu" else "pct", "config", str(g["vmid"])], check_only=True)
+        for nic, opts in re.findall(r"^(net\d+):\s*(\S+)", conf if rc == 0 else "", re.M):
+            mac = re.search(r"(?:^|,)(?:\w+|hwaddr)=([0-9A-Fa-f:]{17})", opts)
+            br = re.search(r"(?:^|,)bridge=([^,]+)", opts)
+            if mac and br:
+                res.append({"vmid": g["vmid"], "name": g["name"], "nic": nic, "mac": mac.group(1).lower(), "bridge": br.group(1)})
+    NIC_CACHE.update(t=time.time(), data=res)
+    return res
+
+
+def sdn_ipam():
+    """IPAM entries of the built-in Proxmox IPAM (gateways, DHCP leases, reservations)."""
+    try:
+        items = pvesh_get("/cluster/sdn/ipams/pve/status") or []
+    except ApiError:
+        return []
+    return [{"zone": x.get("zone", ""), "vnet": x.get("vnet", ""), "subnet": x.get("subnet", ""), "ip": x.get("ip", ""),
+             "mac": str(x.get("mac", "")).lower(), "hostname": x.get("hostname", ""), "vmid": x.get("vmid"),
+             "gateway": bool(x.get("gateway"))} for x in items if isinstance(x, dict) and x.get("ip")]
+
+
+def sdn_state(fresh=False):
+    """Zones, VNets (with subnets), IPAM and DNS plugins as the UI shows them; 10 s cache."""
+    if not fresh and SDN_CACHE["data"] and time.time() - SDN_CACHE["t"] < 10:
+        return SDN_CACHE["data"]
+    res = {"available": False, "error": "", "zones": [], "vnets": [], "ipam": [], "dns": [], "pending": False}
+    try:
+        zones = pvesh_get("/cluster/sdn/zones") or []
+    except ApiError as e:
+        res["error"] = str(e)
+        SDN_CACHE.update(t=time.time(), data=res)
+        return res
+    res["available"] = True
+
+    def states(path, key):  # {id: "new"|"changed"|"deleted"} for objects not applied yet
+        try:
+            return {x[key]: x["state"] for x in pvesh_get(path, "--pending", "1") or [] if x.get(key) and x.get("state")}
+        except ApiError:
+            return {}
+    zst, vst = states("/cluster/sdn/zones", "zone"), states("/cluster/sdn/vnets", "vnet")
+    for z in zones:
+        res["zones"].append({"zone": z.get("zone"), "type": z.get("type", ""), "dhcp": z.get("dhcp", ""), "ipam": z.get("ipam", ""),
+                             "dns": z.get("dns", ""), "reversedns": z.get("reversedns", ""), "dnszone": z.get("dnszone", ""),
+                             "state": zst.get(z.get("zone"), "")})
+    res["zones"] += [{"zone": k, "type": "", "dhcp": "", "ipam": "", "dns": "", "reversedns": "", "dnszone": "", "state": v}
+                     for k, v in zst.items() if v == "deleted"]
+    try:
+        vnets = pvesh_get("/cluster/sdn/vnets") or []
+    except ApiError as e:
+        vnets, res["error"] = [], str(e)
+    for v in vnets + [{"vnet": k, "zone": "", "deleted": True} for k, s in vst.items() if s == "deleted"]:
+        name = v.get("vnet")
+        subs, sst = [], {}
+        if not v.get("deleted"):
+            try:
+                subs = pvesh_get("/cluster/sdn/vnets/%s/subnets" % name) or []
+            except ApiError as e:
+                res["error"] = str(e)
+            sst = states("/cluster/sdn/vnets/%s/subnets" % name, "subnet")
+        res["vnets"].append({
+            "vnet": name, "zone": v.get("zone", ""), "alias": v.get("alias", ""), "tag": v.get("tag"),
+            "state": vst.get(name, ""),
+            "subnets": [{"id": s.get("subnet"), "cidr": s.get("cidr") or s.get("subnet", "").split("-", 1)[-1].replace("-", "/"),
+                         "gateway": s.get("gateway", ""), "snat": bool(s.get("snat")),
+                         "dhcp_range": _dhcp_ranges(s.get("dhcp-range")), "dns_server": s.get("dhcp-dns-server", ""),
+                         "state": sst.get(s.get("subnet"), "")} for s in subs]
+                       + [{"id": k, "cidr": k.split("-", 1)[-1].replace("-", "/"), "gateway": "", "snat": False, "dhcp_range": [],
+                           "dns_server": "", "state": "deleted"} for k, s in sst.items() if s == "deleted"]})
+    res["ipam"] = sdn_ipam()
+    try:  # never pass the plugin's API key on
+        res["dns"] = [{"dns": d.get("dns"), "type": d.get("type", ""), "url": d.get("url", "")} for d in pvesh_get("/cluster/sdn/dns") or []]
+    except ApiError:
+        pass
+    res["pending"] = any(x["state"] for x in res["zones"] + res["vnets"]) or \
+        any(s["state"] for v in res["vnets"] for s in v["subnets"])
+    SDN_CACHE.update(t=time.time(), data=res)
+    return res
+
+
+def sdn_dhcp_vnets():
+    """Applied VNets whose zone hands out DHCP - the host firewall must let DHCP requests in on them."""
+    try:
+        s = sdn_state()
+    except ApiError:
+        return []
+    dhcp = {z["zone"] for z in s["zones"] if z["dhcp"] and z["state"] != "new"}
+    return sorted(v["vnet"] for v in s["vnets"] if v["zone"] in dhcp and v["state"] != "new")
+
+
+def validate_sdn_zone(data, sdn, zid=None):
+    """-> (opts for pvesh, options to delete). New zones are always 'simple' (one host, no VLAN setup needed)."""
+    opts, delete = {}, []
+    if not zid:
+        zid = str(data.get("zone", "")).strip()
+        if not SDN_ID_RE.match(zid):
+            raise ApiError("zone id: 2-8 lowercase letters/digits, starting with a letter (e.g. lab)")
+        if any(z["zone"] == zid for z in sdn["zones"]):
+            raise ApiError("zone %s already exists" % zid)
+        opts.update(zone=zid, type="simple", ipam="pve")
+    if data.get("dhcp"):
+        opts["dhcp"] = "dnsmasq"
+    elif zid:
+        delete.append("dhcp")
+    plugins = {d["dns"] for d in sdn["dns"]}
+    for k in ("dns", "reversedns"):
+        v = str(data.get(k, "") or "").strip()
+        if v and v not in plugins:
+            raise ApiError("unknown DNS plugin %s - add it in Proxmox: Datacenter > SDN > Options > DNS" % v)
+        if v:
+            opts[k] = v
+        else:
+            delete.append(k)
+    dz = str(data.get("dnszone", "") or "").strip().lower().rstrip(".")
+    if dz and not HOSTNAME_RE.match(dz):
+        raise ApiError("DNS zone must be a domain, e.g. lab.example.com")
+    if (opts.get("dns") or opts.get("reversedns")) and not dz:
+        raise ApiError("set the DNS zone (domain) the guests' names are registered in")
+    if dz:
+        opts["dnszone"] = dz
+    else:
+        delete.append("dnszone")
+    return opts, [] if "type" in opts else delete
+
+
+def validate_sdn_vnet(data, sdn):
+    vid = str(data.get("vnet", "")).strip()
+    if not SDN_ID_RE.match(vid):
+        raise ApiError("VNet name: 2-8 lowercase letters/digits, starting with a letter (it becomes the bridge name)")
+    if any(v["vnet"] == vid for v in sdn["vnets"]):
+        raise ApiError("VNet %s already exists" % vid)
+    if vid in list_ifaces() or any(n["iface"] == vid for n in host_networks()):
+        raise ApiError("%s is already an interface on this host - pick another name" % vid)
+    zone = next((z for z in sdn["zones"] if z["zone"] == data.get("zone")), None)
+    if not zone or zone["state"] == "deleted":
+        raise ApiError("pick the zone this VNet belongs to")
+    if zone["type"] != "simple":
+        raise ApiError("zone %s is a %s zone - create its VNets in the Proxmox UI (they need a VLAN tag etc.)" % (zone["zone"], zone["type"]))
+    alias = str(data.get("alias", "") or "").strip()
+    if not NAME_RE.match(alias):
+        raise ApiError("description: up to 40 chars, letters/digits/space/_.:/@+- only")
+    return {"vnet": vid, "zone": zone["zone"]}, alias
+
+
+def _sdn_ip(v, net, what):
+    try:
+        ip = ipaddress.IPv4Address(str(v).strip())
+    except ValueError:
+        raise ApiError("%s must be an IPv4 address in %s" % (what, net))
+    if ip not in net or ip in (net.network_address, net.broadcast_address):
+        raise ApiError("%s %s is not a usable address in %s" % (what, ip, net))
+    return ip
+
+
+def validate_sdn_subnet(data, vnet, sdn, cfg, sid=None):
+    """-> pvesh opts. IPv4; must not clash with host networks, other subnets or WireGuard tunnels."""
+    if sid:
+        cur = next((s for s in vnet["subnets"] if s["id"] == sid), None)
+        net = ipaddress.IPv4Network(cur["cidr"])
+    else:
+        try:
+            net = ipaddress.IPv4Network(str(data.get("cidr", "")).strip(), strict=False)
+        except ValueError:
+            raise ApiError("subnet must be like 10.20.30.0/24")
+        if not 8 <= net.prefixlen <= 29:
+            raise ApiError("subnet size: /8 to /29")
+        if not net.is_private:
+            raise ApiError("use a private range (10.x, 172.16-31.x, 192.168.x) - guests get it via DHCP/NAT")
+        for v in sdn["vnets"]:
+            for s in v["subnets"]:
+                if s["state"] != "deleted" and ipaddress.ip_network(s["cidr"]).overlaps(net):
+                    raise ApiError("%s overlaps subnet %s on VNet %s" % (net, s["cidr"], v["vnet"]))
+        for n in host_networks():
+            if n["iface"] != vnet["vnet"] and ipaddress.ip_network(n["network"]).overlaps(net):
+                raise ApiError("%s overlaps the host network %s on %s" % (net, n["network"], n["iface"]))
+        for t in cfg["wireguard"]["tunnels"]:
+            if ipaddress.ip_interface(t["address"]).network.overlaps(net):
+                raise ApiError("%s overlaps WireGuard tunnel %s" % (net, t["name"]))
+    gw = _sdn_ip(data.get("gateway") or next(net.hosts()), net, "gateway")
+    opts = {"gateway": str(gw), "snat": 1 if data.get("snat", True) else 0}
+    ranges = []
+    for r in _as_list(data.get("dhcp_range", [])):
+        r = r.strip() if isinstance(r, str) else "-".join(r)
+        if not r:
+            continue
+        a, _, b = r.replace(" ", "").partition("-")
+        start, end = _sdn_ip(a, net, "DHCP range start"), _sdn_ip(b or a, net, "DHCP range end")
+        if start > end:
+            raise ApiError("DHCP range %s: the start must come before the end" % r)
+        if start <= gw <= end:
+            raise ApiError("DHCP range %s contains the gateway %s" % (r, gw))
+        ranges.append("start-address=%s,end-address=%s" % (start, end))
+    zone = next((z for z in sdn["zones"] if z["zone"] == vnet["zone"]), {})
+    if ranges and not zone.get("dhcp"):
+        raise ApiError("zone %s has DHCP off - turn it on in the zone first" % vnet["zone"])
+    dns = str(data.get("dns_server", "") or "").strip()
+    if dns and not _is_ip(dns):
+        raise ApiError("DNS server for DHCP clients must be an IP address")
+    if not sid:
+        opts.update(subnet=str(net), type="subnet")
+    delete = []
+    for k, v in (("dhcp-range", ranges), ("dhcp-dns-server", dns)):
+        if v:
+            opts[k] = v
+        elif sid:
+            delete.append(k)
+    return opts, delete
+
+
+def validate_sdn_ip(data, vnet, sdn):
+    """A fixed IP for a MAC address (DHCP reservation) in the Proxmox IPAM."""
+    try:
+        ip = ipaddress.IPv4Address(str(data.get("ip", "")).strip())
+    except ValueError:
+        raise ApiError("IP must be an IPv4 address")
+    sub = next((s for s in vnet["subnets"] if s["state"] != "deleted" and ip in ipaddress.ip_network(s["cidr"])), None)
+    if not sub:
+        raise ApiError("%s is not in a subnet of %s (%s)" % (ip, vnet["vnet"], ", ".join(s["cidr"] for s in vnet["subnets"]) or "none yet"))
+    _sdn_ip(ip, ipaddress.ip_network(sub["cidr"]), "IP")
+    if str(ip) == sub["gateway"]:
+        raise ApiError("%s is the gateway" % ip)
+    mac = str(data.get("mac", "")).strip().lower().replace("-", ":")
+    if not MAC_RE.match(mac):
+        raise ApiError("MAC must look like bc:24:11:12:34:56 (Proxmox shows it on the guest's network device)")
+    for e in sdn["ipam"]:
+        if e["ip"] == str(ip):
+            raise ApiError("%s is already used by %s" % (ip, e["hostname"] or e["mac"] or "the gateway"))
+        if e["mac"] == mac and e["vnet"] == vnet["vnet"]:
+            raise ApiError("%s already has %s - delete that entry first" % (mac, e["ip"]))
+    opts = {"zone": vnet["zone"], "ip": str(ip), "mac": mac}
+    if str(data.get("vmid", "") or "").strip():
+        try:
+            opts["vmid"] = int(data["vmid"])
+        except (TypeError, ValueError):
+            raise ApiError("VM ID must be a number")
+    return opts
+
+
+def sdn_apply():
+    """`pvesh set /cluster/sdn` starts a task that rewrites the SDN network config on every node; wait for it."""
+    if SDN_JOB.get("state") == "pending":
+        return
+    SDN_JOB.update(state="pending", msg="applying SDN configuration ...", t=time.time())
+
+    def job():
+        rc, out = run(["pvesh", "set", "/cluster/sdn"], timeout=120)
+        err = None if rc == 0 else sdn_error(out)
+        upid = re.search(r"UPID:\S+", out or "")
+        for _ in range(120) if upid and not err else []:
+            try:
+                st = pvesh_get("/nodes/%s/tasks/%s/status" % (node_name(), upid.group(0)))
+            except ApiError as e:
+                err = str(e)
+                break
+            if st.get("status") == "stopped":
+                if st.get("exitstatus") != "OK":
+                    err = "Proxmox reported: %s (see Datacenter > SDN in the Proxmox UI or the task log)" % st.get("exitstatus")
+                break
+            time.sleep(1)
+        NET_CACHE["data"], SDN_CACHE["t"], GUEST_CACHE["t"], NIC_CACHE["t"] = None, 0, 0, 0
+        SDN_JOB.update(state="error" if err else "ok", msg=err or "SDN configuration applied", t=time.time())
+        log("SDN apply: %s" % (err or "ok"), "error" if err else "info")
+        if not err and STATE["cfg"]["firewall"]["enabled"]:  # DHCP on new VNets
+            e2 = apply_fw(STATE["cfg"])
+            if e2:
+                log("firewall after SDN apply: %s" % e2, "warn")
+
+    threading.Thread(target=job, daemon=True).start()
+
+
+def dnsmasq_install():
+    """Proxmox runs one dnsmasq per zone (dnsmasq@<zone>); the default instance must stay off."""
+    if SDN_JOB.get("state") == "pending":
+        return
+    SDN_JOB.update(state="pending", msg="installing dnsmasq ...", t=time.time())
+
+    def job():
+        rc, out = run(["apt-get", "install", "-y", "-q", "dnsmasq"], timeout=600)
+        if rc == 0:
+            run(["systemctl", "disable", "--now", "dnsmasq"])
+        SDN_JOB.update(state="ok" if rc == 0 else "error", t=time.time(),
+                       msg="dnsmasq installed" if rc == 0 else "apt-get install failed: %s" % out[-300:])
+
+    threading.Thread(target=job, daemon=True).start()
+
+
+def sdn_info():
+    """GET /api/sdn: SDN state + host requirements + which guest NICs are on which VNet."""
+    s = dict(sdn_state())
+    ver, dhcp_ok = pve_version()
+    s.update(version=ver, dhcp_ok=dhcp_ok, dnsmasq=sh(["dnsmasq", "--version"])[0] == 0, sourced=interfaces_sourced(), job=SDN_JOB)
+    vnets = {v["vnet"] for v in s["vnets"]}
+    s["nics"] = [n for n in guest_nics() if n["bridge"] in vnets] if s["available"] else []
+    return s
+
+
 # --------------------------------------------------------------------------- updates
 
 UPDATE = {"latest": None, "changes": [], "checked": None, "error": None, "running": False, "started": None}
@@ -2755,7 +3807,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log("%s %s" % (self.client_address[0], fmt % args), "debug")
 
-    def send(self, code, body, ctype="application/json", cookies=()):
+    def send(self, code, body, ctype="application/json", cookies=(), headers=()):
         if ctype == "application/json":
             body = json.dumps(body)
         body = body.encode() if isinstance(body, str) else body
@@ -2768,6 +3820,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
         for c in cookies:
             self.send_header("Set-Cookie", c)
+        for k, v in headers:
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -2918,6 +3972,54 @@ class Handler(BaseHTTPRequestHandler):
                 "wildcards": cfg["wildcards"], "wildcard_status": wildcard_status(cfg), "dns_providers": DNS_PROVIDERS,
                 "nginx": {"last_apply": NGINX["last_apply"], "last_error": NGINX["last_error"]},
             })
+        if path == "/api/wireguard" and method == "GET":
+            tunnels = []
+            for t in cfg["wireguard"]["tunnels"]:
+                tunnels.append(dict(t, status=wg_status(t), peers=[dict(p, has_key=bool(wg_secret(p["id"] + ".key")))
+                                                                   for p in t["peers"]]))
+            return self.send(200, {"installed": wg_installed(), "job": WG_JOB, "tunnels": tunnels, "defaults": wg_defaults(cfg)})
+        if path == "/api/wireguard/install" and method == "POST":
+            wg_install()
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/wireguard/tunnels(?:/([0-9a-f]{1,16}))?(?:/peers(?:/([0-9a-f]{1,16}))?(/config)?)?$", path)
+        if m:
+            return self.wireguard_api(method, path, m.group(1), m.group(2), bool(m.group(3)), user)
+        if path == "/api/sdn" and method == "GET":
+            return self.send(200, sdn_info())
+        if path == "/api/sdn/install" and method == "POST":
+            dnsmasq_install()
+            log("%s started the dnsmasq installation" % user)
+            return self.send(200, {"ok": True})
+        if path == "/api/sdn/apply" and method == "POST":
+            sdn_apply()
+            log("%s applied the SDN configuration" % user)
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/sdn/(zones|vnets)(?:/([a-z][a-z0-9]{1,7}))?(?:/(subnets|ips)(?:/([0-9a-z.-]{1,40}))?)?$", path)
+        if m:
+            return self.sdn_api(method, m.group(1), m.group(2), m.group(3), m.group(4), user)
+        if path == "/api/firewall" and method == "GET":
+            return self.send(200, dict(fw_state(cfg), client_ip=self.client_ip()))
+        if path == "/api/firewall" and method == "PUT":
+            with LOCK:
+                new = dict(STATE["cfg"], firewall=validate_fw(self.body(), STATE["cfg"]["firewall"], STATE["cfg"]))
+            fw_change(new, user)
+            return self.send(200, dict(fw_state(STATE["cfg"]), client_ip=self.client_ip()))
+        if path == "/api/firewall/confirm" and method == "POST":
+            fw_confirm()
+            log("%s confirmed the firewall change" % user)
+            return self.send(200, {"ok": True})
+        if path == "/api/firewall/revert" and method == "POST":
+            if FW_PENDING.get("timer"):
+                FW_PENDING["timer"].cancel()
+                old = FW_PENDING["old"]
+                cur = STATE["cfg"]["firewall"]
+                STATE["cfg"] = dict(STATE["cfg"], firewall=old)
+                apply_fw(STATE["cfg"], cur)
+                FW_PENDING.clear()
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/firewall/template/([\w-]{1,30})$", path)
+        if m and method == "GET":
+            return self.send(200, {"rules": fw_template_rules(m.group(1))})
         if path == "/api/fail2ban" and method == "GET":
             return self.send(200, dict(f2b_status(), settings=cfg["fail2ban"], jail_info={j: d for j, (d, _) in F2B_JAILS.items()},
                                        file=F2B_JAIL_FILE, client_ip=self.client_ip()))
@@ -3184,6 +4286,174 @@ class Handler(BaseHTTPRequestHandler):
             issue_cert(dom["id"])  # no-op for certbot if the cert already covers these names
         return self.send(200, {"ok": True})
 
+    def wireguard_api(self, method, path, tid, pid, config, user):
+        cfg = STATE["cfg"]
+        tunnels = json.loads(json.dumps(cfg["wireguard"]["tunnels"]))
+        t = next((x for x in tunnels if x["id"] == tid), None) if tid else None
+        if tid and not t:
+            raise ApiError("tunnel not found", 404)
+        if "/peers" not in path:  # tunnel itself
+            if method == "POST" and not tid:
+                if not wg_installed():
+                    raise ApiError("wireguard-tools is not installed - click Install first")
+                new_t = validate_wg_tunnel(self.body(), tunnels, cfg)
+                priv, new_t["public_key"] = wg_genkey()
+                wg_secret(new_t["id"] + ".key", priv)
+                tunnels.append(new_t)
+                what = "created WireGuard tunnel %s" % new_t["name"]
+            elif method == "PUT" and t:
+                upd = validate_wg_tunnel(dict(t, **self.body()), [x for x in tunnels if x["id"] != tid], cfg, tid)
+                upd.update(public_key=t["public_key"], peers=t["peers"])
+                tunnels[tunnels.index(t)] = upd
+                what = "changed WireGuard tunnel %s" % upd["name"]
+            elif method == "DELETE" and t:
+                tunnels.remove(t)
+                for x in [t] + t["peers"]:
+                    wg_forget(x["id"] + ".key")
+                    wg_forget(x["id"] + ".psk")
+                what = "deleted WireGuard tunnel %s" % t["name"]
+            else:
+                raise ApiError("method not allowed", 405)
+            wg_save(dict(cfg, wireguard={"tunnels": tunnels}), cfg, user, what)
+            return self.send(200, {"ok": True})
+        if not t:
+            raise ApiError("tunnel not found", 404)
+        peer = next((x for x in t["peers"] if x["id"] == pid), None) if pid else None
+        if pid and not peer:
+            raise ApiError("peer not found", 404)
+        if config:
+            if method != "GET":
+                raise ApiError("method not allowed", 405)
+            conf = wg_client_conf(t, peer)
+            fname = re.sub(r"[^A-Za-z0-9_.-]+", "-", peer["name"]).strip("-")[:30] or "peer"
+            return self.send(200, conf, "text/plain", headers=[("Content-Disposition", 'attachment; filename="%s.conf"' % fname)])
+        result = {"ok": True}
+        if method == "POST" and not pid:
+            np_ = validate_wg_peer(self.body(), t)
+            if np_["kind"] == "device":
+                priv, np_["public_key"] = wg_genkey()
+                wg_secret(np_["id"] + ".key", priv)
+            if np_["psk"]:
+                rc, psk = run(["wg", "genpsk"], check_only=True)
+                if rc == 0 and WG_KEY_RE.match(psk.strip()):
+                    wg_secret(np_["id"] + ".psk", psk.strip())
+            t["peers"].append(np_)
+            what, peer = "added WireGuard peer %s to %s" % (np_["name"], t["name"]), np_
+        elif method == "PUT" and peer:
+            body = self.body()
+            upd = validate_wg_peer(dict(peer, **body), t, pid)
+            if upd["kind"] == "device":
+                upd["public_key"] = peer["public_key"]
+            t["peers"][t["peers"].index(peer)] = upd
+            what, peer = "changed WireGuard peer %s" % upd["name"], upd
+        elif method == "DELETE" and peer:
+            t["peers"].remove(peer)
+            wg_forget(peer["id"] + ".key")
+            wg_forget(peer["id"] + ".psk")
+            what, peer = "removed WireGuard peer %s" % peer["name"], None
+        else:
+            raise ApiError("method not allowed", 405)
+        wg_save(dict(cfg, wireguard={"tunnels": tunnels}), cfg, user, what)
+        if peer and method == "POST" and peer["kind"] == "device":
+            result["config"] = wg_client_conf(t, peer)
+            result["peer"] = peer["id"]
+        return self.send(200, result)
+
+    def sdn_api(self, method, kind, oid, sub, sid, user):
+        with LOCK:
+            sdn = sdn_state(fresh=True)
+            if not sdn["available"]:
+                raise ApiError(sdn["error"])
+            if kind == "zones":
+                z = next((x for x in sdn["zones"] if x["zone"] == oid), None) if oid else None
+                if sub or (oid and not z):
+                    raise ApiError("zone not found", 404)
+                if method == "POST" and not oid:
+                    opts, _ = validate_sdn_zone(self.body(), sdn)
+                    pvesh_do("create", "/cluster/sdn/zones", opts)
+                    what = "created SDN zone %s" % opts["zone"]
+                elif method == "PUT" and z:
+                    opts, delete = validate_sdn_zone(self.body(), sdn, oid)
+                    pvesh_do("set", "/cluster/sdn/zones/" + oid, opts, delete)
+                    what = "changed SDN zone %s" % oid
+                elif method == "DELETE" and z:
+                    left = [v["vnet"] for v in sdn["vnets"] if v["zone"] == oid and v["state"] != "deleted"]
+                    if left:
+                        raise ApiError("zone %s still has VNets (%s) - delete them first" % (oid, ", ".join(left)))
+                    pvesh_do("delete", "/cluster/sdn/zones/" + oid)
+                    what = "deleted SDN zone %s" % oid
+                else:
+                    raise ApiError("method not allowed", 405)
+                log("%s %s" % (user, what))
+                return self.send(200, {"ok": True})
+            v = next((x for x in sdn["vnets"] if x["vnet"] == oid), None) if oid else None
+            if oid and not v:
+                raise ApiError("VNet not found", 404)
+            base = "/cluster/sdn/vnets/%s" % oid
+            if not sub:
+                if method == "POST" and not oid:
+                    opts, alias = validate_sdn_vnet(self.body(), sdn)
+                    if alias:
+                        opts["alias"] = alias
+                    pvesh_do("create", "/cluster/sdn/vnets", opts)
+                    what = "created SDN VNet %s" % opts["vnet"]
+                elif method == "PUT" and v:
+                    alias = str(self.body().get("alias", "") or "").strip()
+                    if not NAME_RE.match(alias):
+                        raise ApiError("description: up to 40 chars, letters/digits/space/_.:/@+- only")
+                    pvesh_do("set", base, {"alias": alias} if alias else {}, [] if alias else ["alias"])
+                    what = "changed SDN VNet %s" % oid
+                elif method == "DELETE" and v:
+                    nics = ["%s (%s)" % (n["name"] or n["vmid"], n["nic"]) for n in guest_nics() if n["bridge"] == oid]
+                    if nics:
+                        raise ApiError("still used by %s - move those network devices to another bridge first" % ", ".join(nics))
+                    if any(s_["state"] != "deleted" for s_ in v["subnets"]):
+                        raise ApiError("delete the subnets of %s first" % oid)
+                    pvesh_do("delete", base)
+                    what = "deleted SDN VNet %s" % oid
+                else:
+                    raise ApiError("method not allowed", 405)
+            elif sub == "subnets" and v:
+                s_ = next((x for x in v["subnets"] if x["id"] == sid), None) if sid else None
+                if sid and (not s_ or not SDN_SUBNET_RE.match(sid)):
+                    raise ApiError("subnet not found", 404)
+                if method == "POST" and not sid:
+                    opts, _ = validate_sdn_subnet(self.body(), v, sdn, STATE["cfg"])
+                    pvesh_do("create", base + "/subnets", opts)
+                    what = "added subnet %s to VNet %s" % (opts["subnet"], oid)
+                elif method == "PUT" and s_:
+                    opts, delete = validate_sdn_subnet(self.body(), v, sdn, STATE["cfg"], sid)
+                    pvesh_do("set", base + "/subnets/" + sid, opts, delete)
+                    what = "changed subnet %s" % s_["cidr"]
+                elif method == "DELETE" and s_:
+                    pvesh_do("delete", base + "/subnets/" + sid)
+                    what = "deleted subnet %s" % s_["cidr"]
+                else:
+                    raise ApiError("method not allowed", 405)
+            elif sub == "ips" and v:
+                if method == "POST" and not sid:
+                    opts = validate_sdn_ip(self.body(), v, sdn)
+                    pvesh_do("create", base + "/ips", opts)
+                    what = "reserved %s for %s on %s" % (opts["ip"], opts["mac"], oid)
+                elif method == "DELETE" and sid:
+                    e = next((x for x in sdn["ipam"] if x["vnet"] == oid and x["ip"] == sid), None)
+                    if not e:
+                        raise ApiError("no IPAM entry for %s on %s" % (sid, oid), 404)
+                    if e["gateway"]:
+                        raise ApiError("that is the subnet's gateway - change the subnet instead")
+                    opts = {"zone": v["zone"], "ip": sid}
+                    if e["mac"]:
+                        opts["mac"] = e["mac"]
+                    pvesh_do("delete", base + "/ips", opts)
+                    what = "removed IPAM entry %s on %s" % (sid, oid)
+                else:
+                    raise ApiError("method not allowed", 405)
+            else:
+                raise ApiError("not found", 404)
+        GUEST_CACHE["t"] = 0
+        log("%s %s" % (user, what))
+        return self.send(200, {"ok": True})
+
     def wildcards_api(self, method, wid, cfg, user):
         with LOCK:
             wcs = list(cfg["wildcards"])
@@ -3301,6 +4571,14 @@ def cert_reloader(ctx, cert, key):
 def serve(cfg):
     apply_rules()
     apply_nginx()
+    if cfg["wireguard"]["tunnels"]:
+        err = apply_wg(cfg)
+        if err:
+            log(err, "error")
+    if cfg["firewall"]["enabled"] and cfg["firewall"]["backend"] == "custom":
+        err = apply_fw(cfg)
+        if err:
+            log(err, "error")
     threading.Thread(target=watchdog, daemon=True).start()
     threading.Thread(target=update_checker, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
@@ -3348,7 +4626,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="app" hidden>
   <header>
     <h1 class="brand"><img src="/favicon.svg" alt="" width="26" height="26">PVE Gateway</h1>
-    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#monitor" data-view="monitor">Monitor</a><a href="#security" data-view="security">Security</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
+    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#monitor" data-view="monitor">Monitor</a><a href="#security" data-view="security">Security</a><a href="#vpn" data-view="vpn">VPN</a><a href="#network" data-view="network">Network</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
     <div id="status" class="chips"></div>
     <span class="spacer"></span>
     <span id="who" class="muted"></span>
@@ -3440,13 +4718,52 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </main>
   <main id="view-security" hidden>
-    <div class="sub-head" style="margin-top:0"><h2>Fail2ban</h2><span id="f2bState"></span><span class="spacer"></span>
+    <div class="sub-head" style="margin-top:0"><h2>Firewall</h2><span id="fwState"></span><span class="spacer"></span>
+      <span id="fwDirty" class="muted small"></span><button type="button" id="fwApply">Apply</button></div>
+    <div id="fwPending" class="card banner warn-banner" hidden>The new firewall is active. <b>Can you still reach this page?</b>
+      It is reverted in <b id="fwLeft"></b> s unless you keep it.
+      <span class="spacer"></span><button type="button" id="fwKeep">Keep</button><button type="button" class="ghost" id="fwRevert">Revert now</button></div>
+    <p id="fwErr" class="err"></p>
+    <div class="card form-card">
+      <div class="grid">
+        <label>Backend<select id="fwBackend"><option value="custom">pve-gateway (iptables + ip6tables)</option>
+          <option value="pve">Proxmox firewall (rules visible in the Proxmox UI)</option></select></label>
+        <label>Traffic no rule matches<select id="fwPolicy"><option value="accept">allow (only DROP/REJECT rules block)</option>
+          <option value="drop">drop (only allowed ports are open)</option></select></label>
+        <label class="check"><input type="checkbox" id="fwEnabled"> Firewall enabled</label>
+        <label class="check"><input type="checkbox" id="fwPing"> Answer ping</label>
+      </div>
+      <p class="hint" id="fwSafety"></p>
+    </div>
+    <div class="bar" style="margin-top:12px">
+      <button type="button" class="ghost" id="fwAdd">+ Add rule</button>
+      <select id="fwTemplate"><option value="">Add from template…</option></select>
+    </div>
+    <div class="card scroll">
+      <table><thead><tr><th>#</th><th>On</th><th>Action</th><th>Proto</th><th>Ports</th><th>Source</th><th>Comment</th><th></th></tr></thead>
+        <tbody id="fwRules"></tbody></table>
+      <p id="fwEmpty" class="muted pad" hidden>No rules yet - add one or start from a template.</p>
+    </div>
+    <div id="fwOtherWrap" hidden>
+      <div class="sub-head"><h2>Other Proxmox firewall rules</h2><span class="muted small">not managed by pve-gateway, evaluated after its rules</span></div>
+      <div class="card scroll"><table><thead><tr><th>#</th><th>Action</th><th>Proto</th><th>Ports</th><th>Source</th><th>Comment</th></tr></thead>
+        <tbody id="fwOther"></tbody></table></div>
+    </div>
+    <div class="sub-head"><h2>Fail2ban</h2><span id="f2bState"></span><span class="spacer"></span>
       <button type="button" id="f2bInstall" hidden>Install fail2ban</button>
       <button type="button" class="ghost" id="f2bUnbanAll" hidden>Unban all</button></div>
     <p id="f2bMsg" class="muted small"></p>
     <div class="card scroll" id="f2bJailsCard" hidden>
-      <table><thead><tr><th>Jail</th><th class="num">Failed now / total</th><th class="num">Banned now / total</th><th>Banned IPs</th></tr></thead>
+      <table><thead><tr><th>Jail</th><th class="num">Failed now / total</th><th class="num">Banned now / total</th><th></th></tr></thead>
         <tbody id="f2bJails"></tbody></table>
+    </div>
+    <div class="sub-head" id="f2bBannedHead" hidden><h2>Banned IPs <span id="f2bBannedCount" class="muted"></span></h2>
+      <input id="f2bFilter" placeholder="filter by IP or jail" spellcheck="false" style="width:220px">
+      <span class="spacer"></span><button type="button" class="ghost" id="f2bCopy">Copy list</button></div>
+    <div class="card scroll" id="f2bBannedCard" hidden>
+      <table><thead><tr><th>IP address</th><th>Jail</th><th>Network</th><th></th></tr></thead><tbody id="f2bBanned"></tbody></table>
+      <p id="f2bBannedEmpty" class="muted pad" hidden>No banned IPs.</p>
+      <p id="f2bBannedMore" class="muted pad small" hidden></p>
     </div>
     <div class="bar" id="f2bBanBar" hidden style="margin-top:12px">
       <input id="f2bBanIp" placeholder="IP to ban" spellcheck="false" style="width:180px"><select id="f2bBanJail"></select>
@@ -3467,6 +4784,36 @@ INDEX_HTML = r"""<!doctype html>
       <p id="f2bErr" class="err"></p>
       <div class="actions"><span id="f2bSaved" class="muted small"></span><button type="button" id="f2bSave">Save &amp; apply</button></div>
     </div>
+  </main>
+  <main id="view-vpn" hidden>
+    <div class="sub-head" style="margin-top:0"><h2>WireGuard VPN</h2><span id="wgState"></span><span class="spacer"></span>
+      <button type="button" id="wgInstall" hidden>Install WireGuard</button>
+      <button type="button" id="wgNewTunnel" class="ghost" hidden>+ New tunnel</button></div>
+    <p id="wgMsg" class="muted small"></p>
+    <div id="wgTunnels"></div>
+    <p class="muted small">Clients reach the tunnel network and the routes you list (e.g. the guest bridges). With NAT on, guests see
+      this host's bridge address, so they need no route back to the VPN. The WireGuard port is opened in pve-gateway's firewall automatically.</p>
+  </main>
+  <main id="view-network" hidden>
+    <div class="sub-head" style="margin-top:0"><h2>Network: DHCP, IPAM &amp; DNS</h2><span id="sdnState"></span><span class="spacer"></span>
+      <button type="button" id="sdnInstall" hidden>Install dnsmasq</button>
+      <button type="button" id="sdnNewZone" class="ghost" hidden>+ Zone</button></div>
+    <p id="sdnMsg" class="muted small"></p>
+    <div id="sdnPending" class="card pending-bar" hidden><span>Changes are saved in Proxmox but not active yet.</span>
+      <span class="spacer"></span><button type="button" id="sdnApply">Apply SDN changes</button></div>
+    <ul id="sdnReq" class="checks card" hidden></ul>
+    <div id="sdnZones"></div>
+    <div id="sdnIpamBox" hidden>
+      <div class="sub-head"><h2>IPAM</h2><span class="muted small">addresses Proxmox has handed out or reserved</span><span class="spacer"></span>
+        <button type="button" id="sdnNewIp" class="ghost">+ Reservation</button></div>
+      <div class="card scroll"><table>
+        <thead><tr><th>IP</th><th>VNet</th><th>MAC</th><th>Guest / name</th><th>Type</th><th></th></tr></thead>
+        <tbody id="sdnIpam"></tbody></table></div>
+    </div>
+    <p class="muted small">Uses Proxmox SDN (Datacenter &gt; SDN), so everything also shows up in the Proxmox UI. A VNet is a bridge:
+      set a guest's network device to it (Hardware &gt; Network Device &gt; Bridge). With DHCP on, guests get an address from the subnet's
+      range and Proxmox records it in the IPAM. With SNAT on, they reach the internet through this host, and you forward ports to them on the Ports tab.
+      DNS names need a DNS plugin (PowerDNS), set up in the Proxmox UI under Datacenter &gt; SDN &gt; Options.</p>
   </main>
   <main id="view-settings" hidden>
     <div class="card form-card">
@@ -3578,6 +4925,129 @@ INDEX_HTML = r"""<!doctype html>
   </form>
 </dialog>
 
+<dialog id="fwDlg">
+  <form id="fwForm" class="form">
+    <h2 id="fwTitle">Add rule</h2>
+    <div class="grid">
+      <label>Action<select name="action"><option value="ACCEPT">ACCEPT - allow</option><option value="DROP">DROP - silently block</option>
+        <option value="REJECT">REJECT - block and tell the sender</option></select></label>
+      <label>Protocol<select name="proto"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP (ping)</option><option value="any">any</option></select></label>
+      <label class="fw-ports">Ports<input name="ports" placeholder="80,443 or 8000-8100" spellcheck="false"></label>
+      <label>Source<input name="source" placeholder="anyone (or 203.0.113.0/24)" spellcheck="false"></label>
+      <label class="wide">Comment<input name="comment" maxlength="40"></label>
+      <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled</label>
+    </div>
+    <p id="fwFormErr" class="err"></p>
+    <div class="actions"><button type="button" id="fwCancel" class="ghost">Cancel</button><button type="submit">OK</button></div>
+  </form>
+</dialog>
+
+<dialog id="sdnZDlg">
+  <form id="sdnZForm" class="form">
+    <h2 id="sdnZTitle">New zone</h2>
+    <div class="grid">
+      <label>Zone ID<input name="zone" maxlength="8" placeholder="e.g. lab" spellcheck="false"></label>
+      <label class="check"><input type="checkbox" name="dhcp" checked> DHCP (dnsmasq)</label>
+      <label>DNS plugin<select name="dns"></select></label>
+      <label>Reverse DNS plugin<select name="reversedns"></select></label>
+      <label class="wide">DNS zone (domain for guest names)<input name="dnszone" placeholder="optional, e.g. lab.example.com" spellcheck="false"></label>
+    </div>
+    <p class="muted small">New zones are "simple" zones: isolated bridges on this host, with no VLAN setup needed. The Proxmox IPAM keeps track of the addresses.</p>
+    <p id="sdnZErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" data-close>Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="sdnVDlg">
+  <form id="sdnVForm" class="form">
+    <h2 id="sdnVTitle">New VNet</h2>
+    <div class="grid">
+      <label>Name (bridge)<input name="vnet" maxlength="8" placeholder="e.g. labnet" spellcheck="false"></label>
+      <label>Zone<select name="zone"></select></label>
+      <label class="wide">Description<input name="alias" maxlength="40" placeholder="optional"></label>
+    </div>
+    <p id="sdnVErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" data-close>Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="sdnSDlg">
+  <form id="sdnSForm" class="form">
+    <h2 id="sdnSTitle">New subnet</h2>
+    <div class="grid">
+      <label>Subnet<input name="cidr" placeholder="10.20.30.0/24" spellcheck="false"></label>
+      <label>Gateway (this host)<input name="gateway" placeholder="first address" spellcheck="false"></label>
+      <label class="wide dhcp-only">DHCP ranges (start-end, one per line)<textarea name="dhcp_range" rows="2" spellcheck="false" placeholder="10.20.30.100-10.20.30.200"></textarea></label>
+      <label class="dhcp-only">DNS server for DHCP clients<input name="dns_server" placeholder="optional, e.g. 1.1.1.1" spellcheck="false"></label>
+      <label class="check"><input type="checkbox" name="snat" checked> SNAT (internet through this host)</label>
+    </div>
+    <p id="sdnSErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" data-close>Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="sdnIDlg">
+  <form id="sdnIForm" class="form">
+    <h2>New IP reservation</h2>
+    <div class="grid">
+      <label>VNet<select name="vnet"></select></label>
+      <label>Guest network device<select name="nic"></select></label>
+      <label>MAC address<input name="mac" placeholder="bc:24:11:12:34:56" spellcheck="false"></label>
+      <label>IP address<input name="ip" spellcheck="false"></label>
+      <label>VM / CT ID<input name="vmid" inputmode="numeric" placeholder="optional"></label>
+    </div>
+    <p class="muted small">The guest always gets this address from DHCP. A running guest picks it up when it renews its lease (or after a restart).</p>
+    <p id="sdnIErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" data-close>Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="wgTDlg">
+  <form id="wgTForm" class="form">
+    <h2 id="wgTTitle">New tunnel</h2>
+    <div class="grid">
+      <label>Interface<input name="name" placeholder="wg0" spellcheck="false"></label>
+      <label>UDP port<input name="port" inputmode="numeric"></label>
+      <label>Tunnel address (this host)<input name="address" placeholder="10.99.0.1/24" spellcheck="false"></label>
+      <label>Public endpoint for clients<input name="endpoint" placeholder="this host's public IP or name" spellcheck="false"></label>
+      <label class="wide">Networks clients can reach (besides the tunnel)<textarea name="client_routes" rows="2" spellcheck="false" placeholder="10.10.10.0/24"></textarea></label>
+      <label>DNS for clients<input name="dns" placeholder="optional, e.g. 10.10.10.1" spellcheck="false"></label>
+      <label class="check"><input type="checkbox" name="nat" checked> NAT to guest networks</label>
+      <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled (up now and at boot)</label>
+    </div>
+    <p id="wgTErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" id="wgTCancel">Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="wgPDlg">
+  <form id="wgPForm" class="form">
+    <h2 id="wgPTitle">Add device</h2>
+    <div class="grid">
+      <label class="wide">Name<input name="name" maxlength="40" placeholder="e.g. laptop"></label>
+      <label>Type<select name="kind"><option value="device">Device (phone, laptop) - keys generated here</option>
+        <option value="site">Site / router - it has its own key</option></select></label>
+      <label>VPN address<input name="address" placeholder="next free" spellcheck="false"></label>
+      <label class="wide site-only">Its public key<input name="public_key" placeholder="44 characters, ends with =" spellcheck="false"></label>
+      <label class="wide site-only">Networks behind it<input name="allowed_ips" placeholder="e.g. 192.168.77.0/24 (optional)" spellcheck="false"></label>
+      <label class="site-only">Its endpoint<input name="endpoint" placeholder="optional: host:port" spellcheck="false"></label>
+      <label class="site-only">Keepalive (s)<input name="keepalive" inputmode="numeric" placeholder="0"></label>
+      <label class="check"><input type="checkbox" name="psk" checked> Pre-shared key (extra protection)</label>
+      <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+    </div>
+    <p id="wgPErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" id="wgPCancel">Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="wgCDlg">
+  <h2 id="wgCTitle">Client configuration</h2>
+  <p class="muted small">Import this into the WireGuard app on the device. It contains the device's private key - keep it private.</p>
+  <textarea id="wgCText" rows="14" readonly style="width:100%"></textarea>
+  <div class="actions"><button type="button" class="ghost" id="wgCCopy">Copy</button><button type="button" class="ghost" id="wgCDown">Download</button>
+    <button type="button" id="wgCClose">Close</button></div>
+</dialog>
+
 <dialog id="testDlg">
   <h2 id="testTitle">Test</h2>
   <ul id="testSteps" class="checks"></ul>
@@ -3627,6 +5097,7 @@ main{max-width:1200px;margin:0 auto;padding:16px 20px}
 .scroll{overflow-x:auto}
 .bar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
 button{font:inherit;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:7px 14px;border-radius:7px;cursor:pointer;font-weight:600}
+button:disabled{opacity:.5;cursor:default}
 button.ghost{background:transparent;color:var(--fg);border-color:var(--line);font-weight:500}
 button.ghost:hover{border-color:var(--muted)}
 button.link{background:none;border:none;color:var(--muted);padding:4px 6px;font-weight:500}
@@ -3694,6 +5165,7 @@ button.net:hover{border-color:var(--muted)}button.net.wan{border-color:var(--acc
 .bars i.no{background:var(--bad)}.pill.up{background:var(--ok-bg);color:var(--ok)}.pill.down{background:var(--bad-bg);color:var(--bad)}
 .pill.unknown{background:var(--line);color:var(--muted)}.pill.failing{background:var(--warn-bg);color:var(--warn)}.pill.high{background:var(--bad-bg);color:var(--bad)}
 .pill.admin{background:var(--warn-bg);color:var(--warn)}.pill.low{background:var(--line);color:var(--muted)}
+.warn-banner{color:var(--fg);border-color:var(--warn);background:var(--warn-bg);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .sub-head{display:flex;align-items:center;gap:10px;margin:22px 0 10px}.sub-head h2{margin:0;font-size:15px}
 .sub-head button{padding:4px 12px;font-size:13px}
 .hint{margin:-4px 0 0;font-size:12px;color:var(--muted)}.hint.bad{color:var(--bad)}
@@ -3701,6 +5173,9 @@ form > .hint{margin:12px 0 0}
 #wcFields:empty{display:none}
 .names a{color:var(--fg);text-decoration:none;font-weight:500}.names a:hover{text-decoration:underline}
 .names .alias{display:block;color:var(--muted);font-size:12px}
+.pending-bar{display:flex;align-items:center;gap:10px;padding:10px 14px;margin-bottom:12px;border-color:var(--warn);background:var(--warn-bg);color:var(--warn)}
+#view-network .sub-head{flex-wrap:wrap}#view-network .sub-head button{white-space:nowrap}
+tr.sub td:first-child{padding-left:22px}#sdnZones td .chip{margin-left:6px;font-family:inherit}
 .mockbar{padding:12px 14px;margin-bottom:12px;display:flex;flex-direction:column;gap:6px;border-style:dashed;border-color:var(--warn)}
 .mockbtns{display:flex;flex-wrap:wrap;gap:6px}.mockbtns button{padding:4px 10px;font-size:12px}
 @media (max-width:560px){.grid{grid-template-columns:1fr}header,main{padding-left:16px;padding-right:16px}}
@@ -3765,7 +5240,9 @@ async function load() {
   if (!timer) timer = setInterval(() => {
     if (!document.hidden && view !== 'debug' && view !== 'settings' && ![...document.querySelectorAll('dialog')].some(x => x.open)) load().catch(() => {});
     if (!document.hidden && view === 'monitor' && !$('#monDlg').open) loadMonitor();
-    if (!document.hidden && view === 'security') loadSecurity();
+    if (!document.hidden && view === 'security') { loadSecurity(); if (!$('#fwDlg').open) loadFirewall(); }
+    if (!document.hidden && view === 'vpn' && ![...document.querySelectorAll('dialog')].some(x => x.open)) loadVpn();
+    if (!document.hidden && view === 'network' && ![...document.querySelectorAll('dialog')].some(x => x.open)) loadNetwork();
   }, 5000);
 }
 
@@ -3855,7 +5332,7 @@ async function fillGuests(sel = $('#ruleForm').guest) {
   sel.replaceChildren(el('option', {value: '', textContent: guests.length ? '— pick a guest to fill its IP —' : '— no guests found —'}));
   for (const g of guests) {
     const label = g.vmid + ' ' + (g.name || '') + ' (' + (g.type === 'lxc' ? 'CT' : 'VM') + (g.status !== 'running' ? ', ' + g.status : '') + ')';
-    const src = {agent: '', lxc: '', arp: ' · from ARP', 'cloud-init': ' · cloud-init', config: ' · config'}[g.source] || '';
+    const src = {agent: '', lxc: '', arp: ' · from ARP', ipam: ' · SDN IPAM', 'cloud-init': ' · cloud-init', config: ' · config'}[g.source] || '';
     if (!g.ips.length) sel.append(el('option', {value: '', disabled: true, title: g.hint || '',
       textContent: label + ' — IP unknown' + (g.hint && g.status === 'running' ? ' (' + (/agent/.test(g.hint) ? 'no guest agent' : g.hint) + ')' : '')}));
     for (const ip of g.ips) sel.append(el('option', {value: ip, textContent: label + ' — ' + ip + src}));
@@ -4332,6 +5809,343 @@ $('#scanBtn').onclick = async () => {
   b.disabled = false;
 };
 
+// ---- VPN: WireGuard
+let WG = null, wgTEdit = null, wgPEdit = null, wgPTunnel = null, wgCName = 'peer';
+async function loadVpn() {
+  try { WG = await api('GET', '/api/wireguard'); renderVpn(); } catch (e) { $('#wgMsg').textContent = e.message; }
+}
+function renderVpn() {
+  const job = WG.job || {};
+  $('#wgState').replaceChildren(el('span', {class: 'chip ' + (WG.installed ? 'ok' : 'bad'), textContent: WG.installed ? 'installed' : 'not installed'}));
+  $('#wgInstall').hidden = WG.installed; $('#wgInstall').disabled = job.state === 'pending';
+  $('#wgNewTunnel').hidden = !WG.installed;
+  $('#wgMsg').textContent = job.state === 'pending' || job.state === 'error' ? job.msg : !WG.installed ? 'WireGuard gives you secure access to this host and its guests from anywhere.' :
+    !WG.tunnels.length ? 'No tunnel yet - click + New tunnel (the defaults are fine for most setups).' : '';
+  $('#wgTunnels').replaceChildren(...WG.tunnels.map(t => {
+    const st = t.status || {peers: {}};
+    return el('div', {class: 'card form-card', style: 'margin-bottom:14px;max-width:none'},
+      el('div', {class: 'sub-head', style: 'margin:0'}, el('h2', {textContent: t.name}),
+        el('span', {class: 'chip ' + (st.up ? 'ok' : t.enabled ? 'bad' : 'warn'), textContent: st.up ? 'up' : t.enabled ? 'down' : 'disabled'}),
+        el('span', {class: 'mono small', textContent: t.address + ' · UDP ' + t.port + (t.nat ? ' · NAT' : '')}),
+        el('span', {class: 'spacer'}),
+        el('button', {class: 'ghost', textContent: '+ Device', onclick: () => openWgPeer(t, null, 'device')}),
+        el('button', {class: 'ghost', textContent: '+ Site', onclick: () => openWgPeer(t, null, 'site')}),
+        el('button', {class: 'link', textContent: 'Edit', onclick: () => openWgTunnel(t)}),
+        el('button', {class: 'link del', textContent: 'Delete', onclick: async () => {
+          if (!confirm('Delete tunnel ' + t.name + ' and its ' + t.peers.length + ' peers? Their keys are deleted too.')) return;
+          await api('DELETE', '/api/wireguard/tunnels/' + t.id).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); }})),
+      el('p', {class: 'hint'}, 'Server public key: ', el('span', {class: 'mono', textContent: t.public_key}), ' ',
+        el('button', {class: 'link', textContent: 'copy', onclick: () => navigator.clipboard.writeText(t.public_key)})),
+      el('div', {class: 'scroll'}, el('table', {},
+        el('thead', {}, el('tr', {}, ...['', 'Peer', 'VPN address', 'Endpoint', 'Last handshake', 'Received / sent', ''].map(h => el('th', {textContent: h})))),
+        el('tbody', {}, ...t.peers.map(p => {
+          const ps = st.peers[p.public_key] || {};
+          const s = !p.enabled ? 'unknown' : ps.online ? 'up' : 'down';
+          return el('tr', {class: p.enabled ? '' : 'off'},
+            el('td', {}, el('span', {class: 'pill ' + s, textContent: !p.enabled ? 'off' : ps.online ? 'online' : 'offline'})),
+            el('td', {class: 'names'}, p.name, el('span', {class: 'alias', textContent: p.kind === 'site' ? 'site / router' : 'device'})),
+            el('td', {class: 'mono', textContent: p.address.replace('/32', '') + (p.allowed_ips.length ? ' + ' + p.allowed_ips.join(', ') : '')}),
+            el('td', {class: 'mono small', textContent: ps.endpoint || p.endpoint || '—'}),
+            el('td', {class: 'small', textContent: ps.handshake ? since(ps.handshake).replace(/^(\d.*)$/, '$1 ago') : 'never'}),
+            el('td', {class: 'num small', textContent: ps.rx || ps.tx ? fmtBytes(ps.rx) + ' / ' + fmtBytes(ps.tx) : '—'}),
+            el('td', {class: 'num'},
+              p.kind === 'device' && p.has_key ? el('button', {class: 'link', textContent: 'Config', onclick: () => showWgConfig(t, p)}) : null,
+              el('button', {class: 'link', textContent: 'Edit', onclick: () => openWgPeer(t, p)}),
+              el('button', {class: 'link del', textContent: 'Delete', onclick: async () => {
+                if (!confirm('Remove ' + p.name + '? It can no longer connect.')) return;
+                await api('DELETE', '/api/wireguard/tunnels/' + t.id + '/peers/' + p.id).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); }})));
+        }))),
+        t.peers.length ? null : el('p', {class: 'muted pad', textContent: 'No peers yet - add a device (phone, laptop) or a site (another router).'})));
+  }));
+}
+function openWgTunnel(t) {
+  wgTEdit = t ? t.id : null; const f = $('#wgTForm'), d = t || WG.defaults;
+  $('#wgTTitle').textContent = t ? 'Edit tunnel ' + t.name : 'New tunnel'; $('#wgTErr').textContent = '';
+  f.name.value = d.name; f.name.disabled = !!t; f.port.value = d.port; f.address.value = d.address; f.endpoint.value = d.endpoint || '';
+  f.client_routes.value = (d.client_routes || []).join('\n'); f.dns.value = (d.dns || []).join(', ');
+  f.nat.checked = t ? t.nat : true; f.enabled.checked = t ? t.enabled : true; $('#wgTDlg').showModal();
+}
+$('#wgTForm').addEventListener('submit', async e => {
+  e.preventDefault(); const f = e.target;
+  const d = {name: f.name.value.trim(), port: f.port.value, address: f.address.value.trim(), endpoint: f.endpoint.value.trim(),
+    client_routes: f.client_routes.value, dns: f.dns.value, nat: f.nat.checked, enabled: f.enabled.checked};
+  try { await api(wgTEdit ? 'PUT' : 'POST', '/api/wireguard/tunnels' + (wgTEdit ? '/' + wgTEdit : ''), d); $('#wgTDlg').close(); loadVpn(); }
+  catch (err) { $('#wgTErr').textContent = err.message; }
+});
+function wgKindChanged() { for (const x of document.querySelectorAll('#wgPForm .site-only')) x.hidden = $('#wgPForm').kind.value !== 'site'; }
+function openWgPeer(t, p, kind) {
+  wgPTunnel = t; wgPEdit = p ? p.id : null; const f = $('#wgPForm');
+  $('#wgPTitle').textContent = p ? 'Edit ' + p.name : kind === 'site' ? 'Add site' : 'Add device'; $('#wgPErr').textContent = '';
+  p = p || {kind, name: '', address: '', public_key: '', allowed_ips: [], endpoint: '', keepalive: kind === 'site' ? 25 : 0, psk: true, enabled: true};
+  f.name.value = p.name; f.kind.value = p.kind; f.kind.disabled = !!wgPEdit; f.address.value = p.address.replace('/32', '');
+  f.public_key.value = p.kind === 'site' ? p.public_key : ''; f.public_key.disabled = !!wgPEdit && p.kind !== 'site';
+  f.allowed_ips.value = p.allowed_ips.join(', '); f.endpoint.value = p.endpoint; f.keepalive.value = p.keepalive || '';
+  f.psk.checked = p.psk; f.psk.disabled = !!wgPEdit; f.enabled.checked = p.enabled;
+  wgKindChanged(); $('#wgPDlg').showModal(); f.name.focus();
+}
+$('#wgPForm').kind.addEventListener('change', wgKindChanged);
+$('#wgPForm').addEventListener('submit', async e => {
+  e.preventDefault(); const f = e.target;
+  const d = {name: f.name.value.trim(), kind: f.kind.value, address: f.address.value.trim(), public_key: f.public_key.value.trim(),
+    allowed_ips: f.allowed_ips.value, endpoint: f.endpoint.value.trim(), keepalive: f.keepalive.value, psk: f.psk.checked, enabled: f.enabled.checked};
+  try {
+    const r = await api(wgPEdit ? 'PUT' : 'POST', '/api/wireguard/tunnels/' + wgPTunnel.id + '/peers' + (wgPEdit ? '/' + wgPEdit : ''), d);
+    $('#wgPDlg').close(); await loadVpn();
+    if (r.config) showWgConfigText(d.name, r.config);
+  } catch (err) { $('#wgPErr').textContent = err.message; }
+});
+async function showWgConfig(t, p) {
+  try { const r = await fetch('/api/wireguard/tunnels/' + t.id + '/peers/' + p.id + '/config', {credentials: 'same-origin'});
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+    showWgConfigText(p.name, await r.text()); } catch (e) { $('#wgMsg').textContent = e.message; }
+}
+function showWgConfigText(name, text) {
+  wgCName = name.replace(/[^A-Za-z0-9_.-]+/g, '-') || 'peer';
+  $('#wgCTitle').textContent = 'Client configuration - ' + name; $('#wgCText').value = text; $('#wgCDlg').showModal();
+}
+$('#wgCCopy').onclick = () => navigator.clipboard.writeText($('#wgCText').value).then(() => $('#wgCCopy').textContent = 'Copied', () => {});
+$('#wgCDown').onclick = () => {
+  const url = URL.createObjectURL(new Blob([$('#wgCText').value], {type: 'text/plain'}));
+  const a = el('a', {href: url, download: wgCName + '.conf'}); document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+$('#wgCClose').onclick = () => { $('#wgCText').value = ''; $('#wgCCopy').textContent = 'Copy'; $('#wgCDlg').close(); };
+$('#wgTCancel').onclick = () => $('#wgTDlg').close();
+$('#wgPCancel').onclick = () => $('#wgPDlg').close();
+$('#wgNewTunnel').onclick = () => openWgTunnel(null);
+$('#wgInstall').onclick = async () => { await api('POST', '/api/wireguard/install', {}).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); };
+
+// ---- Network: Proxmox SDN (zones, VNets, subnets with DHCP, IPAM, DNS)
+let SDN = null, sdnZEdit = null, sdnSEdit = null, sdnSVnet = null, sdnErr = '';
+const sdnState = s => s ? el('span', {class: 'chip warn', textContent: s, title: 'not applied yet - click Apply SDN changes'}) : null;
+async function loadNetwork() {
+  try { SDN = await api('GET', '/api/sdn'); renderNetwork(); } catch (e) { $('#sdnMsg').textContent = e.message; }
+  if (SDN && SDN.job && SDN.job.state === 'pending' && view === 'network') setTimeout(loadNetwork, 1000);  // apply / install running
+}
+function renderNetwork() {
+  const s = SDN, job = s.job || {};
+  $('#sdnState').replaceChildren(el('span', {class: 'chip ' + (s.available ? 'ok' : 'bad'),
+    textContent: s.available ? 'Proxmox SDN' + (s.version ? ' · PVE ' + s.version : '') : 'SDN not available'}));
+  $('#sdnNewZone').hidden = !s.available;
+  $('#sdnInstall').hidden = !s.available || s.dnsmasq; $('#sdnInstall').disabled = job.state === 'pending';
+  $('#sdnPending').hidden = !s.pending; $('#sdnApply').disabled = job.state === 'pending';
+  $('#sdnMsg').className = sdnErr ? 'err' : 'muted small';
+  $('#sdnMsg').textContent = sdnErr || (!s.available || s.error) ? sdnErr || s.error : job.state === 'pending' || job.state === 'error' || (job.state === 'ok' && Date.now() / 1000 - job.t < 15) ? job.msg :
+    !s.zones.length ? 'No zone yet - click + Zone, then add a VNet and a subnet with a DHCP range.' : '';
+  const req = [];
+  if (s.available && !s.dhcp_ok) req.push({status: 'warn', name: 'DHCP needs Proxmox VE 8.1 or newer', detail: 'This host runs ' + (s.version || 'an older version') + '. Zones and VNets work; DHCP ranges do not.'});
+  if (s.available && !s.dnsmasq) req.push({status: s.zones.some(z => z.dhcp) ? 'fail' : 'warn', name: 'dnsmasq is not installed', detail: 'Proxmox uses it for SDN DHCP - click Install dnsmasq (or run: apt install dnsmasq && systemctl disable --now dnsmasq).'});
+  if (s.available && !s.sourced) req.push({status: 'fail', name: '/etc/network/interfaces does not include interfaces.d', detail: 'Add this line at the end, or SDN bridges never come up:\nsource /etc/network/interfaces.d/*'});
+  $('#sdnReq').hidden = !req.length; renderChecks($('#sdnReq'), req);
+  const nicsOn = v => s.nics.filter(n => n.bridge === v);
+  $('#sdnZones').replaceChildren(...s.zones.map(z => {
+    const vnets = s.vnets.filter(v => v.zone === z.zone || (v.state === 'deleted' && !v.zone && z.state === 'deleted'));
+    const rows = [];
+    for (const v of vnets) {
+      const g = nicsOn(v.vnet);
+      rows.push(el('tr', {class: v.state === 'deleted' ? 'off' : ''},
+        el('td', {class: 'names'}, el('b', {class: 'mono', textContent: v.vnet}), v.alias ? el('span', {class: 'alias', textContent: v.alias}) : null, sdnState(v.state)),
+        el('td', {colSpan: 4, class: 'small', textContent: g.length ? 'Guests: ' + g.map(n => (n.name || n.vmid) + ' (' + n.nic + ')').join(', ') : v.state === 'deleted' ? '' : 'no guest uses it yet'}),
+        el('td', {class: 'num'}, v.state === 'deleted' || z.type !== 'simple' ? null : el('button', {class: 'link', textContent: '+ Subnet', onclick: () => openSdnSubnet(v, null)}),
+          v.state === 'deleted' ? null : el('button', {class: 'link', textContent: 'Edit', onclick: () => editSdnVnet(v)}),
+          v.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/vnets/' + v.vnet, null, 'Delete VNet ' + v.vnet + '?')}))));
+      for (const sb of v.subnets) rows.push(el('tr', {class: 'sub' + (sb.state === 'deleted' ? ' off' : '')},
+        el('td', {class: 'mono', textContent: '└ ' + sb.cidr}, sdnState(sb.state)),
+        el('td', {class: 'mono', textContent: sb.gateway || '—'}),
+        el('td', {class: 'mono small', textContent: sb.dhcp_range.length ? sb.dhcp_range.map(r => r.join(' – ')).join(', ') : z.dhcp ? 'no range (static only)' : '—'}),
+        el('td', {class: 'mono small', textContent: sb.dns_server || '—'}),
+        el('td', {}, sb.snat ? el('span', {class: 'tag', textContent: 'snat'}) : null),
+        el('td', {class: 'num'}, sb.state === 'deleted' ? null : el('button', {class: 'link', textContent: 'Edit', onclick: () => openSdnSubnet(v, sb)}),
+          sb.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/vnets/' + v.vnet + '/subnets/' + sb.id, null, 'Delete subnet ' + sb.cidr + '?')}))));
+    }
+    return el('div', {class: 'card form-card', style: 'margin-bottom:14px;max-width:none'},
+      el('div', {class: 'sub-head', style: 'margin:0'}, el('h2', {textContent: 'Zone ' + z.zone}),
+        el('span', {class: 'tag', textContent: z.type || '?'}),
+        el('span', {class: 'chip ' + (z.dhcp ? 'ok' : 'warn'), textContent: z.dhcp ? 'DHCP' : 'no DHCP'}),
+        z.dns ? el('span', {class: 'chip ok', textContent: 'DNS ' + z.dns + (z.dnszone ? ' · ' + z.dnszone : '')}) : null,
+        sdnState(z.state), el('span', {class: 'spacer'}),
+        z.state === 'deleted' || z.type !== 'simple' ? null : el('button', {class: 'ghost', textContent: '+ VNet', onclick: () => openSdnVnet(z.zone)}),
+        z.state === 'deleted' ? null : el('button', {class: 'link', textContent: 'Edit', onclick: () => openSdnZone(z)}),
+        z.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/zones/' + z.zone, null, 'Delete zone ' + z.zone + '?')})),
+      z.type && z.type !== 'simple' ? el('p', {class: 'hint', textContent: 'A ' + z.type + ' zone - VNets and subnets are shown here, but create them in the Proxmox UI (they need VLAN/VXLAN settings).'}) : null,
+      rows.length ? el('div', {class: 'scroll'}, el('table', {},
+        el('thead', {}, el('tr', {}, ...['VNet / subnet', 'Gateway', 'DHCP range', 'DNS for clients', '', ''].map(h => el('th', {textContent: h})))),
+        el('tbody', {}, ...rows))) : el('p', {class: 'muted pad', textContent: z.state === 'deleted' ? '' : 'No VNet yet - click + VNet.'}));
+  }));
+  $('#sdnIpamBox').hidden = !s.available || !s.vnets.length;
+  const guest = id => s.nics.find(n => n.vmid === id);
+  $('#sdnIpam').replaceChildren(...s.ipam.slice().sort((a, b) => a.vnet.localeCompare(b.vnet) || ipNum(a.ip) - ipNum(b.ip)).map(e => {
+    const g = e.vmid ? guest(e.vmid) : null;
+    return el('tr', {},
+      el('td', {class: 'mono', textContent: e.ip}), el('td', {class: 'mono', textContent: e.vnet}),
+      el('td', {class: 'mono small', textContent: e.mac || '—'}),
+      el('td', {class: 'names'}, e.gateway ? 'this host' : g ? (g.name || '') + ' (' + e.vmid + ')' : e.vmid ? String(e.vmid) : '—',
+        e.hostname ? el('span', {class: 'alias', textContent: e.hostname}) : null),
+      el('td', {}, el('span', {class: 'tag', textContent: e.gateway ? 'gateway' : e.vmid ? 'guest' : 'reserved'})),
+      el('td', {class: 'num'}, e.gateway ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () =>
+        sdnDo('DELETE', '/api/sdn/vnets/' + e.vnet + '/ips/' + e.ip, null, 'Remove ' + e.ip + ' from the IPAM? A guest that still uses it keeps it until its lease ends.')})));
+  }));
+}
+function ipNum(ip) { return ip.split('.').reduce((a, x) => a * 256 + (+x || 0), 0); }
+async function sdnDo(method, url, body, ask) {
+  if (ask && !confirm(ask)) return;
+  sdnErr = '';
+  try { await api(method, url, body || {}); } catch (e) { sdnErr = e.message; }
+  loadNetwork();
+}
+async function sdnSubmit(e, dlg, errEl, method, url, data) {
+  e.preventDefault();
+  try { await api(method, url, data); $(dlg).close(); sdnErr = ''; loadNetwork(); } catch (err) { $(errEl).textContent = err.message; }
+}
+function plugins(sel, cur) {
+  sel.replaceChildren(el('option', {value: '', textContent: SDN.dns.length ? 'none' : 'none (no DNS plugin in Proxmox)'}),
+    ...SDN.dns.map(d => el('option', {value: d.dns, textContent: d.dns + ' (' + d.type + ')'})));
+  sel.value = cur || '';
+}
+function openSdnZone(z) {
+  sdnZEdit = z ? z.zone : null; const f = $('#sdnZForm');
+  $('#sdnZTitle').textContent = z ? 'Edit zone ' + z.zone : 'New zone'; $('#sdnZErr').textContent = '';
+  f.zone.value = z ? z.zone : ''; f.zone.disabled = !!z; f.dhcp.checked = z ? !!z.dhcp : SDN.dhcp_ok;
+  plugins(f.dns, z && z.dns); plugins(f.reversedns, z && z.reversedns); f.dnszone.value = z ? z.dnszone : '';
+  $('#sdnZDlg').showModal();
+}
+$('#sdnZForm').addEventListener('submit', e => { const f = e.target;
+  sdnSubmit(e, '#sdnZDlg', '#sdnZErr', sdnZEdit ? 'PUT' : 'POST', '/api/sdn/zones' + (sdnZEdit ? '/' + sdnZEdit : ''),
+    {zone: f.zone.value.trim(), dhcp: f.dhcp.checked, dns: f.dns.value, reversedns: f.reversedns.value, dnszone: f.dnszone.value.trim()}); });
+function openSdnVnet(zone) {
+  const f = $('#sdnVForm'); $('#sdnVErr').textContent = '';
+  f.zone.replaceChildren(...SDN.zones.filter(z => z.type === 'simple' && z.state !== 'deleted').map(z => el('option', {value: z.zone, textContent: z.zone})));
+  f.zone.value = zone; f.vnet.value = ''; f.alias.value = ''; $('#sdnVDlg').showModal(); f.vnet.focus();
+}
+$('#sdnVForm').addEventListener('submit', e => { const f = e.target;
+  sdnSubmit(e, '#sdnVDlg', '#sdnVErr', 'POST', '/api/sdn/vnets', {vnet: f.vnet.value.trim(), zone: f.zone.value, alias: f.alias.value.trim()}); });
+function editSdnVnet(v) {
+  const alias = prompt('Description of VNet ' + v.vnet, v.alias || '');
+  if (alias !== null) sdnDo('PUT', '/api/sdn/vnets/' + v.vnet, {alias});
+}
+function openSdnSubnet(v, sb) {
+  sdnSVnet = v; sdnSEdit = sb ? sb.id : null; const f = $('#sdnSForm');
+  const z = SDN.zones.find(x => x.zone === v.zone) || {};
+  $('#sdnSTitle').textContent = sb ? 'Edit subnet ' + sb.cidr : 'New subnet on ' + v.vnet; $('#sdnSErr').textContent = '';
+  f.cidr.value = sb ? sb.cidr : ''; f.cidr.disabled = !!sb; f.gateway.value = sb ? sb.gateway : '';
+  f.dhcp_range.value = sb ? sb.dhcp_range.map(r => r.join('-')).join('\n') : ''; f.dns_server.value = sb ? sb.dns_server : '';
+  f.snat.checked = sb ? sb.snat : true;
+  for (const x of document.querySelectorAll('#sdnSForm .dhcp-only')) x.hidden = !z.dhcp;
+  $('#sdnSDlg').showModal();
+}
+$('#sdnSForm').cidr.addEventListener('change', e => {  // suggest gateway .1 and a DHCP range in the upper half
+  const f = $('#sdnSForm'), m = e.target.value.trim().match(/^(\d+\.\d+\.\d+)\.\d+\/24$/);
+  if (m && !f.gateway.value) f.gateway.value = m[1] + '.1';
+  if (m && !f.dhcp_range.value && !f.dhcp_range.closest('label').hidden) f.dhcp_range.value = m[1] + '.100-' + m[1] + '.200';
+});
+$('#sdnSForm').addEventListener('submit', e => { const f = e.target;
+  sdnSubmit(e, '#sdnSDlg', '#sdnSErr', sdnSEdit ? 'PUT' : 'POST', '/api/sdn/vnets/' + sdnSVnet.vnet + '/subnets' + (sdnSEdit ? '/' + sdnSEdit : ''),
+    {cidr: f.cidr.value.trim(), gateway: f.gateway.value.trim(), dhcp_range: f.dhcp_range.value.split(/[\n,]+/).map(x => x.trim()).filter(Boolean),
+     dns_server: f.dns_server.value.trim(), snat: f.snat.checked}); });
+function sdnNics() {
+  const f = $('#sdnIForm'), list = SDN.nics.filter(n => n.bridge === f.vnet.value);
+  f.nic.replaceChildren(el('option', {value: '', textContent: list.length ? 'type the MAC yourself' : 'no guest on this VNet - type the MAC'}),
+    ...list.map((n, i) => el('option', {value: i, textContent: (n.name || n.vmid) + ' ' + n.nic + ' (' + n.mac + ')'})));
+  f.nic.onchange = () => { const n = list[f.nic.value]; if (n) { f.mac.value = n.mac; f.vmid.value = n.vmid; } };
+}
+$('#sdnNewIp').onclick = () => {
+  const f = $('#sdnIForm'); $('#sdnIErr').textContent = '';
+  f.vnet.replaceChildren(...SDN.vnets.filter(v => v.state !== 'deleted' && v.subnets.length).map(v => el('option', {value: v.vnet, textContent: v.vnet + ' (' + v.subnets.map(x => x.cidr).join(', ') + ')'})));
+  f.mac.value = ''; f.ip.value = ''; f.vmid.value = ''; sdnNics(); $('#sdnIDlg').showModal();
+};
+$('#sdnIForm').vnet.addEventListener('change', sdnNics);
+$('#sdnIForm').addEventListener('submit', e => { const f = e.target;
+  sdnSubmit(e, '#sdnIDlg', '#sdnIErr', 'POST', '/api/sdn/vnets/' + f.vnet.value + '/ips', {ip: f.ip.value.trim(), mac: f.mac.value.trim(), vmid: f.vmid.value.trim()}); });
+$('#sdnNewZone').onclick = () => openSdnZone(null);
+$('#sdnApply').onclick = () => sdnDo('POST', '/api/sdn/apply');
+$('#sdnInstall').onclick = () => sdnDo('POST', '/api/sdn/install');
+for (const b of document.querySelectorAll('[data-close]')) b.onclick = () => b.closest('dialog').close();
+
+// ---- security: firewall (edits go to a draft; Apply activates it with a 60 s keep/revert window)
+let FW = null, FWD = null, fwEditing = null, fwTick = null;
+async function loadFirewall(force) {
+  try {
+    const r = await api('GET', '/api/firewall');
+    const dirty = FWD && JSON.stringify(FWD) !== JSON.stringify(FW && FW.settings);
+    FW = r; if (force || !dirty) FWD = JSON.parse(JSON.stringify(r.settings));
+    renderFirewall();
+  } catch (e) { $('#fwErr').textContent = e.message; }
+}
+function renderFirewall() {
+  const d = FWD, dirty = JSON.stringify(FWD) !== JSON.stringify(FW.settings);
+  $('#fwState').replaceChildren(el('span', {class: 'chip ' + (FW.settings.enabled ? 'ok' : 'warn'),
+    textContent: FW.settings.enabled ? 'on · ' + (FW.settings.backend === 'pve' ? 'Proxmox firewall' : 'pve-gateway') + ' · policy ' + FW.settings.policy : 'off'}));
+  $('#fwDirty').textContent = dirty ? 'unsaved changes' : ''; $('#fwApply').disabled = !dirty;
+  $('#fwBackend').value = d.backend; $('#fwPolicy').value = d.policy; $('#fwEnabled').checked = d.enabled; $('#fwPing').checked = d.allow_ping;
+  $('#fwSafety').textContent = 'Always open while enabled (so you are never locked out): ' +
+    FW.safety.map(x => x.why.replace('safety: ', '') + (x.ports.length ? ' (' + x.proto + ' ' + x.ports.join(',') + ')' : '')).join(', ') +
+    '. Already open connections are kept.' + (d.backend === 'custom' && FW.pve_enabled ? ' The Proxmox firewall is enabled too - pve-gateway\'s rules run first.' : '');
+  $('#fwTemplate').replaceChildren(el('option', {value: '', textContent: 'Add from template…'}),
+    ...Object.entries(FW.templates).map(([k, v]) => el('option', {value: k, textContent: v})),
+    el('option', {value: 'risky-lan', textContent: 'Risky ports open right now → LAN only'}));
+  $('#fwEmpty').hidden = d.rules.length > 0;
+  const move = (i, k) => { const r = d.rules.splice(i, 1)[0]; d.rules.splice(i + k, 0, r); renderFirewall(); };
+  $('#fwRules').replaceChildren(...d.rules.map((r, i) => el('tr', {class: r.enabled ? '' : 'off'},
+    el('td', {class: 'muted', textContent: i + 1}),
+    el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: r.enabled, onchange: e => { r.enabled = e.target.checked; renderFirewall(); }})),
+    el('td', {}, el('span', {class: 'pill ' + (r.action === 'ACCEPT' ? 'up' : 'down'), textContent: r.action})),
+    el('td', {}, el('span', {class: 'tag', textContent: r.proto})),
+    el('td', {class: 'mono', textContent: r.ports.join(',') || '—'}),
+    el('td', {class: 'mono', textContent: r.source || 'anyone'}),
+    el('td', {textContent: r.comment || ''}),
+    el('td', {class: 'num'},
+      el('button', {class: 'link', textContent: '↑', title: 'move up', disabled: i === 0, onclick: () => move(i, -1)}),
+      el('button', {class: 'link', textContent: '↓', title: 'move down', disabled: i === d.rules.length - 1, onclick: () => move(i, 1)}),
+      el('button', {class: 'link', textContent: 'Edit', onclick: () => openFwDlg(i)}),
+      el('button', {class: 'link del', textContent: 'Delete', onclick: () => { d.rules.splice(i, 1); renderFirewall(); }})))));
+  $('#fwOtherWrap').hidden = !(FW.other_rules || []).length;
+  $('#fwOther').replaceChildren(...(FW.other_rules || []).map(r => el('tr', {class: r.enable ? '' : 'off'},
+    el('td', {class: 'muted', textContent: r.pos}), el('td', {textContent: r.action + (r.macro ? ' (' + r.macro + ')' : '')}),
+    el('td', {textContent: r.proto || '—'}), el('td', {class: 'mono', textContent: r.dport || '—'}),
+    el('td', {class: 'mono', textContent: r.source || 'anyone'}), el('td', {textContent: r.comment || ''}))));
+  const pb = $('#fwPending'); pb.hidden = !FW.pending;
+  if (FW.pending && !fwTick) {
+    let left = FW.pending; $('#fwLeft').textContent = left;
+    fwTick = setInterval(() => { left--; $('#fwLeft').textContent = Math.max(0, left); if (left <= 0) { clearInterval(fwTick); fwTick = null; loadFirewall(true); } }, 1000);
+  }
+}
+for (const [id, key, prop] of [['#fwBackend', 'backend', 'value'], ['#fwPolicy', 'policy', 'value'], ['#fwEnabled', 'enabled', 'checked'], ['#fwPing', 'allow_ping', 'checked']])
+  $(id).addEventListener('change', e => { FWD[key] = e.target[prop]; renderFirewall(); });
+function fwProtoChanged() { $('#fwForm').querySelector('.fw-ports').hidden = !['tcp', 'udp'].includes($('#fwForm').proto.value); }
+function openFwDlg(i) {
+  fwEditing = i; const f = $('#fwForm'), r = i == null ? {action: 'ACCEPT', proto: 'tcp', ports: [], source: '', comment: '', enabled: true} : FWD.rules[i];
+  $('#fwTitle').textContent = i == null ? 'Add rule' : 'Edit rule'; $('#fwFormErr').textContent = '';
+  f.action.value = r.action; f.proto.value = r.proto; f.ports.value = r.ports.join(','); f.source.value = r.source; f.comment.value = r.comment; f.enabled.checked = r.enabled;
+  fwProtoChanged(); $('#fwDlg').showModal();
+}
+$('#fwForm').proto.addEventListener('change', fwProtoChanged);
+$('#fwForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const f = e.target, r = {id: fwEditing != null ? FWD.rules[fwEditing].id : undefined, action: f.action.value, proto: f.proto.value,
+    ports: ['tcp', 'udp'].includes(f.proto.value) ? f.ports.value.split(/[\s,]+/).filter(Boolean) : [], source: f.source.value.trim(),
+    comment: f.comment.value.trim(), enabled: f.enabled.checked};
+  if (['tcp', 'udp'].includes(r.proto) && !r.ports.length) { $('#fwFormErr').textContent = 'give the port(s)'; return; }
+  if (fwEditing != null) FWD.rules[fwEditing] = r; else FWD.rules.push(r);
+  $('#fwDlg').close(); renderFirewall();
+});
+$('#fwCancel').onclick = () => $('#fwDlg').close();
+$('#fwAdd').onclick = () => openFwDlg(null);
+$('#fwTemplate').onchange = async e => {
+  if (!e.target.value) return;
+  try { const r = await api('GET', '/api/firewall/template/' + e.target.value);
+    FWD.rules.push(...r.rules.map(x => Object.assign({enabled: true}, x, {ports: x.ports ? String(x.ports).split(',') : []}))); }
+  catch (err) { $('#fwErr').textContent = err.message; }
+  e.target.value = ''; renderFirewall();
+};
+$('#fwApply').onclick = async () => {
+  $('#fwErr').textContent = '';
+  try { FW = Object.assign(await api('PUT', '/api/firewall', FWD), {}); FWD = JSON.parse(JSON.stringify(FW.settings)); renderFirewall(); }
+  catch (e) { $('#fwErr').textContent = e.message; }
+};
+$('#fwKeep').onclick = async () => { await api('POST', '/api/firewall/confirm', {}).catch(e => $('#fwErr').textContent = e.message);
+  clearInterval(fwTick); fwTick = null; loadFirewall(true); };
+$('#fwRevert').onclick = async () => { await api('POST', '/api/firewall/revert', {}).catch(e => $('#fwErr').textContent = e.message);
+  clearInterval(fwTick); fwTick = null; loadFirewall(true); };
+
 // ---- security: fail2ban
 let F2B = null;
 async function loadSecurity() {
@@ -4352,8 +6166,9 @@ function renderF2b() {
     el('td', {class: 'names'}, el('b', {textContent: j.name}), el('span', {class: 'alias', textContent: f.jail_info[j.name] || ''})),
     el('td', {class: 'num', textContent: j.failed + ' / ' + j.failed_total}),
     el('td', {class: 'num', textContent: j.banned + ' / ' + j.banned_total}),
-    el('td', {}, ...(j.ips.length ? j.ips.map(ip => el('span', {class: 'tag mono', style: 'margin:2px 4px 2px 0;text-transform:none'}, ip + ' ',
-      el('button', {class: 'link', textContent: '×', title: 'Unban ' + ip, onclick: () => f2bAct('unban', {jail: j.name, ip})}))) : ['—'])))));
+    el('td', {class: 'num'}, j.ips.length ? el('button', {class: 'link', textContent: 'show ' + j.ips.length + ' banned',
+      onclick: () => { $('#f2bFilter').value = j.name; renderBanned(); $('#f2bFilter').focus(); }}) : null))));
+  renderBanned();
   $('#f2bBanJail').replaceChildren(...f.jails.map(j => el('option', {value: j.name, textContent: j.name})));
   if (document.activeElement && document.activeElement.closest('#f2bSettings')) return;  // don't overwrite while typing
   const c = f.settings;
@@ -4364,6 +6179,34 @@ function renderF2b() {
     el('input', {type: 'checkbox', name: 'jail', value: j, checked: !!c.jails[j]}), el('span', {}, el('b', {textContent: j}), ' - ' + d))));
   for (const x of $('#f2bFields').querySelectorAll('input,textarea,button')) x.disabled = !c.managed;
 }
+function ipNet(ip) {  // a rough "where is it from" without lookups: private/doc ranges or the /24 (/48 for IPv6)
+  if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip)) return 'private network';
+  if (/^(192\.0\.2|198\.51\.100|203\.0\.113)\./.test(ip)) return 'documentation range';
+  return ip.includes(':') ? ip.split(':').slice(0, 3).join(':') + '::/48' : ip.split('.').slice(0, 3).join('.') + '.0/24';
+}
+function renderBanned() {
+  const f = F2B; if (!f) return;
+  const all = f.jails.flatMap(j => j.ips.map(ip => ({ip, jail: j.name})));
+  const q = $('#f2bFilter').value.trim().toLowerCase();
+  const rows = all.filter(b => !q || b.ip.includes(q) || b.jail.toLowerCase().includes(q))
+    .sort((a, b) => a.ip.localeCompare(b.ip, undefined, {numeric: true}));
+  const net = {}; for (const b of all) net[ipNet(b.ip)] = (net[ipNet(b.ip)] || 0) + 1;
+  $('#f2bBannedHead').hidden = $('#f2bBannedCard').hidden = !f.installed;
+  $('#f2bBannedCount').textContent = '(' + (q ? rows.length + ' of ' : '') + all.length + ')';
+  $('#f2bBannedEmpty').hidden = rows.length > 0;
+  const shown = rows.slice(0, 300);
+  $('#f2bBannedMore').hidden = rows.length <= 300; $('#f2bBannedMore').textContent = 'Showing 300 of ' + rows.length + ' - use the filter.';
+  $('#f2bBanned').replaceChildren(...shown.map(b => el('tr', {},
+    el('td', {class: 'mono', textContent: b.ip}),
+    el('td', {}, el('span', {class: 'tag', textContent: b.jail})),
+    el('td', {class: 'small muted', textContent: ipNet(b.ip) + (net[ipNet(b.ip)] > 1 ? ' · ' + net[ipNet(b.ip)] + ' banned from it' : '')}),
+    el('td', {class: 'num'}, el('button', {class: 'link', textContent: 'Unban', onclick: () => f2bAct('unban', {jail: b.jail, ip: b.ip})})))));
+}
+$('#f2bFilter').addEventListener('input', renderBanned);
+$('#f2bCopy').onclick = () => {
+  const txt = F2B.jails.flatMap(j => j.ips.map(ip => ip + '\t' + j.name)).join('\n');
+  navigator.clipboard.writeText(txt).then(() => { $('#f2bCopy').textContent = 'Copied'; setTimeout(() => $('#f2bCopy').textContent = 'Copy list', 2000); }, () => {});
+};
 async function f2bAct(what, body) {
   $('#f2bActErr').textContent = '';
   try { await api('POST', '/api/fail2ban/' + what, body || {}); } catch (e) { $('#f2bActErr').textContent = e.message; }
@@ -4461,10 +6304,12 @@ $('#saveSettings').onclick = async () => {
 };
 
 function setView() {
-  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings', '#monitor': 'monitor', '#security': 'security'}[location.hash] || 'rules';
+  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings', '#monitor': 'monitor', '#security': 'security', '#vpn': 'vpn', '#network': 'network'}[location.hash] || 'rules';
   for (const a of document.querySelectorAll('.tabs a')) a.classList.toggle('on', a.dataset.view === view);
-  for (const v of ['rules', 'domains', 'monitor', 'security', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
-  if (view === 'security' && !$('#app').hidden) loadSecurity();
+  for (const v of ['rules', 'domains', 'monitor', 'security', 'vpn', 'network', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
+  if (view === 'vpn' && !$('#app').hidden) loadVpn();
+  if (view === 'network' && !$('#app').hidden) loadNetwork();
+  if (view === 'security' && !$('#app').hidden) { loadSecurity(); loadFirewall(); }
   if (view === 'monitor' && !$('#app').hidden) { loadMonitor(); fillScanTargets(); }
   if (view === 'settings' && !$('#app').hidden) loadSettings();
   if ($('#app').hidden) return;
@@ -4561,6 +6406,18 @@ local development (macOS etc.):
             cfg["domains"].append(validate_domain(d, cfg["domains"], cfg))
         for m in MOCK.sample_monitors():
             cfg["monitors"].append(validate_monitor(m, cfg["monitors"]))
+        t = validate_wg_tunnel(wg_defaults(cfg), [], cfg)
+        priv, t["public_key"] = wg_genkey()
+        wg_secret(t["id"] + ".key", priv)
+        for name, kind, extra in (("laptop", "device", {}), ("phone", "device", {}),
+                                  ("office router", "site", {"public_key": wg_genkey()[1], "allowed_ips": "192.168.77.0/24",
+                                                             "endpoint": "office.example.com:51820"})):
+            peer = validate_wg_peer(dict(name=name, kind=kind, **extra), t)
+            if kind == "device":
+                pk, peer["public_key"] = wg_genkey()
+                wg_secret(peer["id"] + ".key", pk)
+            t["peers"].append(peer)
+        cfg["wireguard"]["tunnels"].append(t)
         cfg["acme_email"] = "admin@example.com"
     if a.port:
         cfg["port"] = a.port

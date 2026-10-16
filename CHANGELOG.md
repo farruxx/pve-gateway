@@ -4,6 +4,41 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.8.0 - 2026-10-16
+- Network tab - DHCP, IPAM and DNS through Proxmox SDN (PVE 8.1+), using the Proxmox API, so everything also shows up in
+  the Proxmox UI: simple zones with DHCP (dnsmasq), VNets (bridges; shows which guests use them), subnets with
+  gateway, SNAT, DHCP ranges and the DNS server for clients, IPAM list with reservations (pick the guest's NIC), DNS
+  plugin and domain per zone. Changes stay pending until "Apply SDN changes". Install button for dnsmasq.
+- Overlap checks against host networks, other subnets and WireGuard tunnels. VNets that guests still use can't be deleted.
+- Guest IPs: guests that got an address from SDN DHCP are found through the IPAM (no guest agent needed).
+- Firewall: DHCP is allowed on DHCP VNets only (both backends), never on the uplink.
+- Debug: SDN checks (dnsmasq, interfaces.d included, pending changes, VNet bridges, DHCP servers) and raw SDN state.
+  DNS plugin API keys are never read into the API or the debug report.
+
+## 1.7.0 - 2026-10-16
+- VPN tab - WireGuard: create tunnels (suggested free subnet, port, public endpoint, guest networks for clients),
+  server keys generated on the host, up now and at boot (wg-quick@). Peers: devices (keys generated, client config
+  to view / copy / download) and sites/routers (their public key, networks behind them, endpoint, keepalive),
+  optional pre-shared keys. Live status: online, last handshake, endpoint, traffic. Peer changes are applied with
+  `wg syncconf`, so connected peers stay connected.
+- No free-form config lines (no PostUp/PostDown): NAT for VPN clients and forwarding are pve-gateway iptables rules;
+  the WireGuard port is opened automatically when pve-gateway's firewall is on. Private keys are stored only in
+  <config dir>/wireguard (0600) and /etc/wireguard (0600), never in config.json, the API or the debug report.
+  `install` button for wireguard-tools.
+
+## 1.6.0 - 2026-10-16
+- Firewall (Security tab) for incoming traffic to the host, with a choice of backend: pve-gateway's own
+  iptables + ip6tables chain, or the Proxmox firewall (rules created through the Proxmox API, visible in the PVE UI;
+  rules you made yourself stay untouched and are listed). Switching backends moves the rules.
+- Ordered allow / drop / reject rules (TCP, UDP, ICMP, any; port lists and ranges; source network), default policy
+  allow or drop, ping on/off, templates (web, mail, DNS, WireGuard, SSH, Proxmox, databases from LAN only) and
+  "risky ports open right now -> LAN only".
+- Lock-out protection: SSH, Proxmox UI, the pve-gateway port (from its allowed sources), 80/443 with domains, the
+  cluster ports and established connections always stay open; drop rules for everyone on those ports are refused;
+  every change must be confirmed within 60 s or the previous firewall is restored automatically.
+- Fail2ban: banned IPs in their own searchable list (IP, jail, network with how many bans come from it, unban), jail
+  rows link to their bans, "Copy list".
+
 ## 1.5.0 - 2026-10-16
 - Security tab - fail2ban: status and jails (failed / banned now and total), banned IPs with one-click unban,
   "Unban all", manual ban (never your own IP or localhost), and "Install fail2ban" when it's missing.
