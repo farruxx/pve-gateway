@@ -67,7 +67,9 @@ async function shot(name, { hash, width = 1200, height = 760, dark = false, mobi
   await cdp("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: dark ? "dark" : "light" }] });
   await cdp("Page.navigate", { url: BASE + "/?" + Date.now() + hash });
   await sleep(wait);
-  await js(`while (document.querySelector('#app').hidden) await new Promise(r => setTimeout(r, 100)); ${CLEAN} ${setup}`);
+  const keepUpdate = hash === "#settings";  // the mock always "has" a newer version; show that only on Settings
+  await js(`while (document.querySelector('#app').hidden) await new Promise(r => setTimeout(r, 100)); ${CLEAN} ${setup}
+    if (!${keepUpdate}) for (const c of document.querySelectorAll('#status .chip')) if (/available/.test(c.textContent)) c.remove();`);
   await sleep(400);
   let h = height;
   if (fit) {
@@ -105,6 +107,9 @@ await shot("settings", { hash: "#settings", fit: true, setup: `
 await shot("monitor", { hash: "#monitor", height: 760, wait: 7000, setup: `
   ${waitFor("document.querySelectorAll('#monitors tr').length > 3")}
   for (const c of document.querySelectorAll('#status .chip')) if (/available/.test(c.textContent)) c.remove();` });
+await shot("security", { hash: "#security", height: 760, setup: `
+  ${waitFor("document.querySelectorAll('#f2bJails tr').length > 1")}
+  document.querySelector('#f2bMyIp').textContent = '203.0.113.7';` });
 await shot("debug", { hash: "#debug", height: 900, setup: `
   ${waitFor("document.querySelectorAll('#checks li').length > 3")}
   ${CLEAN}

@@ -19,8 +19,8 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 | **Test**: checks DNS, nginx, the upstream, the certificate and a real request, with how to fix each failure | **Wildcard certificates**: `*.example.com` through your DNS provider's API ([guide](wildcard.md)) |
 | ![Web UI access settings](docs/screenshots/settings.png) | ![Debug tab with health checks](docs/screenshots/debug.png) |
 | **Settings**: only the IPs/networks you list can reach the web UI | **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report |
-| ![Health checks, alerts and port scanner](docs/screenshots/monitor.png) | |
-| **Monitor**: health checks with uptime and history, alerts (e-mail, webhook, Telegram), port scanner | |
+| ![Health checks, alerts and port scanner](docs/screenshots/monitor.png) | ![Fail2ban jails and settings](docs/screenshots/security.png) |
+| **Monitor**: health checks with uptime and history, alerts (e-mail, webhook, Telegram), port scanner | **Security**: fail2ban jails, banned IPs with unban, managed jail settings |
 
 <sub>Screenshots use sample data from the built-in mock mode (`./dev.sh`). Regenerate them with `dev/screenshots.sh`.</sub>
 
@@ -244,6 +244,19 @@ The **Monitor** tab watches your guests and domains:
 - **Port scanner:** a TCP connect scan from the host (about 90 common ports, or ranges up to 5000), with service names and risk levels. It shows what the host itself can reach; the internet's view can differ. To prevent misuse, only this host, private networks and known guests can be scanned.
 
 CLI: `pve-gateway monitors` runs every check once; `pve-gateway scan 10.10.10.11 1-1024` scans from the shell.
+
+## Fail2ban
+
+The **Security** tab shows fail2ban's jails with failed and banned counts and the banned IPs. You can **unban** one IP or all of them, and **ban** an IP by hand (never your own IP or localhost). **Install fail2ban** sets it up if it's missing.
+
+Tick *Let pve-gateway manage fail2ban* to configure it from the UI: ban time, find time, failures before a ban, a **never ban** list, and these jails:
+- **sshd**: SSH logins.
+- **proxmox**: failed logins to the Proxmox web UI (port 8006), read from `pvedaemon` in the journal.
+- **pve-gateway**: failed logins to this UI.
+- **nginx-botsearch**: bots probing for missing pages. Requests for `/.well-known/acme-challenge/` are never counted, so Let's Encrypt's validation servers can't get banned after a failed certificate attempt.
+- **recidive**: banned again within a day → banned for a week.
+
+pve-gateway writes `/etc/fail2ban/jail.d/pve-gateway.local` (read last, so it overrides `jail.local`) plus its own `pvegw-*` filters. Each change is checked with `fail2ban-client -t`, and the previous files are restored on failure. Unticking the option removes the file.
 
 ## Securing the web UI
 

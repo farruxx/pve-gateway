@@ -4,6 +4,15 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.5.0 - 2026-10-16
+- Security tab - fail2ban: status and jails (failed / banned now and total), banned IPs with one-click unban,
+  "Unban all", manual ban (never your own IP or localhost), and "Install fail2ban" when it's missing.
+- Optional management: pve-gateway writes /etc/fail2ban/jail.d/pve-gateway.local and its filters, tests them with
+  `fail2ban-client -t` (previous files restored on failure) and reloads. Settings: ban time, find time, max retries,
+  never-ban list, and jails for SSH, the Proxmox web UI (port 8006), pve-gateway logins, nginx-botsearch (Let's
+  Encrypt challenge requests are never counted, so validation servers don't get banned) and recidive.
+- Failed pve-gateway logins are logged ("login failed from <ip>") for the pve-gateway jail.
+
 ## 1.4.0 - 2026-10-16
 - Monitor tab - health checks: HTTP(S) (expected status, certificate expiry), TCP and ping checks on guests and
   domains every N seconds; up / failing / down status, response time, uptime, last 60 results. "Add checks for my

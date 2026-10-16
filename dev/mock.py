@@ -55,6 +55,7 @@ SCENARIOS = {
     "le-blocked": "Let's Encrypt can't reach port 80 (provider firewall) although it works from the host itself",
     "f2b-ban": "fail2ban banned Let's Encrypt's validation servers on ports 80/443 (after failed challenges)",
     "pvefw-no-http": "Proxmox firewall enabled without a rule accepting HTTP/HTTPS",
+    "no-fail2ban": "fail2ban is not installed (use the Install button)",
     "dnat-80": "another tool's iptables rule forwards ports 80/443 to a firewall VM instead of the host's nginx",
 }
 
@@ -144,10 +145,22 @@ def default_state():
         },
         "counters": {},  # "table|chain|rule" -> [packets, bytes]
         "nginx_active": True,
+        "f2b": {"installed": True, "jails": {"sshd": {"failed": 3, "failed_total": 412, "banned_total": 57,
+                                                       "ips": ["198.51.100.23", "203.0.113.99", "192.0.2.150"]},
+                                              "nginx-botsearch": {"failed": 0, "failed_total": 31, "banned_total": 4,
+                                                                  "ips": ["66.133.109.36"]}}},
         "nginx_test_fail": False,
         "issued": {"cloud.example.com": {"names": ["cloud.example.com"], "expires": time.time() + 61 * 86400},
                    "wildcard.example.com": {"names": ["example.com", "*.example.com"], "expires": time.time() + 75 * 86400}},
     }
+
+
+def _read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
 
 
 def _guest(ip):
@@ -414,6 +427,8 @@ server {
             elif name == "dnat-80":
                 nat["PREROUTING"].insert(0, "-d %s/32 -p tcp -m multiport --dports 80,443 -j DNAT --to-destination 10.10.10.254"
                                          % HOST_IP)
+            elif name == "no-fail2ban":
+                st["f2b"] = {"installed": False, "jails": {}}
             elif name == "pvefw-no-http":
                 with open(self.path_for("/etc/pve/firewall/cluster.fw"), "w") as f:
                     f.write(PVEFW_OK.replace("IN HTTP(ACCEPT) -log nolog\n", "").replace("IN HTTPS(ACCEPT) -log nolog\n", ""))
@@ -720,6 +735,60 @@ server {
                 "%s:DEBUG:certbot._internal.log:Exiting abnormally:" % t,
                 "certbot.errors.AuthorizationError: Some challenges have failed.",
                 "%s:ERROR:certbot._internal.log:Some challenges have failed." % t, ""]))
+
+    def c_fail2ban_client(self, st, a, data):
+        f = st["f2b"]
+        if not f["installed"]:
+            return 127, "(mock) command not found: fail2ban-client", False
+        if a == ["--version"]:
+            return 0, "Fail2Ban v1.1.0", False
+        if a == ["ping"]:
+            return 0, "Server replied: pong", False
+        if a == ["-t"]:
+            conf = _read_text(self.path_for("/etc/fail2ban/jail.d/pve-gateway.local"))
+            if "maxretry = 0" in conf:
+                return 1, "ERROR  Failed during configuration: maxretry must be > 0", False
+            return 0, "OK: configuration test is successful", False
+        if a == ["reload"]:  # enable exactly the jails our file turns on
+            conf = _read_text(self.path_for("/etc/fail2ban/jail.d/pve-gateway.local"))
+            if conf:
+                on = re.findall(r"^\[([\w-]+)\]\nenabled = true", conf, re.M)
+                f["jails"] = {j: f["jails"].get(j, {"failed": 0, "failed_total": 0, "banned_total": 0, "ips": []}) for j in on}
+            return 0, "OK", True
+        if a == ["status"]:
+            return 0, "Status\n|- Number of jail:\t%d\n`- Jail list:\t%s" % (len(f["jails"]), ", ".join(f["jails"])), False
+        if a[0] == "status" and len(a) == 2:
+            j = f["jails"].get(a[1])
+            if not j:
+                return 255, "Sorry but the jail '%s' does not exist" % a[1], False
+            return 0, ("Status for the jail: %s\n|- Filter\n|  |- Currently failed:\t%d\n|  |- Total failed:\t%d\n"
+                       "`- Actions\n   |- Currently banned:\t%d\n   |- Total banned:\t%d\n   `- Banned IP list:\t%s"
+                       % (a[1], j["failed"], j["failed_total"], len(j["ips"]), j["banned_total"], " ".join(j["ips"]))), False
+        if a[:2] == ["unban", "--all"]:
+            n = sum(len(j["ips"]) for j in f["jails"].values())
+            for j in f["jails"].values():
+                j["ips"] = []
+            return 0, str(n), True
+        if a[0] == "set" and len(a) == 4 and a[2] in ("banip", "unbanip"):
+            j = f["jails"].get(a[1])
+            if not j:
+                return 255, "Sorry but the jail '%s' does not exist" % a[1], False
+            if a[2] == "banip" and a[3] not in j["ips"]:
+                j["ips"].append(a[3])
+                j["banned_total"] += 1
+            elif a[2] == "unbanip":
+                if a[3] not in j["ips"]:
+                    return 255, "IP %s is not banned" % a[3], False
+                j["ips"].remove(a[3])
+            return 0, "1", True
+        return 1, "(mock) unsupported fail2ban-client call", False
+
+    def c_apt_get(self, st, a, data):
+        time.sleep(1.5)
+        if "fail2ban" in a:
+            st["f2b"] = {"installed": True, "jails": {"sshd": {"failed": 0, "failed_total": 0, "banned_total": 0, "ips": []}}}
+            return 0, "Setting up fail2ban (1.1.0-7) ...", True
+        return 0, "", False
 
     def c_sendmail(self, st, a, data):
         return 0, "", False
