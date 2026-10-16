@@ -8,6 +8,7 @@ pve-firewall, pvesh, qm, pct, lxc-info, plus net.ipv4.ip_forward and TCP probes.
 The fake "kernel" state lives in <config-dir>/mock-state.json, so the web UI
 and CLI commands (status / test / debug / flush / mock ...) all see the same thing.
 """
+import hashlib
 import json
 import os
 import random
@@ -64,10 +65,14 @@ SAMPLE_RULES = [
 
 # domains seeded into a fresh ./.dev config
 SAMPLE_DOMAINS = [
-    {"domain": "cloud.example.com", "ip": "10.10.10.13", "port": 80, "tls": "letsencrypt", "max_body": "10g"},  # cert ok
-    {"domain": "app.example.com", "aliases": "www.app.example.com", "ip": "10.10.10.10", "port": 80, "tls": "none"},
+    {"domain": "cloud.example.com", "ip": "10.10.10.13", "port": 80, "tls": "letsencrypt", "max_body": "10g",
+     "headers": True},                                          # cert ok
+    {"domain": "app.example.com", "aliases": "www.app.example.com", "ip": "10.10.10.10", "port": 80, "tls": "none",
+     "alias_redirect": True},                                   # www -> 301 to app; has a stray AAAA record
     {"domain": "broken.invalid", "ip": "10.10.10.11", "port": 8080, "tls": "letsencrypt"},  # no DNS, nothing on 8080
     {"domain": "status.example.com", "ip": "10.10.10.10", "port": 80, "tls": "wildcard"},  # uses *.example.com
+    {"domain": "shop.example.com", "ip": "10.10.10.10", "port": 443, "upstream_https": True, "tls": "wildcard",
+     "cloudflare": True, "headers": True, "hsts": True},       # behind the Cloudflare proxy
 ]
 
 # wildcard certificates seeded into a fresh ./.dev config (token "bad" makes the mock DNS API reject it)
@@ -132,6 +137,12 @@ class Mock:
     def __init__(self, conf_dir, node):
         self.path = os.path.join(conf_dir, "mock-state.json")
         self.root = os.path.join(conf_dir, "mock-fs")
+        apt = os.path.join(self.root, "etc/apt/sources.list.d")
+        if not os.path.isdir(apt):  # fresh PVE without subscription: enterprise repo still enabled
+            os.makedirs(apt)
+            with open(os.path.join(apt, "pve-enterprise.sources"), "w") as f:
+                f.write("Types: deb\nURIs: https://enterprise.proxmox.com/debian/pve\nSuites: bookworm\n"
+                        "Components: pve-enterprise\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n")
         self.node = node
         self.lock = threading.RLock()
         os.makedirs(conf_dir, exist_ok=True)
@@ -197,7 +208,13 @@ class Mock:
         return [dict(d) for d in SAMPLE_DOMAINS]
 
     def resolve(self, name):
-        return [] if name.endswith(".invalid") or name.startswith("nodns.") else [PUBLIC_IP]
+        if name.endswith(".invalid") or name.startswith("nodns."):
+            return []
+        if name == "shop.example.com":
+            return ["104.21.32.7", "172.67.150.2"]  # Cloudflare proxy addresses
+        if name == "app.example.com":
+            return [PUBLIC_IP, "2001:db8:ffff::10"]  # AAAA left over from an old server
+        return [PUBLIC_IP]
 
     def http_check(self, host, tls):
         """Answer a request through the simulated nginx by reading the generated config."""
@@ -208,8 +225,9 @@ class Mock:
             names = re.search(r"server_name ([^;]+);", block)
             if not names or host not in names.group(1).split() or ("listen 443" in block) != tls:
                 continue
-            if "return 301" in block:
-                return 301, "301 Moved Permanently -> https://%s/" % host
+            ret = re.search(r"return 301 (\S+);", block)
+            if ret:
+                return 301, "301 Moved Permanently -> " + ret.group(1).replace("$host", host).replace("$request_uri", "/")
             m = re.search(r"proxy_pass https?://([\d.]+):(\d+);", block)
             res, _ = self.tcp_probe(m.group(1), int(m.group(2)))
             return (200, "200 OK") if res == "ok" else (502, "502 Bad Gateway")
@@ -431,7 +449,14 @@ class Mock:
         return 0, "", True
 
     # ------------------------------------------------------------------ network tools
+    def c_pvesubscription(self, st, a, data):
+        return 0, "message: There is no subscription key\nserverid: 0123456789ABCDEF0123456789ABCDEF\nstatus: notfound", False
+
     def c_ip(self, st, a, data):
+        if "-6" in a and "addr" in a:
+            return 0, "\n".join(["lo               UNKNOWN        ::1/128",
+                                 "vmbr0            UP             fe80::be24:11ff:fe00:1/64",
+                                 "vmbr1            UP             fe80::be24:11ff:fe00:2/64"]), False
         if "neigh" in a:
             out = ["192.168.1.1 dev vmbr0 lladdr 00:1a:2b:3c:4d:5e REACHABLE"]
             for g in GUESTS:
@@ -545,7 +570,40 @@ class Mock:
         m = re.search(r"/live/([^/]+)/", path)
         return m.group(1) if m else ""
 
+    def _served_name(self, host):
+        """Cert name nginx would serve for host on 443 (SNI match, else the first TLS server = default)."""
+        first = None
+        for block in re.split(r"\nserver \{", self._nginx_conf())[1:]:
+            if "listen 443" not in block:
+                continue
+            crt = re.search(r"ssl_certificate (\S+);", block)
+            name = self._cert_name(crt.group(1)) if crt else None
+            first = first or name
+            names = re.search(r"server_name ([^;]+);", block)
+            if names and host in names.group(1).split():
+                return name
+        return first
+
     def c_openssl(self, st, a, data):
+        if a[:1] == ["s_client"]:
+            host = a[a.index("-servername") + 1]
+            if not st.get("nginx_active", True):
+                return 1, "connect:errno=111\n40C7F3C4DF7F0000:error:8000006F:system library:BIO_connect:Connection refused", False
+            name = self._served_name(host)
+            if not name:
+                return 1, "CONNECTED(00000003)\n40C7F3C4DF7F0000:error:0A000410:SSL routines:ssl3_read_bytes:" \
+                          "sslv3 alert handshake failure\nno peer certificate available", False
+            return 0, ("CONNECTED(00000003)\n---\nServer certificate\n-----BEGIN CERTIFICATE-----\nMOCK %s\n"
+                       "-----END CERTIFICATE-----\nsubject=CN = %s\n---" % (name, name)), False
+        if a[:1] == ["x509"] and "-in" not in a:
+            m = re.search(r"MOCK (\S+)", data or "")
+            c = st["issued"].get(m.group(1)) if m else None
+            if not c:
+                return 1, "Could not find certificate from <stdin>", False
+            fp = ":".join("%02X" % b for b in hashlib.sha256(m.group(1).encode()).digest())
+            return 0, ("notAfter=%s\nsha256 Fingerprint=%s\nX509v3 Subject Alternative Name: \n    %s" % (
+                time.strftime("%b %d %H:%M:%S %Y GMT", time.gmtime(c["expires"])), fp,
+                ", ".join("DNS:" + n for n in c["names"]))), False
         path = a[a.index("-in") + 1] if "-in" in a else ""
         c = st["issued"].get(self._cert_name(path))
         if not c:

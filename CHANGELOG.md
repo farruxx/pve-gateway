@@ -4,6 +4,17 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.2.0 - 2026-10-16
+- Domains: aliases can redirect (301) to the main domain instead of serving the same site.
+- Domains: "Behind the Cloudflare proxy" option - nginx trusts Cloudflare's ranges and uses the real visitor IP
+  (CF-Connecting-IP) for logs, the guest and "Allowed sources"; the DNS test recognises Cloudflare-proxied records.
+- Domains: optional security headers (nosniff, same-origin framing, referrer policy) and HSTS.
+- Domain test: checks the certificate nginx actually serves (covers every name, expiry, same certificate over IPv4
+  and IPv6), warns about AAAA records that don't point to this host, and checks that aliases answer with a 301.
+- Debug: warns about risky services (rpcbind, databases, Redis, Docker API, VNC, ...) listening on all interfaces,
+  and about Proxmox enterprise repositories enabled without a subscription.
+- Settings: edit the Proxmox users allowed to sign in; optional automatic updates.
+
 ## 1.1.0 - 2026-10-16
 - Updates: check GitHub for a new version and install it from the UI (Settings → Updates) or `pve-gateway update`.
 - Web UI access control: only listed IPs/networks can reach the UI (Settings, `pve-gateway ui-allow`).
