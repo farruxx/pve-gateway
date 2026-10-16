@@ -9,6 +9,7 @@ The fake "kernel" state lives in <config-dir>/mock-state.json, so the web UI
 and CLI commands (status / test / debug / flush / mock ...) all see the same thing.
 """
 import hashlib
+import urllib.parse
 import json
 import os
 import random
@@ -93,6 +94,16 @@ SAMPLE_DOMAINS = [
 # wildcard certificates seeded into a fresh ./.dev config (token "bad" makes the mock DNS API reject it)
 SAMPLE_WILDCARDS = [
     {"zone": "example.com", "provider": "cloudflare", "credentials": {"dns_cloudflare_api_token": "mock-token"}},
+]
+
+# health checks seeded into a fresh ./.dev config
+SAMPLE_MONITORS = [
+    {"name": "cloud", "type": "http", "target": "https://cloud.example.com/", "interval": 60},
+    {"name": "status page", "type": "http", "target": "https://status.example.com/", "interval": 60},
+    {"name": "postgres", "type": "tcp", "target": "10.10.10.11:5432", "interval": 60},
+    {"name": "game server", "type": "tcp", "target": "10.10.10.12:27015", "interval": 60},   # VM stopped -> down
+    {"name": "broken", "type": "http", "target": "http://broken.invalid/", "interval": 120},  # no DNS -> down
+    {"name": "office gateway", "type": "ping", "target": "192.168.50.20", "interval": 60},
 ]
 
 # certbot DNS plugins "installed" on the mock host (others report as missing)
@@ -223,6 +234,38 @@ class Mock:
 
     def sample_wildcards(self):
         return [dict(w) for w in SAMPLE_WILDCARDS]
+
+    def sample_monitors(self):
+        return [dict(m) for m in SAMPLE_MONITORS]
+
+    def monitor_http(self, m):
+        """HTTP check through the simulated DNS + nginx (or straight to a guest IP)."""
+        u = urllib.parse.urlsplit(m["target"])
+        tls, host = u.scheme == "https", u.hostname
+        time.sleep(0.02)
+        if self.resolve(host) == [] and not re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
+            return False, 3.0, "<urlopen error [Errno -2] Name or service not known>", None
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
+            res, ms = self.tcp_probe(host, u.port or (443 if tls else 80))
+            return res == "ok", ms, "HTTP 200" if res == "ok" else res, None
+        st, hdr, _ = self.http_get(HOST_IP, 443 if tls else 80, host, u.path or "/", tls)
+        lo, _, hi = m["expect"].partition("-")
+        ok = bool(st) and int(lo) <= st <= int(hi or lo)
+        days = None
+        if tls:
+            c = self._load()["issued"].get(self._served_name(host) or "")
+            days = int((c["expires"] - time.time()) // 86400) if c else None
+        return ok, random.uniform(8, 60), ("HTTP %d" % st if st else "connection refused") + \
+            ("" if ok or not st else " (expected %s)" % m["expect"]), days
+
+    def port_open(self, ip, port):
+        g = _guest(ip)
+        if g:
+            return g["status"] == "running" and port in g["ports"] + ([22] if g["type"] == "lxc" else [])
+        if ip in (HOST_IP, BRIDGE_IP, "127.0.0.1"):
+            return port in [int(a.rsplit(":", 1)[1]) for p_, s_, a, u_ in SS_LINES if p_ == "tcp"] + \
+                ([80, 443] if self._load().get("nginx_active", True) else [])
+        return False
 
     def sample_domains(self):
         return [dict(d) for d in SAMPLE_DOMAINS]
@@ -677,6 +720,9 @@ server {
                 "%s:DEBUG:certbot._internal.log:Exiting abnormally:" % t,
                 "certbot.errors.AuthorizationError: Some challenges have failed.",
                 "%s:ERROR:certbot._internal.log:Some challenges have failed." % t, ""]))
+
+    def c_sendmail(self, st, a, data):
+        return 0, "", False
 
     def c_systemctl(self, st, a, data):
         if a[-1] != "nginx":

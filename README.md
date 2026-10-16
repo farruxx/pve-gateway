@@ -19,6 +19,8 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 | **Test**: checks DNS, nginx, the upstream, the certificate and a real request, with how to fix each failure | **Wildcard certificates**: `*.example.com` through your DNS provider's API ([guide](wildcard.md)) |
 | ![Web UI access settings](docs/screenshots/settings.png) | ![Debug tab with health checks](docs/screenshots/debug.png) |
 | **Settings**: only the IPs/networks you list can reach the web UI | **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report |
+| ![Health checks, alerts and port scanner](docs/screenshots/monitor.png) | |
+| **Monitor**: health checks with uptime and history, alerts (e-mail, webhook, Telegram), port scanner | |
 
 <sub>Screenshots use sample data from the built-in mock mode (`./dev.sh`). Regenerate them with `dev/screenshots.sh`.</sub>
 
@@ -150,6 +152,8 @@ pve-gateway ui-allow IP...  # web UI only from these IPs/networks ("any" = every
 pve-gateway ui-host NAME..  # extra hostnames the web UI may be opened by ("none" = clear)
 pve-gateway --version       # installed version
 pve-gateway update [check]  # install the latest version from GitHub ("check" = only check)
+pve-gateway monitors        # run every health check once
+pve-gateway scan IP [PORTS] # TCP port scan from this host (common | 22,80,8000-8100)
 pve-gateway domains         # list domains, wildcard certificates and expiry
 pve-gateway cert NAME       # request / renew now: a domain, or '*.example.com' for a wildcard
 pve-gateway debug           # full diagnostic report, paste it when asking for help
@@ -225,6 +229,21 @@ To break the host on purpose, run a scenario. They're also available as buttons 
 The simulated guests are 100 web, 101 db, 102 game (stopped), 103 nextcloud, 104 win11 (no guest agent, ignores ping) and 105 office-gw (behind a gateway). The sample rules show every test outcome. The sample domains are `cloud.example.com` (HTTPS working), `app.example.com` (HTTP only, with an alias) and `broken.invalid` (no DNS and nothing listening upstream). The sample wildcard is `*.example.com` (Cloudflare), used by `status.example.com`. The mock certbot fails for names ending in `.invalid` and succeeds after 2 s for everything else. For wildcards, the API token `bad` gets Cloudflare's "invalid credentials" error, and only the Cloudflare, DigitalOcean and RFC 2136 plugins count as installed, so OVH shows the "plugin missing" message. Generated nginx files end up under `.dev/mock-fs/`. Delete `.dev/` to start over.
 
 `--dry-run` is different. It's meant for a **real** host: read-only commands run for real, and changes are only logged.
+
+## Monitoring
+
+The **Monitor** tab watches your guests and domains:
+
+- **Health checks:** HTTP(S) (expected status, certificate expiry), TCP port, and ping, every N seconds. Each check shows up / failing / down, response time, uptime and the last 60 results. **Add checks for my domains & ports** creates one check per domain and port rule.
+- **Alerts:** sent when a check is down for N checks in a row, when it comes back up, and when a certificate expires within N days. Channels:
+  - **e-mail**, through the host's mail system (Proxmox ships postfix);
+  - a **webhook** (Slack, Discord or any URL; JSON with `text`/`content`);
+  - **Telegram** (bot token + chat id).
+
+  **Send test alert** checks the setup. Tokens are stored on the host only and never shown again.
+- **Port scanner:** a TCP connect scan from the host (about 90 common ports, or ranges up to 5000), with service names and risk levels. It shows what the host itself can reach; the internet's view can differ. To prevent misuse, only this host, private networks and known guests can be scanned.
+
+CLI: `pve-gateway monitors` runs every check once; `pve-gateway scan 10.10.10.11 1-1024` scans from the shell.
 
 ## Securing the web UI
 
