@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.3"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.2.4"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -1167,9 +1167,11 @@ def run_certbot(key, cert_name, names, auth, plugin=None, package=None, prefligh
         rc, out = run(cmd, timeout=900)
         if rc != 0:
             reason = le_failure_reason(out)
-            if preflight and re.search(r"connection|Timeout|firewall", reason, re.I):
-                reason += ("\n(the same check worked from this host, so something between the internet and this host "
-                           "blocks Let's Encrypt: your hosting provider's firewall, the Proxmox firewall, or a router)")
+            if preflight and re.search(r"connection|Timeout|firewall|refused", reason, re.I):
+                found = [d for n, st, d in port_checks(cfg) if st in ("fail", "warn")]
+                reason += ("\n" + "\n".join(found) if found else
+                           "\n(the same check worked from this host, so something between the internet and this host "
+                           "blocks Let's Encrypt: your hosting provider's firewall or a router)")
             return fail(reason)
         cert_info(cfg, cert_name, fresh=True)
         err = apply_nginx()
@@ -1302,6 +1304,124 @@ def acme_preflight(cfg, names):
         except OSError:
             pass
     return problems
+
+
+def _ports_in(spec):
+    """Ports matched by an iptables --dport/--dports value ("80", "80,443", "79:81")."""
+    res = set()
+    for part in spec.split(","):
+        a, _, b = part.partition(":")
+        if a.isdigit():
+            res.update(range(int(a), int(b or a) + 1) if (b or a).isdigit() else [int(a)])
+    return res
+
+
+def _pvefw_allows(port):
+    """Does the Proxmox firewall config (datacenter or this node) accept incoming TCP `port`? None if unreadable."""
+    files = ["/etc/pve/firewall/cluster.fw", "/etc/pve/nodes/%s/host.fw" % socket.gethostname().split(".")[0]]
+    texts = [_read(MOCK.path_for(f) if MOCK else f) for f in files]
+    if not any(texts):
+        return None
+    macro = {80: "HTTP", 443: "HTTPS"}.get(port)
+    if any(re.search(r"^policy_in:\s*ACCEPT", t or "", re.M) for t in texts):
+        return True
+    groups = False
+    for text in texts:
+        rules = (text or "").split("[RULES]", 1)[1] if "[RULES]" in (text or "") else ""
+        for line in rules.splitlines():
+            line = line.strip()
+            if line.startswith("[") and line != "[RULES]":
+                break
+            if line.startswith("GROUP "):
+                groups = True
+            if not line.startswith("IN "):  # "|IN ..." = disabled rule
+                continue
+            if macro and re.match(r"^IN %s\(ACCEPT\)" % macro, line):
+                return True
+            m = re.search(r"-dport (\S+)", line)
+            if re.match(r"^IN ACCEPT\b", line) and "-p tcp" in line and m and port in _ports_in(m.group(1)) and "-source" not in line:
+                return True
+    return None if groups else False  # security groups: can't tell without resolving them
+
+
+def port_checks(cfg, ports=(80, 443)):
+    """What stands between the internet and nginx on 80/443: listener, iptables/fail2ban rejects, Proxmox firewall.
+    Returns [(name, status, detail)]."""
+    res = []
+    tls_needed = any(d["enabled"] and d["tls"] != "none" for d in cfg["domains"])
+    rc, out = sh(["ss", "-Hltnp"])
+    for port in ports:
+        lines = [l for l in out.splitlines() if re.search(r":%d\s" % port, l)] if rc == 0 else []
+        procs = sorted({m for l in lines for m in re.findall(r'\(\("([^"]+)"', l)})
+        if not lines:
+            if port == 80 or tls_needed:
+                res.append(("port %d listener" % port, "fail" if port == 80 else "warn",
+                            "nothing listens on port %d - is nginx running? (systemctl status nginx)" % port))
+            else:
+                res.append(("port %d listener" % port, "info", "not used yet - nginx listens on 443 once a domain has a certificate"))
+        elif any(p != "nginx" for p in procs):
+            res.append(("port %d listener" % port, "fail", "%s listens on port %d, not (only) nginx - stop it or move it" % (", ".join(procs), port)))
+        else:
+            res.append(("port %d listener" % port, "ok", "nginx"))
+    rc, rules = sh(["iptables-save", "-t", "filter"])
+    rules = rules.splitlines() if rc == 0 else []
+    for port in ports:
+        blocking = []
+        for l in rules:
+            m = re.search(r"--dports? (\S+)", l)
+            if not l.startswith("-A ") or not m or port not in _ports_in(m.group(1)) or "-p udp" in l:
+                continue
+            if re.search(r"-j (DROP|REJECT)\b", l) and " -s " not in l:
+                blocking.append(l)
+        if blocking:
+            res.append(("firewall port %d" % port, "fail", "an iptables rule drops/rejects port %d for everyone: %s" % (port, blocking[0][:160])))
+    jails = {}
+    for l in rules:
+        jm = re.match(r"^-A (INPUT|PVEFW-INPUT) .*--dports? (\S+).* -j (f2b-\S+)", l)
+        if jm and set(ports) & _ports_in(jm.group(2)):
+            jails[jm.group(3)] = sum(1 for x in rules if x.startswith("-A %s -s " % jm.group(3)) and re.search(r"-j (REJECT|DROP)", x))
+    for jail, banned in sorted(jails.items()):
+        if banned:
+            res.append(("fail2ban %s" % jail[4:], "warn", "%d address(es) banned on ports 80/443 - Let's Encrypt's validation servers "
+                        "get 'Connection refused' if they are among them (they are banned after failed challenges = 404s). "
+                        "Unban: fail2ban-client unban --all, and exclude /.well-known/acme-challenge/ from that jail" % banned))
+    # 80/443 must reach nginx on this host; a DNAT from another tool sends them to a guest instead
+    rc, nat = sh(["iptables-save", "-t", "nat"])
+    for l in nat.splitlines() if rc == 0 else []:
+        m = re.search(r"--dports? (\S+)", l)
+        to = re.search(r"--to-destination (\S+)", l)
+        if l.startswith("-A ") and "-j DNAT" in l and m and set(ports) & _ports_in(m.group(1)) and "-p udp" not in l \
+                and not l.split()[1].startswith("PVEGW_"):
+            res.append(("port %s forwarded away" % "/".join(str(p) for p in sorted(set(ports) & _ports_in(m.group(1)))), "fail",
+                        "an iptables rule outside pve-gateway forwards it to %s, so requests never reach nginx on this host "
+                        "(%s) - remove it: iptables -t nat -D %s" % (to.group(1) if to else "another address", l[:140], l[3:])))
+    rc, nft = sh(["nft", "list", "ruleset"])
+    if rc == 0:
+        table = ""
+        for l in nft.splitlines():
+            t = re.match(r"^table (\S+) (\S+)", l)
+            if t:
+                table = "%s %s" % t.groups()
+            m = re.search(r"tcp dport (\{[^}]*\}|\d+).*\bdnat\b.*?to (\S+)", l)
+            if m and "pvegw" not in table.lower() and set(ports) & _ports_in(m.group(1).strip("{} ").replace(" ", "")):
+                res.append(("port 80/443 forwarded away (nftables)", "fail", "nftables table %s forwards it to %s, so requests "
+                            "never reach nginx on this host: %s" % (table, m.group(2), l.strip()[:140])))
+    rc, st = sh(["pve-firewall", "status"])
+    if rc == 0 and "enabled" in st:
+        for port in ports:
+            if port == 443 and not tls_needed:
+                continue
+            allowed = _pvefw_allows(port)
+            if allowed is False:
+                res.append(("Proxmox firewall port %d" % port, "fail", "the Proxmox firewall is on and has no rule accepting port %d - "
+                            "add Datacenter > Firewall > Add: direction in, action ACCEPT, macro %s"
+                            % (port, {80: "HTTP", 443: "HTTPS"}[port])))
+            elif allowed:
+                res.append(("Proxmox firewall port %d" % port, "ok", "accepted"))
+            else:
+                res.append(("Proxmox firewall port %d" % port, "info", "firewall is on; can't verify port %d (security groups "
+                            "or unreadable config) - make sure HTTP/HTTPS are accepted" % port))
+    return res
 
 
 def nginx_sites(cfg):
@@ -1471,6 +1591,9 @@ def test_domain(d):
         check_dns(d, n, add)
     rc, out = sh(["systemctl", "is-active", "nginx"])
     add("nginx running", _st(out.strip() == "active"), out.strip() if out else "")
+    for name, status, detail in port_checks(cfg):
+        if status != "ok" or name.startswith("port 80"):
+            add(name, status, detail)
     sites = nginx_sites(cfg)
     if sites is not None and not sites["loaded"]:
         add("nginx loads pve-gateway", "fail", "%s is not included by nginx.conf - nginx ignores all domains; make sure "
@@ -1698,6 +1821,8 @@ def checks():
         add("nginx installed", _st(rc == 0), out if rc == 0 else "apt install nginx")
         rc, out = sh(["systemctl", "is-active", "nginx"])
         add("nginx running", _st(out.strip() == "active"), out.strip())
+        for name, status, detail in port_checks(cfg):
+            add(name, status, detail)
         sites = nginx_sites(cfg)
         if sites is not None:
             add("nginx loads pve-gateway.conf", _st(sites["loaded"] or not cfg["domains"]),
