@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.8.2"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.8.3"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -5049,6 +5049,14 @@ INDEX_HTML = r"""<!doctype html>
     <button type="button" id="wgCClose">Close</button></div>
 </dialog>
 
+<dialog id="askDlg" class="ask">
+  <form method="dialog">
+    <h2 id="askTitle"></h2>
+    <p id="askText" class="muted"></p>
+    <div class="actions"><button value="no" class="ghost">Cancel</button><button value="yes" id="askOk">OK</button></div>
+  </form>
+</dialog>
+
 <dialog id="testDlg">
   <h2 id="testTitle">Test</h2>
   <ul id="testSteps" class="checks"></ul>
@@ -5109,6 +5117,8 @@ button.link{background:none;border:1px solid transparent;color:var(--link);paddi
 button.link:hover:not(:disabled){background:var(--btn);border-color:var(--btn-line)}
 button.link.del{color:var(--bad)}button.link.del:hover:not(:disabled){background:var(--bad-bg);border-color:transparent}
 button.link:disabled{color:var(--muted)}
+button.danger{background:var(--bad);border-color:var(--bad);color:var(--accent-fg)}
+dialog.ask{max-width:440px}dialog.ask h2{font-size:16px;margin:0 0 8px}dialog.ask p{margin:0 0 4px;white-space:pre-wrap}
 table{width:100%;border-collapse:collapse;white-space:nowrap}
 th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line)}
 th{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
@@ -5202,6 +5212,21 @@ async function api(method, path, body) {
   if (r.status === 401 && path !== '/api/login') { showLogin(); throw new Error('Login required'); }
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
+}
+
+// Confirmation for every change: ask(title, detail, okLabel, danger) -> Promise<boolean>. Escape / Cancel = no.
+function ask(title, text, ok, danger) {
+  const d = $('#askDlg');
+  if (d.open) { d.returnValue = ''; d.onclose && d.onclose(); d.onclose = null; d.close(); }  // a second click: the first question is cancelled
+  $('#askTitle').textContent = title; $('#askText').textContent = text || ''; $('#askText').hidden = !text;
+  $('#askOk').textContent = ok || 'Save'; $('#askOk').classList.toggle('danger', !!danger);
+  d.returnValue = '';
+  return new Promise(res => { d.onclose = () => res(d.returnValue === 'yes'); d.showModal(); $('#askOk').focus(); });
+}
+// Checkbox toggles: put the box back when the change is not confirmed.
+async function askToggle(e, what) {
+  if (await ask((e.target.checked ? 'Enable ' : 'Disable ') + what + '?', 'The change is applied right away.', e.target.checked ? 'Enable' : 'Disable', !e.target.checked)) return true;
+  e.target.checked = !e.target.checked; return false;
 }
 
 function el(tag, props, ...kids) {
@@ -5303,7 +5328,7 @@ function render() {
     const c = S.counters[r.id];
     tb.append(el('tr', {class: r.enabled ? '' : 'off'},
       el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: r.enabled, title: r.enabled ? 'Disable' : 'Enable',
-        onchange: e => save(r.id, Object.assign({}, r, {enabled: e.target.checked}))})),
+        onchange: async e => { if (await askToggle(e, 'rule "' + (r.name || r.ext_port) + '"')) save(r.id, Object.assign({}, r, {enabled: e.target.checked})).catch(() => {}); }})),
       el('td', {textContent: r.name || '—'}),
       el('td', {}, el('span', {class: 'tag', textContent: r.proto === 'both' ? 'tcp+udp' : r.proto})),
       el('td', {class: 'mono', textContent: r.ext_port}),
@@ -5327,7 +5352,7 @@ async function save(id, data) {
 }
 
 async function del(r) {
-  if (!confirm('Delete rule "' + (r.name || r.ext_port) + '"?')) return;
+  if (!await ask('Delete rule "' + (r.name || r.ext_port) + '"?', 'Host port ' + r.ext_port + ' stops forwarding to ' + r.ip + '.', 'Delete', true)) return;
   try { await api('DELETE', '/api/rules/' + r.id); flash('Deleted'); await load(); } catch (e) { flash(e.message, true); }
 }
 
@@ -5383,6 +5408,9 @@ $('#ruleForm').addEventListener('submit', async e => {
   const f = e.target, d = {};
   for (const k of ['name', 'proto', 'ext_port', 'ip', 'int_port', 'source', 'iface']) d[k] = f[k].value.trim();
   d.masq = f.masq.checked; d.enabled = f.enabled.checked;
+  if (!await ask((editing ? 'Save changes to rule ' : 'Create rule ') + '"' + (d.name || d.ext_port) + '"?',
+    (d.proto === 'both' ? 'TCP+UDP' : d.proto.toUpperCase()) + ' ' + d.ext_port + ' → ' + d.ip + (d.int_port ? ':' + d.int_port : '') +
+    (d.enabled ? '. iptables is updated right away.' : ' (disabled).'), editing ? 'Save' : 'Create')) return;
   try {
     await api(editing ? 'PUT' : 'POST', editing ? '/api/rules/' + editing : '/api/rules', d);
     $('#dlg').close(); flash('Saved and applied'); load();
@@ -5454,7 +5482,7 @@ function renderWildcards() {
     const st = (S.wildcard_status || {})[w.id] || {};
     tb.append(el('tr', {class: w.enabled ? '' : 'off'},
       el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: w.enabled, title: w.enabled ? 'Disable' : 'Enable',
-        onchange: e => saveWildcard(w.id, Object.assign({}, w, {enabled: e.target.checked}))})),
+        onchange: async e => { if (await askToggle(e, 'wildcard *.' + w.zone)) saveWildcard(w.id, Object.assign({}, w, {enabled: e.target.checked})); }})),
       el('td', {class: 'names'}, el('span', {class: 'mono', textContent: '*.' + w.zone}), el('span', {class: 'alias', textContent: '+ ' + w.zone})),
       el('td', {textContent: (prov[w.provider] || {}).label || w.provider}),
       el('td', {}, certChip(st.cert, st.job, 'valid')),
@@ -5487,7 +5515,7 @@ function renderDomains() {
   for (const d of ds) {
     tb.append(el('tr', {class: d.enabled ? '' : 'off'},
       el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: d.enabled, title: d.enabled ? 'Disable' : 'Enable',
-        onchange: e => saveDomain(d.id, Object.assign({}, d, {enabled: e.target.checked}))})),
+        onchange: async e => { if (await askToggle(e, 'domain ' + d.domain)) saveDomain(d.id, Object.assign({}, d, {enabled: e.target.checked})); }})),
       el('td', {class: 'names'}, el('a', {href: (d.tls !== 'none' ? 'https://' : 'http://') + d.domain, target: '_blank', rel: 'noopener', textContent: d.domain}),
         ...d.aliases.map(a => el('span', {class: 'alias', textContent: d.alias_redirect ? '↳ ' + a + ' → 301' : a})),
         (d.cloudflare || d.hsts) ? el('span', {class: 'alias'},
@@ -5517,7 +5545,7 @@ async function saveDomain(id, data) {
 }
 
 async function delDomain(d) {
-  if (!confirm('Delete domain "' + d.domain + '"? (its certificate is kept)')) return;
+  if (!await ask('Delete domain ' + d.domain + '?', 'nginx stops serving it. Its certificate is kept.', 'Delete', true)) return;
   try { await api('DELETE', '/api/domains/' + d.id); domFlash('Deleted'); } catch (e) { domFlash(e.message, true); }
   load().catch(() => {});
 }
@@ -5573,6 +5601,8 @@ $('#domForm').addEventListener('submit', async e => {
   for (const k of ['domain', 'aliases', 'ip', 'port', 'tls', 'max_body', 'source', 'acme_email']) d[k] = f[k].value.trim();
   d.upstream_https = f.upstream_https.checked; d.force_https = f.force_https.checked; d.enabled = f.enabled.checked;
   for (const k of ['alias_redirect', 'hsts', 'headers', 'cloudflare']) d[k] = f[k].checked;
+  if (!await ask((editingDom ? 'Save changes to ' : 'Add domain ') + d.domain + '?', d.domain + ' → ' + (d.upstream_https ? 'https://' : 'http://') +
+    d.ip + ':' + d.port + '. nginx is reloaded' + (d.tls === 'letsencrypt' && d.enabled && !editingDom ? ' and a certificate is requested.' : '.'), editingDom ? 'Save' : 'Add')) return;
   const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
   try {
     await api(editingDom ? 'PUT' : 'POST', editingDom ? '/api/domains/' + editingDom : '/api/domains', d);
@@ -5619,6 +5649,8 @@ $('#wcForm').addEventListener('submit', async e => {
   for (const i of $('#wcFields').querySelectorAll('input')) if (i.value.trim()) creds[i.name.slice(5)] = i.value.trim();
   const d = {zone: f.zone.value.trim(), provider: f.provider.value, propagation: f.propagation.value.trim() || 0,
     acme_email: f.acme_email.value.trim(), enabled: f.enabled.checked, credentials: creds};
+  if (!await ask((editingWc ? 'Save wildcard *.' : 'Add wildcard *.') + d.zone + '?', d.enabled ? 'A certificate is requested through ' + d.provider + ' DNS.' : '',
+    editingWc ? 'Save' : 'Add')) return;
   const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
   try {
     await api(editingWc ? 'PUT' : 'POST', editingWc ? '/api/wildcards/' + editingWc.id : '/api/wildcards', d);
@@ -5634,7 +5666,7 @@ async function saveWildcard(id, w) {
   load().catch(() => {});
 }
 async function delWildcard(w) {
-  if (!confirm('Delete wildcard *.' + w.zone + '? Its stored DNS credentials are removed (the certificate files are kept).')) return;
+  if (!await ask('Delete wildcard *.' + w.zone + '?', 'Its stored DNS credentials are removed (the certificate files are kept).', 'Delete', true)) return;
   try { await api('DELETE', '/api/wildcards/' + w.id); domFlash('Deleted'); } catch (e) { domFlash(e.message, true); }
   load().catch(() => {});
 }
@@ -5745,7 +5777,7 @@ function renderMonitor() {
           loadMonitor(); }}),
         el('button', {class: 'link', textContent: 'Edit', onclick: () => openMonDlg(m)}),
         el('button', {class: 'link del', textContent: 'Delete', onclick: async () => {
-          if (!confirm('Delete check "' + (m.name || m.target) + '"?')) return;
+          if (!await ask('Delete check "' + (m.name || m.target) + '"?', 'Its history is removed too.', 'Delete', true)) return;
           await api('DELETE', '/api/monitors/' + m.id).catch(e => $('#monMsg').textContent = e.message); loadMonitor(); }}))));
   }
   const a = MONS.alerts || {};
@@ -5774,18 +5806,22 @@ $('#monForm').addEventListener('submit', async e => {
   const f = e.target, d = {};
   for (const k of ['name', 'type', 'target', 'interval', 'timeout', 'expect']) d[k] = f[k].value.trim();
   for (const k of ['verify_tls', 'alert', 'enabled']) d[k] = f[k].checked;
+  if (!await ask((editingMon ? 'Save check "' : 'Add check "') + (d.name || d.target) + '"?', d.type.toUpperCase() + ' ' + d.target + ' every ' + (d.interval || 60) + ' s.',
+    editingMon ? 'Save' : 'Add')) return;
   try { await api(editingMon ? 'PUT' : 'POST', editingMon ? '/api/monitors/' + editingMon : '/api/monitors', d); $('#monDlg').close(); loadMonitor(); }
   catch (err) { $('#monErr').textContent = err.message; }
 });
 $('#monCancel').onclick = () => $('#monDlg').close();
 $('#addMonBtn').onclick = () => openMonDlg(null);
 $('#suggestMon').onclick = async () => {
+  if (!await ask('Add checks for your domains and ports?', 'One check is created for each domain and port rule that has none yet.', 'Add')) return;
   try { const r = await api('POST', '/api/monitors/suggest', {}); $('#monMsg').textContent = r.added ? 'Added ' + r.added + ' check(s)' : 'Every domain and port rule already has a check'; }
   catch (e) { $('#monMsg').textContent = e.message; }
   setTimeout(loadMonitor, 1200);
 };
 $('#alSave').onclick = async () => {
   $('#alErr').textContent = '';
+  if (!await ask('Save alert settings?', 'Alerts are sent to the channels you filled in.')) return;
   try {
     await api('PUT', '/api/alerts', {email: $('#alEmail').value, webhook: $('#alHook').value, telegram_token: $('#alTgToken').value,
       telegram_chat: $('#alTgChat').value, fail_after: $('#alFails').value, cert_days: $('#alCert').value});
@@ -5847,7 +5883,7 @@ function renderVpn() {
         el('button', {class: 'ghost', textContent: '+ Site', onclick: () => openWgPeer(t, null, 'site')}),
         el('button', {class: 'link', textContent: 'Edit', onclick: () => openWgTunnel(t)}),
         el('button', {class: 'link del', textContent: 'Delete', onclick: async () => {
-          if (!confirm('Delete tunnel ' + t.name + ' and its ' + t.peers.length + ' peers? Their keys are deleted too.')) return;
+          if (!await ask('Delete tunnel ' + t.name + '?', 'Its ' + t.peers.length + ' peer(s) disconnect, and all their keys are deleted.', 'Delete', true)) return;
           await api('DELETE', '/api/wireguard/tunnels/' + t.id).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); }})),
       el('p', {class: 'hint'}, 'Server public key: ', el('span', {class: 'mono', textContent: t.public_key}), ' ',
         el('button', {class: 'link', textContent: 'copy', onclick: () => navigator.clipboard.writeText(t.public_key)})),
@@ -5867,7 +5903,7 @@ function renderVpn() {
               p.kind === 'device' && p.has_key ? el('button', {class: 'link', textContent: 'Config', onclick: () => showWgConfig(t, p)}) : null,
               el('button', {class: 'link', textContent: 'Edit', onclick: () => openWgPeer(t, p)}),
               el('button', {class: 'link del', textContent: 'Delete', onclick: async () => {
-                if (!confirm('Remove ' + p.name + '? It can no longer connect.')) return;
+                if (!await ask('Remove ' + p.name + '?', 'It can no longer connect, and its keys are deleted.', 'Remove', true)) return;
                 await api('DELETE', '/api/wireguard/tunnels/' + t.id + '/peers/' + p.id).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); }})));
         }))),
         t.peers.length ? null : el('p', {class: 'muted pad', textContent: 'No peers yet - add a device (phone, laptop) or a site (another router).'})));
@@ -5884,6 +5920,8 @@ $('#wgTForm').addEventListener('submit', async e => {
   e.preventDefault(); const f = e.target;
   const d = {name: f.name.value.trim(), port: f.port.value, address: f.address.value.trim(), endpoint: f.endpoint.value.trim(),
     client_routes: f.client_routes.value, dns: f.dns.value, nat: f.nat.checked, enabled: f.enabled.checked};
+  if (!await ask((wgTEdit ? 'Save tunnel ' : 'Create tunnel ') + d.name + '?', d.address + ', UDP ' + d.port + (d.enabled ? '. The tunnel is (re)started; connected peers stay connected.' : ' (disabled).'),
+    wgTEdit ? 'Save' : 'Create')) return;
   try { await api(wgTEdit ? 'PUT' : 'POST', '/api/wireguard/tunnels' + (wgTEdit ? '/' + wgTEdit : ''), d); $('#wgTDlg').close(); loadVpn(); }
   catch (err) { $('#wgTErr').textContent = err.message; }
 });
@@ -5903,6 +5941,8 @@ $('#wgPForm').addEventListener('submit', async e => {
   e.preventDefault(); const f = e.target;
   const d = {name: f.name.value.trim(), kind: f.kind.value, address: f.address.value.trim(), public_key: f.public_key.value.trim(),
     allowed_ips: f.allowed_ips.value, endpoint: f.endpoint.value.trim(), keepalive: f.keepalive.value, psk: f.psk.checked, enabled: f.enabled.checked};
+  if (!await ask((wgPEdit ? 'Save ' : 'Add ') + (d.kind === 'site' ? 'site ' : 'device ') + d.name + '?',
+    wgPEdit ? 'The tunnel is updated in place.' : d.kind === 'device' ? 'Keys are generated and you get its configuration.' : 'It can connect with its own key.', wgPEdit ? 'Save' : 'Add')) return;
   try {
     const r = await api(wgPEdit ? 'PUT' : 'POST', '/api/wireguard/tunnels/' + wgPTunnel.id + '/peers' + (wgPEdit ? '/' + wgPEdit : ''), d);
     $('#wgPDlg').close(); await loadVpn();
@@ -5927,7 +5967,7 @@ $('#wgCClose').onclick = () => { $('#wgCText').value = ''; $('#wgCCopy').textCon
 $('#wgTCancel').onclick = () => $('#wgTDlg').close();
 $('#wgPCancel').onclick = () => $('#wgPDlg').close();
 $('#wgNewTunnel').onclick = () => openWgTunnel(null);
-$('#wgInstall').onclick = async () => { await api('POST', '/api/wireguard/install', {}).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); };
+$('#wgInstall').onclick = async () => { if (!await ask('Install WireGuard?', 'Runs: apt-get install wireguard-tools', 'Install')) return; await api('POST', '/api/wireguard/install', {}).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); };
 
 // ---- Network: Proxmox SDN (zones, VNets, subnets with DHCP, IPAM, DNS)
 let SDN = null, sdnZEdit = null, sdnSEdit = null, sdnSVnet = null, sdnErr = '';
@@ -5962,7 +6002,7 @@ function renderNetwork() {
         el('td', {colSpan: 4, class: 'small', textContent: g.length ? 'Guests: ' + g.map(n => (n.name || n.vmid) + ' (' + n.nic + ')').join(', ') : v.state === 'deleted' ? '' : 'no guest uses it yet'}),
         el('td', {class: 'num'}, v.state === 'deleted' || z.type !== 'simple' ? null : el('button', {class: 'link', textContent: '+ Subnet', onclick: () => openSdnSubnet(v, null)}),
           v.state === 'deleted' ? null : el('button', {class: 'link', textContent: 'Edit', onclick: () => editSdnVnet(v)}),
-          v.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/vnets/' + v.vnet, null, 'Delete VNet ' + v.vnet + '?')}))));
+          v.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/vnets/' + v.vnet, null, 'Delete VNet ' + v.vnet + '?', 'Pending in Proxmox until you click Apply SDN changes.', 'Delete', true)}))));
       for (const sb of v.subnets) rows.push(el('tr', {class: 'sub' + (sb.state === 'deleted' ? ' off' : '')},
         el('td', {class: 'mono', textContent: '└ ' + sb.cidr}, sdnState(sb.state)),
         el('td', {class: 'mono', textContent: sb.gateway || '—'}),
@@ -5970,7 +6010,7 @@ function renderNetwork() {
         el('td', {class: 'mono small', textContent: sb.dns_server || '—'}),
         el('td', {}, sb.snat ? el('span', {class: 'tag', textContent: 'snat'}) : null),
         el('td', {class: 'num'}, sb.state === 'deleted' ? null : el('button', {class: 'link', textContent: 'Edit', onclick: () => openSdnSubnet(v, sb)}),
-          sb.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/vnets/' + v.vnet + '/subnets/' + sb.id, null, 'Delete subnet ' + sb.cidr + '?')}))));
+          sb.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/vnets/' + v.vnet + '/subnets/' + sb.id, null, 'Delete subnet ' + sb.cidr + '?', 'Pending in Proxmox until you click Apply SDN changes.', 'Delete', true)}))));
     }
     return el('div', {class: 'card form-card', style: 'margin-bottom:14px;max-width:none'},
       el('div', {class: 'sub-head', style: 'margin:0'}, el('h2', {textContent: 'Zone ' + z.zone}),
@@ -5980,7 +6020,7 @@ function renderNetwork() {
         sdnState(z.state), el('span', {class: 'spacer'}),
         z.state === 'deleted' || z.type !== 'simple' ? null : el('button', {class: 'ghost', textContent: '+ VNet', onclick: () => openSdnVnet(z.zone)}),
         z.state === 'deleted' ? null : el('button', {class: 'link', textContent: 'Edit', onclick: () => openSdnZone(z)}),
-        z.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/zones/' + z.zone, null, 'Delete zone ' + z.zone + '?')})),
+        z.state === 'deleted' ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () => sdnDo('DELETE', '/api/sdn/zones/' + z.zone, null, 'Delete zone ' + z.zone + '?', 'Pending in Proxmox until you click Apply SDN changes.', 'Delete', true)})),
       z.type && z.type !== 'simple' ? el('p', {class: 'hint', textContent: 'A ' + z.type + ' zone - VNets and subnets are shown here, but create them in the Proxmox UI (they need VLAN/VXLAN settings).'}) : null,
       rows.length ? el('div', {class: 'scroll'}, el('table', {},
         el('thead', {}, el('tr', {}, ...['VNet / subnet', 'Gateway', 'DHCP range', 'DNS for clients', '', ''].map(h => el('th', {textContent: h})))),
@@ -5997,18 +6037,19 @@ function renderNetwork() {
         e.hostname ? el('span', {class: 'alias', textContent: e.hostname}) : null),
       el('td', {}, el('span', {class: 'tag', textContent: e.gateway ? 'gateway' : e.vmid ? 'guest' : 'reserved'})),
       el('td', {class: 'num'}, e.gateway ? null : el('button', {class: 'link del', textContent: 'Delete', onclick: () =>
-        sdnDo('DELETE', '/api/sdn/vnets/' + e.vnet + '/ips/' + e.ip, null, 'Remove ' + e.ip + ' from the IPAM? A guest that still uses it keeps it until its lease ends.')})));
+        sdnDo('DELETE', '/api/sdn/vnets/' + e.vnet + '/ips/' + e.ip, null, 'Remove ' + e.ip + ' from the IPAM?', 'A guest that still uses it keeps it until its lease ends.', 'Remove', true)})));
   }));
 }
 function ipNum(ip) { return ip.split('.').reduce((a, x) => a * 256 + (+x || 0), 0); }
-async function sdnDo(method, url, body, ask) {
-  if (ask && !confirm(ask)) return;
+async function sdnDo(method, url, body, title, text, ok, danger) {
+  if (title && !await ask(title, text, ok, danger)) return;
   sdnErr = '';
   try { await api(method, url, body || {}); } catch (e) { sdnErr = e.message; }
   loadNetwork();
 }
-async function sdnSubmit(e, dlg, errEl, method, url, data) {
+async function sdnSubmit(e, dlg, errEl, method, url, data, title, text) {
   e.preventDefault();
+  if (!await ask(title, text, method === 'POST' ? 'Create' : 'Save')) return;
   try { await api(method, url, data); $(dlg).close(); sdnErr = ''; loadNetwork(); } catch (err) { $(errEl).textContent = err.message; }
 }
 function plugins(sel, cur) {
@@ -6025,17 +6066,19 @@ function openSdnZone(z) {
 }
 $('#sdnZForm').addEventListener('submit', e => { const f = e.target;
   sdnSubmit(e, '#sdnZDlg', '#sdnZErr', sdnZEdit ? 'PUT' : 'POST', '/api/sdn/zones' + (sdnZEdit ? '/' + sdnZEdit : ''),
-    {zone: f.zone.value.trim(), dhcp: f.dhcp.checked, dns: f.dns.value, reversedns: f.reversedns.value, dnszone: f.dnszone.value.trim()}); });
+    {zone: f.zone.value.trim(), dhcp: f.dhcp.checked, dns: f.dns.value, reversedns: f.reversedns.value, dnszone: f.dnszone.value.trim()},
+    (sdnZEdit ? 'Save zone ' : 'Create zone ') + (sdnZEdit || f.zone.value.trim()) + '?', (f.dhcp.checked ? 'DHCP on. ' : 'DHCP off. ') + 'Pending in Proxmox until you click Apply SDN changes.'); });
 function openSdnVnet(zone) {
   const f = $('#sdnVForm'); $('#sdnVErr').textContent = '';
   f.zone.replaceChildren(...SDN.zones.filter(z => z.type === 'simple' && z.state !== 'deleted').map(z => el('option', {value: z.zone, textContent: z.zone})));
   f.zone.value = zone; f.vnet.value = ''; f.alias.value = ''; $('#sdnVDlg').showModal(); f.vnet.focus();
 }
 $('#sdnVForm').addEventListener('submit', e => { const f = e.target;
-  sdnSubmit(e, '#sdnVDlg', '#sdnVErr', 'POST', '/api/sdn/vnets', {vnet: f.vnet.value.trim(), zone: f.zone.value, alias: f.alias.value.trim()}); });
+  sdnSubmit(e, '#sdnVDlg', '#sdnVErr', 'POST', '/api/sdn/vnets', {vnet: f.vnet.value.trim(), zone: f.zone.value, alias: f.alias.value.trim()},
+    'Create VNet ' + f.vnet.value.trim() + ' in zone ' + f.zone.value + '?', 'It becomes a bridge on this host. Pending in Proxmox until you click Apply SDN changes.'); });
 function editSdnVnet(v) {
   const alias = prompt('Description of VNet ' + v.vnet, v.alias || '');
-  if (alias !== null) sdnDo('PUT', '/api/sdn/vnets/' + v.vnet, {alias});
+  if (alias !== null) sdnDo('PUT', '/api/sdn/vnets/' + v.vnet, {alias}, 'Rename VNet ' + v.vnet + '?', 'Description: ' + (alias || '(none)'));
 }
 function openSdnSubnet(v, sb) {
   sdnSVnet = v; sdnSEdit = sb ? sb.id : null; const f = $('#sdnSForm');
@@ -6055,7 +6098,9 @@ $('#sdnSForm').cidr.addEventListener('change', e => {  // suggest gateway .1 and
 $('#sdnSForm').addEventListener('submit', e => { const f = e.target;
   sdnSubmit(e, '#sdnSDlg', '#sdnSErr', sdnSEdit ? 'PUT' : 'POST', '/api/sdn/vnets/' + sdnSVnet.vnet + '/subnets' + (sdnSEdit ? '/' + sdnSEdit : ''),
     {cidr: f.cidr.value.trim(), gateway: f.gateway.value.trim(), dhcp_range: f.dhcp_range.value.split(/[\n,]+/).map(x => x.trim()).filter(Boolean),
-     dns_server: f.dns_server.value.trim(), snat: f.snat.checked}); });
+     dns_server: f.dns_server.value.trim(), snat: f.snat.checked},
+    (sdnSEdit ? 'Save subnet ' : 'Create subnet ') + (f.cidr.value.trim()) + ' on ' + sdnSVnet.vnet + '?',
+    'Gateway ' + (f.gateway.value.trim() || 'first address') + (f.snat.checked ? ', SNAT on' : '') + '. Pending in Proxmox until you click Apply SDN changes.'); });
 function sdnNics() {
   const f = $('#sdnIForm'), list = SDN.nics.filter(n => n.bridge === f.vnet.value);
   f.nic.replaceChildren(el('option', {value: '', textContent: list.length ? 'type the MAC yourself' : 'no guest on this VNet - type the MAC'}),
@@ -6069,10 +6114,11 @@ $('#sdnNewIp').onclick = () => {
 };
 $('#sdnIForm').vnet.addEventListener('change', sdnNics);
 $('#sdnIForm').addEventListener('submit', e => { const f = e.target;
-  sdnSubmit(e, '#sdnIDlg', '#sdnIErr', 'POST', '/api/sdn/vnets/' + f.vnet.value + '/ips', {ip: f.ip.value.trim(), mac: f.mac.value.trim(), vmid: f.vmid.value.trim()}); });
+  sdnSubmit(e, '#sdnIDlg', '#sdnIErr', 'POST', '/api/sdn/vnets/' + f.vnet.value + '/ips', {ip: f.ip.value.trim(), mac: f.mac.value.trim(), vmid: f.vmid.value.trim()},
+    'Reserve ' + f.ip.value.trim() + ' for ' + (f.mac.value.trim() || 'this MAC') + '?', 'Saved in the Proxmox IPAM right away.'); });
 $('#sdnNewZone').onclick = () => openSdnZone(null);
-$('#sdnApply').onclick = () => sdnDo('POST', '/api/sdn/apply');
-$('#sdnInstall').onclick = () => sdnDo('POST', '/api/sdn/install');
+$('#sdnApply').onclick = () => sdnDo('POST', '/api/sdn/apply', null, 'Apply SDN changes?', 'Proxmox reloads the SDN networks; guests on changed VNets may lose connectivity for a moment.', 'Apply');
+$('#sdnInstall').onclick = () => sdnDo('POST', '/api/sdn/install', null, 'Install dnsmasq?', 'Runs: apt-get install dnsmasq (the default dnsmasq service is turned off; Proxmox runs one per zone).', 'Install');
 for (const b of document.querySelectorAll('[data-close]')) b.onclick = () => b.closest('dialog').close();
 
 // ---- security: firewall (edits go to a draft; Apply activates it with a 60 s keep/revert window)
@@ -6153,6 +6199,7 @@ $('#fwTemplate').onchange = async e => {
 };
 $('#fwApply').onclick = async () => {
   $('#fwErr').textContent = '';
+  if (!await ask('Apply the firewall changes?', 'They take effect now. Confirm within 60 s that you can still reach this page, or the previous firewall comes back.', 'Apply')) return;
   try { FW = Object.assign(await api('PUT', '/api/firewall', FWD), {}); FWD = JSON.parse(JSON.stringify(FW.settings)); renderFirewall(); }
   catch (e) { $('#fwErr').textContent = e.message; }
 };
@@ -6215,7 +6262,7 @@ function renderBanned() {
     el('td', {class: 'mono', textContent: b.ip}),
     el('td', {}, el('span', {class: 'tag', textContent: b.jail})),
     el('td', {class: 'small muted', textContent: ipNet(b.ip) + (net[ipNet(b.ip)] > 1 ? ' · ' + net[ipNet(b.ip)] + ' banned from it' : '')}),
-    el('td', {class: 'num'}, el('button', {class: 'link', textContent: 'Unban', onclick: () => f2bAct('unban', {jail: b.jail, ip: b.ip})})))));
+    el('td', {class: 'num'}, el('button', {class: 'link', textContent: 'Unban', onclick: async () => { if (await ask('Unban ' + b.ip + '?', 'From jail ' + b.jail + '.', 'Unban')) f2bAct('unban', {jail: b.jail, ip: b.ip}); }})))));
 }
 $('#f2bFilter').addEventListener('input', renderBanned);
 $('#f2bCopy').onclick = () => {
@@ -6232,6 +6279,7 @@ $('#f2bAddMe').onclick = () => { const t = $('#f2bIgnore'), ip = $('#f2bMyIp').t
   if (!t.value.split(/[\s,]+/).includes(ip)) t.value = (t.value.trim() ? t.value.trim() + '\n' : '') + ip; };
 $('#f2bSave').onclick = async () => {
   $('#f2bErr').textContent = '';
+  if (!await ask('Apply fail2ban settings?', 'fail2ban is reloaded with the new jails and limits.', 'Apply')) return;
   const jails = {}; for (const c of document.querySelectorAll('#f2bJailToggles input')) jails[c.value] = c.checked;
   try {
     await api('PUT', '/api/fail2ban', {managed: $('#f2bManaged').checked, bantime: $('#f2bBantime').value, findtime: $('#f2bFindtime').value,
@@ -6239,9 +6287,10 @@ $('#f2bSave').onclick = async () => {
     $('#f2bSaved').textContent = 'Applied'; setTimeout(() => $('#f2bSaved').textContent = '', 3000); document.activeElement.blur(); loadSecurity();
   } catch (e) { $('#f2bErr').textContent = e.message; }
 };
-$('#f2bInstall').onclick = () => f2bAct('install');
-$('#f2bUnbanAll').onclick = () => confirm('Unban every banned IP in all jails?') && f2bAct('unban-all');
-$('#f2bBan').onclick = () => f2bAct('ban', {jail: $('#f2bBanJail').value, ip: $('#f2bBanIp').value.trim()});
+$('#f2bInstall').onclick = async () => { if (await ask('Install fail2ban?', 'Runs: apt-get install fail2ban', 'Install')) f2bAct('install'); };
+$('#f2bUnbanAll').onclick = async () => { if (await ask('Unban every banned IP?', 'In all jails.', 'Unban all', true)) f2bAct('unban-all'); };
+$('#f2bBan').onclick = async () => { const ip = $('#f2bBanIp').value.trim(), jail = $('#f2bBanJail').value;
+  if (await ask('Ban ' + (ip || 'this IP') + '?', 'In jail ' + jail + '. It can no longer reach the services that jail protects.', 'Ban', true)) f2bAct('ban', {jail, ip}); };
 
 // ---- updates
 const ago = t => { const m = Math.round((Date.now() / 1000 - t) / 60); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.round(m / 60) + ' h ago'; };
@@ -6275,12 +6324,13 @@ async function waitForRestart(ver) {
 }
 $('#updCheck').onclick = () => loadUpdate(true);
 $('#autoUpd').onchange = async e => {
+  if (!await askToggle(e, 'automatic updates')) return;
   try { await api('PUT', '/api/settings', {auto_update: e.target.checked}); }
   catch (err) { e.target.checked = !e.target.checked; $('#updErr').textContent = err.message; }
 };
 $('#updRun').onclick = async () => {
   const b = $('#updRun');
-  if (!confirm(b.textContent + ' now? pve-gateway restarts for a few seconds; port rules and domains keep working.')) return;
+  if (!await ask(b.textContent + ' now?', 'pve-gateway restarts for a few seconds; port rules and domains keep working.', b.textContent)) return;
   b.disabled = true; $('#updErr').textContent = ''; $('#updStatus').textContent = 'Downloading…';
   try {
     const r = await api('POST', '/api/update', {});
@@ -6309,6 +6359,7 @@ $('#addMyIp').onclick = () => {
 };
 $('#saveSettings').onclick = async () => {
   $('#setErr').textContent = '';
+  if (!await ask('Save web UI access settings?', 'Only the listed IPs / networks and host names can open this page afterwards.')) return;
   try {
     const body = {ui_allow: $('#uiAllow').value, allowed_hosts: $('#uiHosts').value};
     if (!$('#usersRow').hidden) body.allowed_users = $('#uiUsers').value;

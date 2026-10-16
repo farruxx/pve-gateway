@@ -4,6 +4,11 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.8.3 - 2026-10-16
+- Every create, edit, delete, enable/disable, apply and install action now asks for confirmation first, in a dialog
+  that says what will change (port rules, domains, wildcards, checks, alerts, WireGuard, firewall, fail2ban, SDN,
+  settings, update). Destructive actions have a red button. Escape or Cancel leaves everything as it was.
+
 ## 1.8.2 - 2026-10-16
 - Secondary buttons are easier to see: outlined buttons (Re-apply, + VNet, Cancel, ...) get a filled background and
   a stronger border, and row actions (Test, Edit, Config, ...) are coloured with a hover highlight. Delete is red.
