@@ -51,6 +51,7 @@ SCENARIOS = {
     "nginx-test-fails": "make the next `nginx -t` fail (shows the automatic rollback)",
     "cert-expiring": "make all certificates expire in 5 days",
     "foreign-site": "install another panel's nginx site bound to the host IP that redirects everything to HTTPS",
+    "le-blocked": "Let's Encrypt can't reach port 80 (provider firewall) although it works from the host itself",
 }
 
 # rules seeded into a fresh ./.dev config, chosen to show every test outcome
@@ -339,6 +340,8 @@ server {
                 os.makedirs(d, exist_ok=True)
                 with open(os.path.join(d, "other-panel"), "w") as f:
                     f.write(self.FOREIGN_SITE % {"ip": HOST_IP})
+            elif name == "le-blocked":
+                st["le_blocked"] = True
             elif name == "cert-expiring":
                 for c in st["issued"].values():
                     c["expires"] = time.time() + 5 * 86400 + 3600
@@ -620,6 +623,29 @@ server {
         time.sleep(1)  # "Waiting 10 seconds for DNS changes to propagate"
         return None
 
+    def _le_log(self, domain, kind, detail):
+        """A letsencrypt.log like certbot writes it (incl. lines that must be filtered out of the Debug view)."""
+        p = self.path_for("/var/log/letsencrypt/letsencrypt.log")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        t = time.strftime("%Y-%m-%d %H:%M:%S,000")
+        with open(p, "w") as f:
+            f.write("\n".join([
+                "%s:DEBUG:certbot._internal.main:certbot version: 4.0.0" % t,
+                "%s:DEBUG:acme.client:Sending POST request to https://acme-v02.api.letsencrypt.org/acme/new-acct:" % t,
+                '{"contact": ["mailto:someone@example.com"], "termsOfServiceAgreed": true}',
+                '  "payload": "eyJjb250YWN0IjpbIm1haWx0bzpzb21lb25lQGV4YW1wbGUuY29tIl19",',
+                "%s:INFO:certbot._internal.auth_handler:Performing the following challenges:" % t,
+                "%s:INFO:certbot._internal.auth_handler:http-01 challenge for %s" % (t, domain),
+                "%s:INFO:certbot._internal.auth_handler:Waiting for verification..." % t,
+                '{', '  "identifier": {"type": "dns", "value": "%s"},' % domain, '  "status": "invalid",',
+                '  "challenges": [{', '      "type": "http-01", "status": "invalid",',
+                '      "error": {', '        "type": "urn:ietf:params:acme:error:%s",' % kind,
+                '        "detail": "%s",' % detail, '        "status": 400', "      }", "  }]", "}",
+                "%s:INFO:certbot._internal.auth_handler:Cleaning up challenges" % t,
+                "%s:DEBUG:certbot._internal.log:Exiting abnormally:" % t,
+                "certbot.errors.AuthorizationError: Some challenges have failed.",
+                "%s:ERROR:certbot._internal.log:Some challenges have failed." % t, ""]))
+
     def c_systemctl(self, st, a, data):
         if a[-1] != "nginx":
             return 1, "(mock) only nginx is simulated", False
@@ -698,6 +724,14 @@ server {
             return 1, "(mock) unsupported certbot call", False
         names = [a[i + 1] for i, x in enumerate(a) if x == "-d"]
         name = a[a.index("--cert-name") + 1]
+        if st.get("le_blocked") and "--webroot" in a:
+            time.sleep(1)
+            self._le_log(names[0], "connection", "%s: Fetching http://%s/.well-known/acme-challenge/kQ9r2x: "
+                         "Timeout during connect (likely firewall problem)" % (PUBLIC_IP, names[0]))
+            # like certbot 4: the short summary only, the details are in letsencrypt.log
+            return 1, ("Saving debug log to /var/log/letsencrypt/letsencrypt.log\nSome challenges have failed.\n"
+                       "Ask for help or search for solutions at https://community.letsencrypt.org. See the logfile "
+                       "/var/log/letsencrypt/letsencrypt.log or re-run Certbot with -v for more details."), False
         if "--authenticator" in a:
             err = self._dns01(a, names)
             if err:
