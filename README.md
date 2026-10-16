@@ -26,28 +26,50 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 - **Login with your Proxmox account.** Credentials are checked against the local PVE API, and only `root@pam` is allowed by default. You can switch to a local password instead.
 - **HTTPS out of the box.** It reuses the Proxmox certificate (`/etc/pve/local/pveproxy-ssl.*` or `pve-ssl.*`).
 - **Safe to run next to other rules.** Everything lives in its own chains (`PVEGW_PRE`, `PVEGW_POST`, `PVEGW_FWD`), which are swapped atomically with `iptables-restore`. pve-firewall and your own rules are left alone.
-- **Guest picker.** It lists local VMs and CTs with their IPs (from the QEMU guest agent or the LXC config).
+- **Guest picker.** It lists local VMs and CTs with their IPs (from the QEMU guest agent, the host's ARP table, cloud-init or the LXC config; see [Guest IPs](#guest-ips)).
+- **Host network at a glance.** The Ports and Domains tabs show the host's interfaces and IPs (public, WAN, guest bridges) with tips on where DNS and routers should point.
 - Supports TCP, UDP or both, port ranges, a source IP/CIDR allow-list, an incoming interface, optional masquerade, and shows per-rule hit counters.
 - **Guard rails.** It refuses to forward 22, 8006, 3128, 111, 5405-5412 or its own port. Only traffic **addressed to the host** is forwarded (`-m addrtype --dst-type LOCAL`), so guests' outgoing traffic is never hijacked.
 - A watchdog re-hooks the chains if something flushes iptables, and rules are restored at boot.
 
 ## Install (on the Proxmox host, as root)
 
-```bash
-scp pve-gateway.py pve-gateway.service install.sh root@pve:/root/pve-gateway/
-```
+One command downloads, installs and starts the service:
 
 ```bash
-cd /root/pve-gateway && sh install.sh
+curl -fsSL https://raw.githubusercontent.com/farruxx/pve-gateway/master/install.sh | sh
 ```
 
 Then open `https://<proxmox-ip>:8099` and log in as `root@pam`.
 
-To use the **Domains** tab (reverse proxy by hostname), install nginx and certbot as well. They are the only optional dependencies, both from Debian:
+To use the **Domains** tab (reverse proxy by hostname), add nginx and certbot. They are the only optional dependencies, both from Debian:
 
 ```bash
-sh install.sh --with-nginx
+curl -fsSL https://raw.githubusercontent.com/farruxx/pve-gateway/master/install.sh | sh -s -- --with-nginx
 ```
+
+For **wildcard certificates**, also add your DNS provider's certbot plugin, for example Cloudflare (see [wildcard.md](wildcard.md)):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/farruxx/pve-gateway/master/install.sh | sh -s -- --with-dns cloudflare
+```
+
+Run the same command again to **update**. Your rules, domains and certificates are kept.
+
+- **No subscription?** `apt-get update` fails with `401 Unauthorized` on `enterprise.proxmox.com`. The installer warns and continues, because nginx and certbot come from the Debian repositories. To fix the error itself, go to **Node → Updates → Repositories** in the Proxmox UI, disable the *enterprise* repositories (pve and ceph), and add *No-Subscription*.
+- **Prefer to read before you run?** Clone the repo and run the script from it; it then uses the local files instead of downloading:
+
+  ```bash
+  git clone https://github.com/farruxx/pve-gateway && cd pve-gateway && sh install.sh --with-nginx
+  ```
+
+### Guest IPs
+
+The guest picker fills in a VM's IP from the **QEMU guest agent** if one is running. Without the agent it falls back to the host's **ARP table**, matching the VM's MAC address, and then to a **cloud-init** `ipconfig`. For containers, the IP comes from LXC or the container config. If a VM still shows *IP unknown*:
+- install the agent in the VM (`apt install qemu-guest-agent`),
+- turn on **Options → QEMU Guest Agent** for the VM in Proxmox, and restart the VM.
+
+You can always type the IP by hand.
 
 ## Domains (nginx reverse proxy)
 

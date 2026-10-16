@@ -420,32 +420,99 @@ def list_ifaces():
     except OSError:
         return []
     skip = ("lo", "fwbr", "fwpr", "fwln", "tap", "veth", "docker")
-    return [n for n in names if not n.startswith(skip)]
+    return [n for n in names if not n.startswith(skip) and os.path.isdir(os.path.join("/sys/class/net", n))]
 
 
-def _guest_ips(g):
-    vmid = str(g["vmid"])
-    ips = []
+IPV4_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
+NET_CACHE = {"t": 0, "data": None}
+
+
+def host_networks():
+    """Host IPv4 addresses per interface, flagging public ones and the default-route (WAN) interface."""
+    if NET_CACHE["data"] is not None and time.time() - NET_CACHE["t"] < 30:
+        return NET_CACHE["data"]
+    rc, out = sh(["ip", "-4", "-br", "addr"])
+    wan = set()
+    rc2, routes = sh(["ip", "-4", "route"])
+    for line in routes.splitlines() if rc2 == 0 else []:
+        m = re.match(r"^default\b.*\bdev (\S+)", line)
+        if m:
+            wan.add(m.group(1))
+    skip = ("lo", "fwbr", "fwpr", "fwln", "tap", "veth", "docker")
+    nets = []
+    for f in (line.split() for line in out.splitlines()) if rc == 0 else []:
+        name = f[0].split("@")[0] if f else ""
+        if len(f) < 3 or name.startswith(skip):
+            continue
+        for cidr in f[2:]:
+            try:
+                itf = ipaddress.IPv4Interface(cidr)
+            except ValueError:
+                continue
+            nets.append({"iface": name, "state": f[1], "cidr": cidr, "ip": str(itf.ip),
+                         "network": str(itf.network), "public": itf.ip.is_global, "wan": name in wan})
+    nets.sort(key=lambda n: (not n["wan"], n["iface"]))
+    NET_CACHE.update(t=time.time(), data=nets)
+    return nets
+
+
+def neighbors():
+    """{mac: [ipv4, ...]} from the host's ARP table - finds guests without a guest agent."""
+    rc, out = sh(["ip", "-4", "neigh"])
+    res = {}
+    for line in out.splitlines() if rc == 0 else []:
+        m = re.match(r"^(\S+) dev \S+ lladdr ([0-9a-f:]{17}) (\S+)", line.strip(), re.I)
+        if m and m.group(3) not in ("FAILED", "INCOMPLETE"):
+            res.setdefault(m.group(2).lower(), []).append(m.group(1))
+    return res
+
+
+def _clean(ips):
+    return [i for i in dict.fromkeys(ips) if IPV4_RE.match(i) and not i.startswith(("127.", "169.254."))]
+
+
+def _guest_ips(g, neigh):
+    """{"ips", "source", "hint"}: guest agent / lxc first, then ARP by MAC, then static config."""
+    vmid, running = str(g["vmid"]), g.get("status") == "running"
     if g["type"] == "lxc":
-        if g.get("status") == "running":
+        if running:
             rc, out = run(["lxc-info", "-n", vmid, "-iH"], check_only=True)
-            if rc == 0:
-                ips = out.split()
-        if not ips:
-            rc, out = run(["pct", "config", vmid], check_only=True)
-            if rc == 0:
-                ips = re.findall(r"\bip=(\d+\.\d+\.\d+\.\d+)", out)
-    elif g.get("status") == "running":
+            ips = _clean(out.split()) if rc == 0 else []
+            if ips:
+                return {"ips": ips, "source": "lxc", "hint": ""}
+        rc, out = run(["pct", "config", vmid], check_only=True)
+        ips = _clean(re.findall(r"\bip=(\d+\.\d+\.\d+\.\d+)", out)) if rc == 0 else []
+        return {"ips": ips, "source": "config" if ips else None,
+                "hint": "" if ips else "container uses DHCP and is not running"}
+    rc, conf = run(["qm", "config", vmid], check_only=True)
+    conf = conf if rc == 0 else ""
+    agent = bool(re.search(r"^agent:\s*(1|enabled=1)", conf, re.M))
+    macs = [m.lower() for m in re.findall(r"^net\d+:\s*\w+=([0-9A-Fa-f:]{17})", conf, re.M)]
+    if running and agent:
         rc, out = run(["timeout", "3", "qm", "guest", "cmd", vmid, "network-get-interfaces"], check_only=True)
+        ips = []
         if rc == 0:
             try:
-                for itf in json.loads(out):
-                    for a in itf.get("ip-addresses", []):
-                        if a.get("ip-address-type") == "ipv4":
-                            ips.append(a["ip-address"])
+                ips = _clean(a["ip-address"] for itf in json.loads(out) for a in itf.get("ip-addresses", [])
+                             if a.get("ip-address-type") == "ipv4")
             except (ValueError, KeyError, TypeError):
                 pass
-    return [i for i in ips if re.match(r"^\d+\.\d+\.\d+\.\d+$", i) and not i.startswith("127.")]
+        if ips:
+            return {"ips": ips, "source": "agent", "hint": ""}
+    if running:
+        ips = _clean(ip for mac in macs for ip in neigh.get(mac, []))
+        if ips:
+            return {"ips": ips, "source": "arp", "hint": ""}
+    ips = _clean(re.findall(r"^ipconfig\d+:.*\bip=(\d+\.\d+\.\d+\.\d+)", conf, re.M))
+    if ips:
+        return {"ips": ips, "source": "cloud-init", "hint": ""}
+    if not running:
+        hint = "VM is stopped"
+    elif not agent:
+        hint = "install qemu-guest-agent in the VM and enable Options > QEMU Guest Agent (or type the IP)"
+    else:
+        hint = "guest agent not responding - is qemu-guest-agent running inside the VM?"
+    return {"ips": [], "source": None, "hint": hint}
 
 
 def list_guests():
@@ -459,10 +526,11 @@ def list_guests():
         items = [g for g in json.loads(out) if g.get("node") == node and not g.get("template")]
     except ValueError:
         return []
+    neigh = neighbors()
     with ThreadPoolExecutor(8) as ex:
-        ips = list(ex.map(_guest_ips, items))
-    data = sorted(({"vmid": g["vmid"], "name": g.get("name", ""), "type": g["type"],
-                    "status": g.get("status", ""), "ips": i} for g, i in zip(items, ips)),
+        found = list(ex.map(lambda g: _guest_ips(g, neigh), items))
+    data = sorted((dict({"vmid": g["vmid"], "name": g.get("name", ""), "type": g["type"],
+                         "status": g.get("status", "")}, **f) for g, f in zip(items, found)),
                   key=lambda x: x["vmid"])
     GUEST_CACHE.update(t=time.time(), data=data)
     return data
@@ -731,6 +799,8 @@ def build_nginx(cfg):
            "# Manage domains in the pve-gateway web UI.", "",
            "map $http_upgrade $pvegw_connection_upgrade {", "    default upgrade;", "    ''      close;", "}"]
     v6 = cfg.get("nginx_ipv6", True)
+    new_h2 = nginx_version() >= (1, 25, 1)  # Debian trixie / PVE 9: "listen ... http2" is deprecated
+    ssl_listen = "ssl" if new_h2 else "ssl http2"
     acme = ["    location ^~ /.well-known/acme-challenge/ {", "        root %s;" % cfg["acme_webroot"],
             "        default_type text/plain;", "    }"]
     for d in cfg["domains"]:
@@ -749,7 +819,8 @@ def build_nginx(cfg):
         out.append("}")
         if tls:
             crt, key = cert_paths(cfg, cname)
-            out += ["server {", "    listen 443 ssl http2;"] + (["    listen [::]:443 ssl http2;"] if v6 else []) + [
+            out += ["server {", "    listen 443 %s;" % ssl_listen] + (["    listen [::]:443 %s;" % ssl_listen] if v6 else []) + \
+                (["    http2 on;"] if new_h2 else []) + [
                 "    server_name %s;" % names,
                 "    ssl_certificate %s;" % crt,
                 "    ssl_certificate_key %s;" % key,
@@ -761,6 +832,11 @@ def build_nginx(cfg):
 
 def nginx_installed():
     return sh(["nginx", "-v"])[0] == 0
+
+
+def nginx_version():
+    m = re.search(r"nginx/(\d+)\.(\d+)\.(\d+)", sh(["nginx", "-v"])[1])
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
 
 
 def nginx_conf_path(cfg):
@@ -937,11 +1013,20 @@ def test_domain(d):
         steps.append({"name": name, "status": status, "detail": detail})
 
     add("domain enabled", _st(d["enabled"]))
+    public = [x["ip"] for x in host_networks() if x["public"]]
     for n in _names(d):
         ips = resolve(n)
-        add("DNS %s" % n, _st(bool(ips)), ("resolves to " + ", ".join(ips) +
-            " - must be this host's public IP (or your router's, forwarding 80/443 here)") if ips
-            else "does not resolve - create an A record pointing to this host's public IP")
+        if not ips:
+            add("DNS %s" % n, "fail", "does not resolve - create an A record pointing to %s"
+                % (" / ".join(public) if public else "your public IP"))
+        elif not public:
+            add("DNS %s" % n, "ok", "resolves to %s - this host has no public IP, so that must be your router "
+                "forwarding ports 80/443 here" % ", ".join(ips))
+        elif set(ips) & set(public):
+            add("DNS %s" % n, "ok", "resolves to %s (this host)" % ", ".join(ips))
+        else:
+            add("DNS %s" % n, "warn", "resolves to %s, but this host's public IP is %s - fix the A record, unless "
+                "a router or proxy in front forwards 80/443 here" % (", ".join(ips), ", ".join(public)))
     rc, out = sh(["systemctl", "is-active", "nginx"])
     add("nginx running", _st(out.strip() == "active"), out.strip() if out else "")
     try:
@@ -1424,7 +1509,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state" and method == "GET":
             return self.send(200, {
                 "user": user, "version": VERSION, "rules": cfg["rules"], "counters": counters(),
-                "ifaces": list_ifaces(), "dry_run": DRY_RUN, "mock": bool(MOCK),
+                "ifaces": list_ifaces(), "networks": host_networks(), "dry_run": DRY_RUN, "mock": bool(MOCK),
                 "status": {"ip_forward": ip_forward_on(), "active": DRY_RUN or hooks_active(),
                            "last_apply": STATE["last_apply"], "last_error": STATE["last_error"]},
                 "domains": cfg["domains"], "domain_status": domain_status(cfg), "acme_email": cfg.get("acme_email", ""),
@@ -1701,6 +1786,7 @@ INDEX_HTML = r"""<!doctype html>
       <button id="reapply" class="ghost" title="Re-write iptables rules from saved config">Re-apply</button>
       <span id="msg"></span>
     </div>
+    <div id="netRules" class="card netbar" hidden></div>
     <div class="card scroll">
       <table>
         <thead><tr><th>On</th><th>Name</th><th>Proto</th><th>Host port</th><th></th><th>Destination</th><th>Source</th><th>Iface</th><th class="num">Hits</th><th></th></tr></thead>
@@ -1716,6 +1802,7 @@ INDEX_HTML = r"""<!doctype html>
       <button id="addDomBtn">+ Add domain</button>
       <span id="domMsg"></span>
     </div>
+    <div id="netDomains" class="card netbar" hidden></div>
     <div id="nginxErr" class="card banner" hidden></div>
     <div class="card scroll">
       <table>
@@ -1897,6 +1984,12 @@ font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
 #testDlg{width:min(640px,calc(100vw - 32px))}#testDlg .checks{border:1px solid var(--line);border-radius:8px;margin-bottom:10px}
 .spin{color:var(--muted);padding:14px}
 .banner{padding:10px 14px;margin-bottom:12px;color:var(--bad);border-color:var(--bad);white-space:pre-wrap;font-size:13px}
+.netbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;padding:10px 14px;margin-bottom:12px}
+.netbar .hint{flex-basis:100%;margin:2px 0 0}
+button.net{display:inline-flex;gap:6px;align-items:center;background:var(--bg);color:var(--fg);border:1px solid var(--line);
+padding:3px 10px;font-weight:400;font-size:12px;border-radius:99px}
+button.net:hover{border-color:var(--muted)}button.net.wan{border-color:var(--accent)}
+.net .nif{font-weight:600}.ntag{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--accent)}.ntag.pub{color:var(--ok)}
 .sub-head{display:flex;align-items:center;gap:10px;margin:22px 0 10px}.sub-head h2{margin:0;font-size:15px}
 .sub-head button{padding:4px 12px;font-size:13px}
 .hint{margin:-4px 0 0;font-size:12px;color:var(--muted)}.hint.bad{color:var(--bad)}
@@ -1967,8 +2060,36 @@ async function load() {
   }, 5000);
 }
 
+function netLabel(iface) {
+  const ips = (S.networks || []).filter(n => n.iface === iface);
+  return ips.length ? iface + ' — ' + ips.map(n => n.cidr + (n.public ? ' public' : '') + (n.wan ? ' · WAN' : '')).join(', ') : iface;
+}
+
+function renderNet() {
+  const nets = S.networks || [], pub = nets.filter(n => n.public), wan = nets.find(n => n.wan);
+  const lan = nets.filter(n => !n.wan && !n.public);
+  for (const [id, mode] of [['#netRules', 'ports'], ['#netDomains', 'domains']]) {
+    const box = $(id); box.hidden = !nets.length;
+    if (!nets.length) continue;
+    let tip = '';
+    if (pub.length) tip = (mode === 'domains' ? 'Point DNS A records at ' : 'Forwarded ports are reachable at ') + pub.map(n => n.ip).join(', ') + '.';
+    else if (wan) tip = 'This host is behind NAT (' + wan.ip + ' is private): forward the ports on your router to ' + wan.ip +
+      (mode === 'domains' ? ' and point DNS at the router\'s public IP.' : '.');
+    if (mode === 'ports' && lan.length) tip += ' Guests on ' + lan.map(n => n.iface + ' should use ' + n.ip).join(', ') +
+      ' as their gateway, or enable Masquerade on the rule.';
+    box.replaceChildren(el('span', {class: 'muted small', textContent: 'Host network'}),
+      ...nets.map(n => el('button', {type: 'button', class: 'net' + (n.wan ? ' wan' : ''), title: 'Copy ' + n.ip,
+        onclick: () => navigator.clipboard.writeText(n.ip).then(() => (mode === 'domains' ? domFlash : flash)('Copied ' + n.ip), () => {})},
+        el('span', {class: 'nif', textContent: n.iface}), el('span', {class: 'mono', textContent: n.cidr}),
+        n.public ? el('span', {class: 'ntag pub', textContent: 'public'}) : null,
+        n.wan ? el('span', {class: 'ntag', textContent: 'wan'}) : null)),
+      tip ? el('p', {class: 'hint', textContent: tip}) : null);
+  }
+}
+
 function render() {
   renderDomains();
+  renderNet();
   $('#who').textContent = S.user;
   const st = $('#status'); st.replaceChildren();
   const chip = (cls, t, title) => st.append(el('span', {class: 'chip ' + cls, textContent: t, title: title || ''}));
@@ -2020,8 +2141,10 @@ async function fillGuests(sel = $('#ruleForm').guest) {
   sel.replaceChildren(el('option', {value: '', textContent: guests.length ? '— pick a guest to fill its IP —' : '— no guests found —'}));
   for (const g of guests) {
     const label = g.vmid + ' ' + (g.name || '') + ' (' + (g.type === 'lxc' ? 'CT' : 'VM') + (g.status !== 'running' ? ', ' + g.status : '') + ')';
-    if (!g.ips.length) sel.append(el('option', {value: '', disabled: true, textContent: label + ' — IP unknown'}));
-    for (const ip of g.ips) sel.append(el('option', {value: ip, textContent: label + ' — ' + ip}));
+    const src = {agent: '', lxc: '', arp: ' · from ARP', 'cloud-init': ' · cloud-init', config: ' · config'}[g.source] || '';
+    if (!g.ips.length) sel.append(el('option', {value: '', disabled: true, title: g.hint || '',
+      textContent: label + ' — IP unknown' + (g.hint && g.status === 'running' ? ' (' + (/agent/.test(g.hint) ? 'no guest agent' : g.hint) + ')' : '')}));
+    for (const ip of g.ips) sel.append(el('option', {value: ip, textContent: label + ' — ' + ip + src}));
   }
 }
 
@@ -2031,7 +2154,7 @@ function openDlg(r) {
   $('#dlgTitle').textContent = r ? 'Edit rule' : 'Add rule';
   $('#formErr').textContent = '';
   const iface = f.iface; iface.replaceChildren(el('option', {value: '', textContent: 'any'}));
-  for (const i of S.ifaces) iface.append(el('option', {value: i, textContent: i}));
+  for (const i of S.ifaces) iface.append(el('option', {value: i, textContent: netLabel(i)}));
   r = r || {proto: 'tcp', enabled: true};
   for (const k of ['name', 'proto', 'ext_port', 'ip', 'int_port', 'source', 'iface']) f[k].value = r[k] || '';
   if (r.iface && !S.ifaces.includes(r.iface)) iface.append(el('option', {value: r.iface, textContent: r.iface, selected: true}));

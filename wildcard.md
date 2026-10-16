@@ -33,13 +33,13 @@ If the Proxmox host is behind a router, forward **TCP 443** to it (and **TCP 80*
 
 ## 2. Install the certbot DNS plugin
 
-On the Proxmox host, install nginx and certbot if you haven't already:
+On the Proxmox host, one command installs nginx, certbot and the plugin. Replace `cloudflare` with your provider's name from the table below:
 
 ```bash
-sh install.sh --with-nginx
+curl -fsSL https://raw.githubusercontent.com/farruxx/pve-gateway/master/install.sh | sh -s -- --with-dns cloudflare
 ```
 
-Then install the plugin for your DNS provider:
+Or install the plugin by hand:
 
 | Provider | Install |
 |---|---|
