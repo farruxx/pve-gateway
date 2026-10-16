@@ -100,10 +100,10 @@ IN HTTPS(ACCEPT) -log nolog
 
 # rules seeded into a fresh ./.dev config, chosen to show every test outcome
 SAMPLE_RULES = [
-    {"name": "web", "proto": "tcp", "ext_port": "8080", "ip": "10.10.10.10", "int_port": "80"},
+    {"name": "web", "proto": "tcp", "ext_port": "8080", "ip": "10.10.10.10", "int_port": "80", "group": "web"},
     {"name": "db ssh", "proto": "tcp", "ext_port": "2222", "ip": "10.10.10.11", "int_port": "22", "source": "203.0.113.0/24"},
-    {"name": "game", "proto": "both", "ext_port": "27015-27020", "ip": "10.10.10.12"},                # guest stopped
-    {"name": "nextcloud tls", "proto": "tcp", "ext_port": "8443", "ip": "10.10.10.13", "int_port": "443"},  # refused
+    {"name": "game", "proto": "both", "ext_port": "27015-27020", "ip": "10.10.10.12", "group": "games"},                # guest stopped
+    {"name": "nextcloud tls", "proto": "tcp", "ext_port": "8443", "ip": "10.10.10.13", "int_port": "443", "group": "web"},  # refused
     {"name": "rdp", "proto": "tcp", "ext_port": "3389", "ip": "10.10.10.14", "iface": "vmbr0"},    # no ping, tcp ok
     {"name": "office", "proto": "tcp", "ext_port": "9443", "ip": "192.168.50.20", "int_port": "443", "masq": True},
     {"name": "old test", "proto": "udp", "ext_port": "5000", "ip": "10.10.10.10", "enabled": False},
@@ -112,11 +112,11 @@ SAMPLE_RULES = [
 # domains seeded into a fresh ./.dev config
 SAMPLE_DOMAINS = [
     {"domain": "cloud.example.com", "ip": "10.10.10.13", "port": 80, "tls": "letsencrypt", "max_body": "10g",
-     "headers": True},                                          # cert ok
+     "headers": True, "group": "apps"},                                          # cert ok
     {"domain": "app.example.com", "aliases": "www.app.example.com", "ip": "10.10.10.10", "port": 80, "tls": "none",
      "alias_redirect": True},                                   # www -> 301 to app; has a stray AAAA record
     {"domain": "broken.invalid", "ip": "10.10.10.11", "port": 8080, "tls": "letsencrypt"},  # no DNS, nothing on 8080
-    {"domain": "status.example.com", "ip": "10.10.10.10", "port": 80, "tls": "wildcard"},  # uses *.example.com
+    {"domain": "status.example.com", "ip": "10.10.10.10", "port": 80, "tls": "wildcard", "group": "apps"},  # uses *.example.com
     {"domain": "shop.example.com", "ip": "10.10.10.10", "port": 443, "upstream_https": True, "tls": "wildcard",
      "cloudflare": True, "headers": True, "hsts": True},       # behind the Cloudflare proxy
 ]

@@ -33,6 +33,7 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 - **Guest picker.** It lists local VMs and CTs with their IPs (from the QEMU guest agent, the host's ARP table, cloud-init or the LXC config; see [Guest IPs](#guest-ips)).
 - **Host network at a glance.** The Ports and Domains tabs show the host's interfaces and IPs (public, WAN, guest bridges) with tips on where DNS and routers should point.
 - Supports TCP, UDP or both, port ranges, a source IP/CIDR allow-list, an incoming interface, optional masquerade, and shows per-rule hit counters.
+- **Groups.** Port rules and domains can be put into groups (e.g. *web*, *games*). Each group is a collapsible section with its own **+ Add**, **Rename** and **Ungroup**. Anything without a group, including everything saved by older versions, stays in **default**. While all items are in default, the tables look as before. Groups only change how items are listed; they don't affect iptables or nginx.
 - **Guard rails.** It refuses to forward 22, 8006, 3128, 111, 5405-5412 or its own port. Only traffic **addressed to the host** is forwarded (`-m addrtype --dst-type LOCAL`), so guests' outgoing traffic is never hijacked.
 - A watchdog re-hooks the chains if something flushes iptables, and rules are restored at boot.
 
@@ -337,6 +338,7 @@ Rules are stored here too. Restart the service after editing it by hand.
 - `allowed_users`: Proxmox users allowed to log in. Accounts with TFA enabled aren't supported; use `passwd` instead.
 - `forward_accept`: adds narrow `ACCEPT` rules in `FORWARD` for the forwarded flows. They're inserted before `PVEFW-FORWARD`, so if the Proxmox firewall is on for a guest, a forwarded port bypasses that guest's firewall. Use the rule's *Allowed source* field to restrict access.
 - `listen`: set it to a LAN IP (e.g. `192.168.1.10`) to keep the UI off the public interface.
+- `group` (on each rule and domain): the group it's listed under; missing or invalid means `default`.
 
 ## Trusted HTTPS (Let's Encrypt)
 
