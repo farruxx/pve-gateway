@@ -4,6 +4,9 @@
 # Uses a throwaway mock state and port 8101, so a running ./dev.sh is not disturbed.
 set -e
 cd "$(dirname "$0")/.."
+if curl -s -o /dev/null http://127.0.0.1:8101/; then
+    echo "port 8101 is busy (an old mock server?) - stop it first, e.g.: pkill -f 'port 8101'"; exit 1
+fi
 TMP=$(mktemp -d)
 trap 'kill $PID 2>/dev/null; rm -rf "$TMP"' EXIT
 python3 pve-gateway.py --mock --config-dir "$TMP/state" apply >/dev/null 2>&1

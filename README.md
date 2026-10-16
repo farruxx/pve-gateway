@@ -52,7 +52,7 @@ For **wildcard certificates**, also add your DNS provider's certbot plugin, for 
 curl -fsSL https://raw.githubusercontent.com/farruxx/pve-gateway/master/install.sh | sh -s -- --with-dns cloudflare
 ```
 
-Run the same command again to **update**. Your rules, domains and certificates are kept.
+**Updating:** in **Settings → Updates**, click **Update to vX.Y.Z**. pve-gateway checks GitHub once a day and shows a badge in the header when a new version is out, together with what changed (from [CHANGELOG.md](CHANGELOG.md)). From a shell, run `pve-gateway update`, or re-run the install command. Your rules, domains and certificates are kept either way.
 
 - **No Proxmox subscription?** That's the normal case and it's handled for you. Without a subscription, the Proxmox *enterprise* repositories answer `401 Unauthorized`. When the installer sees that, it switches apt to the free **no-subscription** repositories:
   - the enterprise entries (pve and ceph) are disabled, not deleted;
@@ -72,7 +72,9 @@ Run the same command again to **update**. Your rules, domains and certificates a
 
 ### Guest IPs
 
-The guest picker fills in a VM's IP from the **QEMU guest agent** if one is running. Without the agent it falls back to the host's **ARP table**, matching the VM's MAC address, and then to a **cloud-init** `ipconfig`. For containers, the IP comes from LXC or the container config. If a VM still shows *IP unknown*:
+The guest picker fills in a VM's IP from the **QEMU guest agent** if one is running. Without the agent it falls back to the host's **ARP table**, matching the VM's MAC address, and then to a **cloud-init** `ipconfig`.
+
+A VM whose gateway is another router (for example a firewall VM) never talks to the host itself, so it isn't in the ARP table. For those, the picker briefly probes the addresses on the host's private bridges, at most every 5 minutes and never the uplink, so they answer ARP and show up. For containers, the IP comes from LXC or the container config. If a VM still shows *IP unknown*:
 - install the agent in the VM (`apt install qemu-guest-agent`),
 - turn on **Options → QEMU Guest Agent** for the VM in Proxmox, and restart the VM.
 
@@ -136,6 +138,7 @@ pve-gateway test [NAME...]  # reachability test (rule id/name/host port or domai
 pve-gateway ui-allow IP...  # web UI only from these IPs/networks ("any" = everyone, no args = show)
 pve-gateway ui-host NAME..  # extra hostnames the web UI may be opened by ("none" = clear)
 pve-gateway --version       # installed version
+pve-gateway update [check]  # install the latest version from GitHub ("check" = only check)
 pve-gateway domains         # list domains, wildcard certificates and expiry
 pve-gateway cert NAME       # request / renew now: a domain, or '*.example.com' for a wildcard
 pve-gateway debug           # full diagnostic report, paste it when asking for help

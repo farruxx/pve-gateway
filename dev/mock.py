@@ -26,12 +26,12 @@ GUESTS = [
     {"vmid": 104, "name": "win11", "type": "qemu", "status": "running", "ip": "10.10.10.14", "ports": [3389], "agent": False,
      "no_ping": True},
     {"vmid": 105, "name": "office-gw", "type": "qemu", "status": "running", "ip": "192.168.50.20", "ports": [443], "agent": True},
-    # no guest agent and never talked to the host: IP can't be discovered
+    # no guest agent and never talks to the host (gateway is another router): found by the ARP sweep
     {"vmid": 106, "name": "quiet-vm", "type": "qemu", "status": "running", "ip": "10.10.10.16", "ports": [22], "agent": False,
      "no_arp": True},
-    # no guest agent, but cloud-init sets a static IP
+    # no guest agent, doesn't answer ARP, but cloud-init sets a static IP
     {"vmid": 107, "name": "ci-node", "type": "qemu", "status": "running", "ip": "10.10.10.17", "ports": [22, 9000],
-     "agent": False, "no_arp": True, "cloudinit": True},
+     "agent": False, "no_arp": True, "silent": True, "cloudinit": True},
 ]
 
 
@@ -162,6 +162,29 @@ class Mock:
             st = self._load()
             st["ip_forward"] = bool(value)
             self._save(st)
+
+    def arp_sweep(self):
+        """Guests that only answer ARP when asked appear in `ip neigh` after a sweep."""
+        with self.lock:
+            st = self._load()
+            st["swept"] = True
+            self._save(st)
+        return True
+
+    def remote_file(self, path):
+        """Pretend GitHub: the local checkout, one minor version ahead, with a changelog entry for it."""
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, path), "rb") as f:
+            data = f.read()
+        if path == "pve-gateway.py":
+            m = re.search(rb'^VERSION = "(\d+)\.(\d+)\.(\d+)"', data, re.M)
+            if m:
+                data = data.replace(m.group(0), b'VERSION = "%d.%d.0"' % (int(m.group(1)), int(m.group(2)) + 1), 1)
+        elif path == "CHANGELOG.md":
+            m = re.search(rb"^## (\d+)\.(\d+)\.", data, re.M)
+            nxt = b"%d.%d.0" % (int(m.group(1)), int(m.group(2)) + 1) if m else b"9.9.0"
+            data = data.replace(b"\n## ", b"\n## " + nxt + b" - upcoming\n- Release notes of the new version are listed here before you update.\n\n## ", 1)
+        return data
 
     def path_for(self, real_path):
         """Map a real host path (e.g. /etc/nginx/conf.d/x.conf) into the mock filesystem under .dev."""
@@ -412,7 +435,8 @@ class Mock:
         if "neigh" in a:
             out = ["192.168.1.1 dev vmbr0 lladdr 00:1a:2b:3c:4d:5e REACHABLE"]
             for g in GUESTS:
-                if g["status"] == "running" and not g.get("no_arp") and g["ip"].startswith("10.10.10."):
+                visible = not g.get("no_arp") or (st.get("swept") and not g.get("silent"))
+                if g["status"] == "running" and visible and g["ip"].startswith("10.10.10."):
                     out.append("%s dev vmbr1 lladdr %s %s" % (g["ip"], _mac(g["vmid"]), random.choice(["REACHABLE", "STALE"])))
             out.append("10.10.10.99 dev vmbr1 FAILED")
             return 0, "\n".join(out), False

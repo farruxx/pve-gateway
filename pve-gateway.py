@@ -44,7 +44,9 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.1.0"
+VERSION = "1.1.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+REPO_URL = "https://github.com/farruxx/pve-gateway"
+REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
 CH_PRE, CH_POST, CH_FWD = "PVEGW_PRE", "PVEGW_POST", "PVEGW_FWD"
 JUMPS = (("nat", "PREROUTING", CH_PRE), ("nat", "POSTROUTING", CH_POST), ("filter", "FORWARD", CH_FWD))
@@ -77,6 +79,9 @@ DEFAULTS = {
     "acme_webroot": "/var/lib/pve-gateway/acme",
     "letsencrypt_dir": "/etc/letsencrypt/live",
     "nginx_ipv6": True,  # also listen on [::]:80/443
+    # Updates: branch/tag on GitHub to check and install from; daily background check.
+    "update_ref": "master",
+    "update_check": True,
 }
 
 LOCK = threading.RLock()
@@ -565,6 +570,40 @@ def neighbors():
     return res
 
 
+ARP_SWEEP = {"t": 0}
+
+
+def arp_sweep():
+    """Make the kernel ARP every address on the host's private bridges (one empty UDP datagram each), so guests
+    that never talk to the host itself - e.g. behind a router VM - show up in `ip neigh`. At most every 5 min."""
+    if MOCK:
+        return MOCK.arp_sweep()
+    if time.time() - ARP_SWEEP["t"] < 300:
+        return False
+    ARP_SWEEP["t"] = time.time()
+    sent = 0
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setblocking(False)
+    try:
+        for n in host_networks():
+            net = ipaddress.IPv4Network(n["network"])
+            if n["public"] or n["wan"] or net.num_addresses > 1024:  # guest bridges only, never the uplink
+                continue
+            for ip in net.hosts():
+                if str(ip) != n["ip"]:
+                    try:
+                        s.sendto(b"", (str(ip), 9))  # discard port; only the ARP lookup matters
+                        sent += 1
+                    except OSError:
+                        pass
+    finally:
+        s.close()
+    if sent:
+        log("arp sweep: probed %d addresses on guest bridges" % sent, "debug")
+        time.sleep(1.5)  # let ARP replies arrive
+    return sent > 0
+
+
 def _clean(ips):
     return [i for i in dict.fromkeys(ips) if IPV4_RE.match(i) and not i.startswith(("127.", "169.254."))]
 
@@ -627,6 +666,12 @@ def list_guests():
     neigh = neighbors()
     with ThreadPoolExecutor(8) as ex:
         found = list(ex.map(lambda g: _guest_ips(g, neigh), items))
+        missing = [i for i, (g, f) in enumerate(zip(items, found))
+                   if not f["ips"] and g["type"] == "qemu" and g.get("status") == "running"]
+        if missing and arp_sweep():
+            neigh = neighbors()
+            for i, f in zip(missing, ex.map(lambda i: _guest_ips(items[i], neigh), missing)):
+                found[i] = f
     data = sorted((dict({"vmid": g["vmid"], "name": g.get("name", ""), "type": g["type"],
                          "status": g.get("status", "")}, **f) for g, f in zip(items, found)),
                   key=lambda x: x["vmid"])
@@ -1242,6 +1287,13 @@ def checks():
     if rc == 0 and "enabled" in out and cfg.get("forward_accept", True) and any(r["enabled"] for r in cfg["rules"]):
         add("forwarded ports vs pve-firewall", "info", "forwarded traffic is accepted before pve-firewall, so guest "
             "firewall rules don't filter it - limit access with each rule's Allowed source")
+    info = update_info()
+    if info["available"]:
+        add("pve-gateway version", "warn", "%s installed, %s available - update in Settings or run: pve-gateway update"
+            % (VERSION, info["latest"]))
+    else:
+        add("pve-gateway version", "info" if info["error"] or not info["latest"] else "ok",
+            VERSION + (" (latest)" if info["latest"] else "") + (" - " + info["error"] if info["error"] else ""))
     if cfg.get("ui_allow"):
         add("web UI access", "ok", "only from " + ", ".join(cfg["ui_allow"]) + " (and localhost)")
     else:
@@ -1449,6 +1501,108 @@ def test_rule(r):
         add("return path", "info", "without Masquerade the guest's default gateway must be this host%s"
             % (" (%s)" % src.group(1) if src else ""))
     return steps
+
+
+# --------------------------------------------------------------------------- updates
+
+UPDATE = {"latest": None, "changes": [], "checked": None, "error": None, "running": False, "started": None}
+UPDATE_DIR = "/var/lib/pve-gateway/update"
+
+
+def parse_version(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3]) or (0,)
+
+
+def fetch_remote(path, ref):
+    """A file from the GitHub repo at ref (TLS verified)."""
+    if MOCK:
+        return MOCK.remote_file(path)
+    req = urllib.request.Request("%s/%s/%s" % (REPO_RAW, urllib.parse.quote(ref, safe=""), path),
+                                 headers={"User-Agent": "pve-gateway/" + VERSION})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.read(4000000)
+
+
+def parse_changelog(text, newer_than):
+    """[{"version", "notes"}] for CHANGELOG.md sections newer than the given version."""
+    out = []
+    for block in re.split(r"^## ", text, flags=re.M)[1:]:
+        head, _, body = block.partition("\n")
+        ver = head.split()[0] if head.split() else ""
+        if parse_version(ver) > parse_version(newer_than):
+            out.append({"version": ver, "title": head.strip(), "notes": body.strip()})
+    return out
+
+
+def check_update():
+    ref = STATE["cfg"].get("update_ref", "master")
+    try:
+        src = fetch_remote("pve-gateway.py", ref).decode("utf-8", "replace")
+        m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
+        if not m:
+            raise ValueError("no VERSION found in %s/pve-gateway.py" % ref)
+        try:
+            changes = parse_changelog(fetch_remote("CHANGELOG.md", ref).decode("utf-8", "replace"), VERSION)
+        except Exception:
+            changes = []
+        UPDATE.update(latest=m.group(1), changes=changes, checked=time.time(), error=None)
+        log("update check: installed %s, latest %s" % (VERSION, m.group(1)), "debug")
+    except Exception as e:
+        UPDATE.update(checked=time.time(), error="cannot reach GitHub: %s" % e)
+        log("update check failed: %s" % e, "warn")
+    return update_info()
+
+
+def update_info():
+    latest, ref = UPDATE["latest"], STATE["cfg"].get("update_ref", "master")
+    return {"current": VERSION, "latest": latest, "ref": ref, "checked": UPDATE["checked"], "error": UPDATE["error"],
+            "available": bool(latest) and parse_version(latest) > parse_version(VERSION),
+            "changes": UPDATE["changes"], "running": UPDATE["running"], "url": "%s/commits/%s" % (REPO_URL, ref)}
+
+
+def run_update():
+    """Download the latest release files, check them, and run install.sh outside our own service
+    (systemd-run), because the installer restarts pve-gateway and would otherwise kill itself."""
+    if UPDATE["running"] and time.time() - (UPDATE["started"] or 0) < 600:
+        raise ApiError("an update is already running", 409)
+    ref = STATE["cfg"].get("update_ref", "master")
+    try:
+        files = {n: fetch_remote(n, ref) for n in ("pve-gateway.py", "pve-gateway.service", "install.sh")}
+    except Exception as e:
+        raise ApiError("download failed: %s" % e, 502)
+    src = files["pve-gateway.py"].decode("utf-8", "replace")
+    m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
+    try:
+        compile(src, "pve-gateway.py", "exec")
+    except SyntaxError as e:
+        raise ApiError("downloaded pve-gateway.py does not compile (%s) - not installing" % e, 502)
+    if not m or not files["install.sh"].startswith(b"#!/bin/sh"):
+        raise ApiError("downloaded files look wrong - not installing", 502)
+    new = m.group(1)
+    if MOCK:
+        log("[mock] update to %s: would run install.sh via systemd-run" % new, "warn")
+        return {"ok": True, "version": new, "mock": True}
+    os.makedirs(UPDATE_DIR, mode=0o700, exist_ok=True)
+    for name, data in files.items():
+        with open(os.path.join(UPDATE_DIR, name), "wb") as f:
+            f.write(data)
+    unit = "pve-gateway-update"
+    run(["systemctl", "reset-failed", unit + ".service"], check_only=True)
+    rc, out = run(["systemd-run", "--unit", unit, "--collect", "--quiet", "--description", "pve-gateway update to " + new,
+                   "/bin/sh", os.path.join(UPDATE_DIR, "install.sh")])
+    if rc != 0:
+        raise ApiError("could not start the update: %s" % out, 500)
+    UPDATE.update(running=True, started=time.time())
+    log("update to %s started (journalctl -u %s)" % (new, unit))
+    return {"ok": True, "version": new}
+
+
+def update_checker():
+    time.sleep(5 if MOCK else 120)
+    while True:
+        if STATE["cfg"].get("update_check", True):
+            check_update()
+        time.sleep(86400)
 
 
 # --------------------------------------------------------------------------- auth
@@ -1673,6 +1827,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {
                 "user": user, "version": VERSION, "rules": cfg["rules"], "counters": counters(),
                 "ui_open": not cfg.get("ui_allow"),
+                "update": {"available": update_info()["available"], "latest": UPDATE["latest"]},
                 "ifaces": list_ifaces(), "networks": host_networks(), "dry_run": DRY_RUN, "mock": bool(MOCK),
                 "status": {"ip_forward": ip_forward_on(), "active": DRY_RUN or hooks_active(),
                            "last_apply": STATE["last_apply"], "last_error": STATE["last_error"]},
@@ -1680,6 +1835,13 @@ class Handler(BaseHTTPRequestHandler):
                 "wildcards": cfg["wildcards"], "wildcard_status": wildcard_status(cfg), "dns_providers": DNS_PROVIDERS,
                 "nginx": {"last_apply": NGINX["last_apply"], "last_error": NGINX["last_error"]},
             })
+        if path == "/api/update" and method == "GET":
+            return self.send(200, update_info())
+        if path == "/api/update/check" and method == "POST":
+            return self.send(200, check_update())
+        if path == "/api/update" and method == "POST":
+            log("%s started an update" % user)
+            return self.send(200, run_update())
         if path == "/api/settings" and method == "GET":
             return self.send(200, {"ui_allow": cfg.get("ui_allow", []), "allowed_hosts": cfg.get("allowed_hosts", []),
                                    "client_ip": self.client_ip(), "own_hosts": sorted(own_hostnames())})
@@ -1940,6 +2102,7 @@ def serve(cfg):
     apply_rules()
     apply_nginx()
     threading.Thread(target=watchdog, daemon=True).start()
+    threading.Thread(target=update_checker, daemon=True).start()
     try:
         httpd = Server((cfg["listen"], int(cfg["port"])), Handler)
     except OSError as e:
@@ -2035,6 +2198,15 @@ INDEX_HTML = r"""<!doctype html>
       DNS must point at this host's public IP, and if the host is behind a router, the router must forward ports 80 and 443 to it.</p>
   </main>
   <main id="view-settings" hidden>
+    <div class="card form-card">
+      <h2>Updates</h2>
+      <p id="updStatus" class="muted"></p>
+      <div id="updChanges" class="changes"></div>
+      <p id="updErr" class="err"></p>
+      <div class="actions"><a id="updLink" class="muted small" target="_blank" rel="noopener">changes on GitHub</a>
+        <span class="spacer"></span><button type="button" class="ghost" id="updCheck">Check now</button>
+        <button type="button" id="updRun" hidden>Update</button></div>
+    </div>
     <div class="card form-card">
       <h2>Web UI access</h2>
       <p class="muted small">Only these source IPs / networks can open this page (port <span id="uiPort"></span>).
@@ -2183,7 +2355,9 @@ label{display:flex;flex-direction:column;gap:4px;font-size:12px;font-weight:600;
 textarea{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);background:var(--input);border:1px solid var(--line);border-radius:7px;padding:7px 9px;resize:vertical}
 textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .form-card{padding:18px 20px;max-width:680px;display:flex;flex-direction:column;gap:12px}.form-card h2{margin:0}
-.form-card .actions{align-items:center}
+.form-card .actions{align-items:center}.form-card + .form-card{margin-top:14px}
+.changes:empty{display:none}.changes{border-left:3px solid var(--ok);padding-left:12px}
+.changes b{font-size:13px}.changes pre{white-space:pre-wrap;margin:4px 0 10px;font:13px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--muted)}
 a.chip{text-decoration:none}
 input,select{font:inherit;color:var(--fg);background:var(--input);border:1px solid var(--line);border-radius:7px;padding:7px 9px;font-weight:400}
 input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
@@ -2304,8 +2478,9 @@ function renderNet() {
     if (pub.length) tip = (mode === 'domains' ? 'Point DNS A records at ' : 'Forwarded ports are reachable at ') + pub.map(n => n.ip).join(', ') + '.';
     else if (wan) tip = 'This host is behind NAT (' + wan.ip + ' is private): forward the ports on your router to ' + wan.ip +
       (mode === 'domains' ? ' and point DNS at the router\'s public IP.' : '.');
-    if (mode === 'ports' && lan.length) tip += ' Guests on ' + lan.map(n => n.iface + ' should use ' + n.ip).join(', ') +
-      ' as their gateway, or enable Masquerade on the rule.';
+    if (mode === 'ports' && lan.length) tip += ' Guests on ' + lan.map(n => n.iface).join(', ') +
+      ' answer forwarded traffic directly only if their gateway is this host (' + lan.map(n => n.ip).join(', ') +
+      '); behind another router (e.g. a firewall VM), enable Masquerade on the rule.';
     box.replaceChildren(el('span', {class: 'muted small', textContent: 'Host network'}),
       ...nets.map(n => el('button', {type: 'button', class: 'net' + (n.wan ? ' wan' : ''), title: 'Copy ' + n.ip,
         onclick: () => navigator.clipboard.writeText(n.ip).then(() => (mode === 'domains' ? domFlash : flash)('Copied ' + n.ip), () => {})},
@@ -2324,6 +2499,8 @@ function render() {
   const chip = (cls, t, title) => st.append(el('span', {class: 'chip ' + cls, textContent: t, title: title || ''}));
   if (S.dry_run) chip('warn', 'DRY RUN', 'iptables commands are only printed');
   if (S.mock) chip('warn', 'MOCK', 'simulated Proxmox host - nothing real is touched');
+  if (S.update && S.update.available) st.append(el('a', {class: 'chip ok', href: '#settings', textContent: 'v' + S.update.latest + ' available',
+    title: 'a new pve-gateway version is available - update in Settings'}));
   if (S.ui_open) st.append(el('a', {class: 'chip warn', href: '#settings', textContent: 'UI open to all IPs',
     title: 'anyone can reach this login page - restrict it in Settings'}));
   chip(S.status.active ? 'ok' : 'bad', S.status.active ? 'rules active' : 'rules not loaded');
@@ -2716,8 +2893,52 @@ $('#dbgVerbose').onchange = async e => {
   catch (err) { e.target.checked = !e.target.checked; $('#dbgMsg').textContent = err.message; }
 };
 
+// ---- updates
+const ago = t => { const m = Math.round((Date.now() / 1000 - t) / 60); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.round(m / 60) + ' h ago'; };
+function renderUpdate(u) {
+  $('#updStatus').textContent = 'Installed v' + u.current + (u.latest ? ' · latest v' + u.latest + ' (' + u.ref + ')' : '') +
+    (u.checked ? ' · checked ' + ago(u.checked) : ' · not checked yet') + (u.latest && !u.available ? ' · up to date' : '');
+  $('#updErr').textContent = u.error || '';
+  $('#updRun').hidden = !u.available; $('#updRun').textContent = 'Update to v' + u.latest; $('#updRun').disabled = false;
+  $('#updLink').href = u.url;
+  $('#updChanges').replaceChildren(...(u.changes || []).map(c =>
+    el('div', {}, el('b', {textContent: 'v' + c.title}), el('pre', {textContent: c.notes}))));
+}
+async function loadUpdate(fresh) {
+  $('#updCheck').disabled = true;
+  try { renderUpdate(await api(fresh ? 'POST' : 'GET', fresh ? '/api/update/check' : '/api/update', fresh ? {} : undefined)); }
+  catch (e) { $('#updErr').textContent = e.message; }
+  $('#updCheck').disabled = false;
+}
+async function waitForRestart(ver) {
+  clearInterval(timer); timer = null;
+  const until = Date.now() + 180000;
+  while (Date.now() < until) {
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const r = await fetch('/api/state', {credentials: 'same-origin'});
+      if (r.status === 401) return location.reload();  // restarted (sessions live in memory): sign in again
+      if (r.ok && (await r.json()).version === ver) return location.reload();
+    } catch (e) { /* restarting */ }
+  }
+  $('#updErr').textContent = 'The update did not finish within 3 minutes - on the host run: journalctl -u pve-gateway-update';
+}
+$('#updCheck').onclick = () => loadUpdate(true);
+$('#updRun').onclick = async () => {
+  const b = $('#updRun');
+  if (!confirm(b.textContent + ' now? pve-gateway restarts for a few seconds; port rules and domains keep working.')) return;
+  b.disabled = true; $('#updErr').textContent = ''; $('#updStatus').textContent = 'Downloading…';
+  try {
+    const r = await api('POST', '/api/update', {});
+    if (r.mock) { $('#updStatus').textContent = 'Mock mode: v' + r.version + ' was downloaded and checked; a real host would install it now.'; b.disabled = false; return; }
+    $('#updStatus').textContent = 'Installing v' + r.version + '… the page reloads when pve-gateway is back (you will need to sign in again).';
+    waitForRestart(r.version);
+  } catch (e) { $('#updErr').textContent = e.message; b.disabled = false; }
+};
+
 // ---- settings
 async function loadSettings() {
+  loadUpdate(false);
   try {
     const d = await api('GET', '/api/settings');
     $('#uiAllow').value = d.ui_allow.join('\n'); $('#uiHosts').value = d.allowed_hosts.join('\n');
@@ -2787,6 +3008,7 @@ def main():
   apply            re-apply saved rules
   flush            remove all forwarding rules and chains (config is kept)
   passwd           set a local login instead of Proxmox accounts
+  update [check]   check GitHub for a new version and install it ("check" = only check)
   ui-allow [IP...]  limit the web UI to these IPs/networks ("any" = everyone); no args = show
   ui-host [NAME..] hostnames the UI may be opened by besides IPs ("none" = clear); no args = show
   domains          list domains, wildcard certificates and expiry
@@ -2798,7 +3020,7 @@ local development (macOS etc.):
             "reset, unhook, ip-forward-off, forward-drop, pvefw-first, foreign-dnat, traffic"))
     ap.add_argument("cmd", nargs="?", default="serve",
                     choices=["serve", "status", "test", "debug", "show", "apply", "flush", "passwd", "mock",
-                             "domains", "cert", "ui-allow", "ui-host"])
+                             "domains", "cert", "ui-allow", "ui-host", "update"])
     ap.add_argument("rules", nargs="*", help=argparse.SUPPRESS)
     ap.add_argument("-v", "--verbose", action="store_true", help="log every iptables command and HTTP request")
     ap.add_argument("--version", action="version", version="pve-gateway " + VERSION)
@@ -2844,6 +3066,22 @@ local development (macOS etc.):
         sys.stdout.write(build_ruleset(cfg))
     elif a.cmd == "apply":
         sys.exit(1 if apply_rules() or apply_nginx() else 0)
+    elif a.cmd == "update":
+        info = check_update()
+        if info["error"]:
+            sys.exit(info["error"])
+        print("installed %s, latest %s (%s)" % (info["current"], info["latest"], info["ref"]))
+        for c in info["changes"]:
+            print("\n## " + c["title"] + "\n" + c["notes"])
+        if not info["available"]:
+            print("up to date")
+        elif a.rules[:1] != ["check"]:
+            try:
+                r = run_update()
+            except ApiError as e:
+                sys.exit(str(e))
+            print("mock: %s downloaded and checked, nothing installed" % r["version"] if r.get("mock") else
+                  "updating to %s - follow it with: journalctl -fu pve-gateway-update" % r["version"])
     elif a.cmd in ("ui-allow", "ui-host"):
         key = "ui_allow" if a.cmd == "ui-allow" else "allowed_hosts"
         if a.rules:
