@@ -44,14 +44,18 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
-CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or os.environ.get("PVEGW_DIR") or "/etc/pve-gateway"
+VERSION = "1.1.0"
+CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
 CH_PRE, CH_POST, CH_FWD = "PVEGW_PRE", "PVEGW_POST", "PVEGW_FWD"
 JUMPS = (("nat", "PREROUTING", CH_PRE), ("nat", "POSTROUTING", CH_POST), ("filter", "FORWARD", CH_FWD))
 
 DEFAULTS = {
     "listen": "0.0.0.0",
     "port": 8099,
+    # Web UI access: source IPs/networks allowed to connect (empty = anyone; loopback always works),
+    # and extra hostnames the UI may be opened by (IP addresses and this host's own names always work).
+    "ui_allow": [],
+    "allowed_hosts": [],
     # Proxmox accounts allowed to log in (checked against the local PVE API).
     "allowed_users": ["root@pam"],
     # If set (via `passwd`), use a local password instead of Proxmox login.
@@ -79,6 +83,10 @@ LOCK = threading.RLock()
 STATE = {"cfg": None, "last_apply": None, "last_error": None}
 SESSIONS = {}  # token -> [user, expires]
 FAILS = {}     # ip -> [count, first_ts]
+LOGIN_LOCK = threading.Lock()
+LOGIN_INFLIGHT = set()   # IPs with a login being checked right now
+TFA_PENDING = {}         # id -> {"user", "ticket", "ip", "exp"}
+LOGIN_MAX_FAILS, LOGIN_WINDOW = 5, 900
 SESSION_TTL = 8 * 3600
 DRY_RUN = False
 MOCK = None  # dev/mock.py instance when started with --mock (simulated host for local development)
@@ -103,9 +111,16 @@ def load_config():
             cfg.update(json.load(f))
     except FileNotFoundError:
         pass
-    for k in ("nginx_conf", "acme_webroot"):  # paths saved before the rename from pve-portfwd
-        if isinstance(cfg.get(k), str) and "pve-portfwd" in cfg[k]:
-            cfg[k] = cfg[k].replace("pve-portfwd", "pve-gateway")
+    try:
+        cfg["ui_allow"] = parse_networks(cfg.get("ui_allow", []))
+    except ApiError as e:
+        log("ignoring invalid ui_allow (%s) - web UI is open to everyone" % e, "warn")
+        cfg["ui_allow"] = []
+    try:
+        cfg["allowed_hosts"] = parse_hostnames(cfg.get("allowed_hosts", []))
+    except ApiError as e:
+        log("ignoring invalid allowed_hosts (%s)" % e, "warn")
+        cfg["allowed_hosts"] = []
     rules = []
     for r in cfg.get("rules", []):
         try:
@@ -155,7 +170,90 @@ def log(msg, level="info"):
 
 NAME_RE = re.compile(r"^[A-Za-z0-9 _.:/@+-]{0,40}$")
 PORT_RE = re.compile(r"^(\d{1,5})(?:[-:](\d{1,5}))?$")
-IFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+IFACE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$")  # no leading "-": it is an iptables argument
+HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
+
+
+def _as_list(v):
+    return re.split(r"[\s,]+", v) if isinstance(v, str) else list(v or [])
+
+
+def parse_networks(v):
+    """IP addresses / CIDRs (IPv4 or IPv6) -> normalised list."""
+    out = []
+    for x in _as_list(v):
+        x = str(x).strip()
+        if not x:
+            continue
+        try:
+            n = str(ipaddress.ip_network(x, strict=False))
+        except ValueError:
+            raise ApiError("invalid IP address or network '%s' (e.g. 203.0.113.7 or 10.20.0.0/24)" % x)
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def parse_hostnames(v):
+    out = []
+    for x in _as_list(v):
+        x = str(x).strip().lower().rstrip(".")
+        if not x:
+            continue
+        if not HOSTNAME_RE.match(x):
+            raise ApiError("invalid hostname '%s'" % x)
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def norm_ip(ip):
+    """'::ffff:1.2.3.4' -> '1.2.3.4' (dual-stack sockets)."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    return str(a.ipv4_mapped) if getattr(a, "ipv4_mapped", None) else str(a)
+
+
+def ui_client_allowed(ip, cfg):
+    """Web UI source filter. Loopback always works (ssh tunnel / recovery)."""
+    try:
+        a = ipaddress.ip_address(norm_ip(ip))
+    except ValueError:
+        return False
+    if a.is_loopback or not cfg.get("ui_allow"):
+        return True
+    return any(a in ipaddress.ip_network(n) for n in cfg["ui_allow"])
+
+
+def own_hostnames():
+    names = {"localhost"}
+    hn = socket.gethostname().lower()
+    names |= {hn, hn.split(".")[0]}
+    try:
+        names.add(socket.getfqdn().lower())
+    except OSError:
+        pass
+    return {n for n in names if n and not n.endswith(".arpa")}  # getfqdn() may return a reverse-DNS name
+
+
+def host_allowed(host, cfg):
+    """Host header check against DNS rebinding: IP literals, this host's names, allowed_hosts."""
+    h = (host or "").strip().lower()
+    if not h:
+        return True  # no browser omits Host; scripts (HTTP/1.0) may
+    if h.startswith("["):
+        h = h[1:h.find("]")] if "]" in h else h
+    elif h.count(":") == 1:
+        h = h.split(":")[0]
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    h = h.rstrip(".")
+    return h in own_hostnames() or h in cfg.get("allowed_hosts", [])
 
 
 def parse_ports(s):
@@ -1141,6 +1239,14 @@ def checks():
             policy + (" - forward_accept must stay enabled" if drop else ""))
     rc, out = sh(["pve-firewall", "status"])
     add("pve-firewall", "info", out)
+    if rc == 0 and "enabled" in out and cfg.get("forward_accept", True) and any(r["enabled"] for r in cfg["rules"]):
+        add("forwarded ports vs pve-firewall", "info", "forwarded traffic is accepted before pve-firewall, so guest "
+            "firewall rules don't filter it - limit access with each rule's Allowed source")
+    if cfg.get("ui_allow"):
+        add("web UI access", "ok", "only from " + ", ".join(cfg["ui_allow"]) + " (and localhost)")
+    else:
+        add("web UI access", "warn", "port %s is open to every IP - restrict it in Settings or run: pve-gateway ui-allow <your-ip>"
+            % cfg.get("port", 8099))
     listeners = host_listeners()
     for r in cfg["rules"]:
         if not r["enabled"]:
@@ -1362,30 +1468,47 @@ def check_password(pw, stored):
         return False
 
 
-def pve_login(user, pw):
-    """Validate credentials against the local Proxmox API. Returns canonical user or None."""
-    if "@" not in user:
-        user += "@pam"
-    body = urllib.parse.urlencode({"username": user, "password": pw}).encode()
+def pve_ticket(params):
+    """POST /access/ticket on the local Proxmox API. Returns the "data" dict or None."""
+    body = urllib.parse.urlencode(params).encode()
     ctx = ssl._create_unverified_context()  # localhost only
     try:
         with urllib.request.urlopen("https://127.0.0.1:8006/api2/json/access/ticket", body,
                                     timeout=10, context=ctx) as resp:
-            d = json.load(resp).get("data") or {}
+            return json.load(resp).get("data") or None
     except Exception:
         return None
-    if not d.get("ticket") or d.get("NeedTFA"):
-        return None
-    return d.get("username")
+
+
+def pve_login(user, pw):
+    """Returns (canonical user, None) on success, (user, challenge ticket) if a second factor is needed."""
+    if "@" not in user:
+        user += "@pam"
+    d = pve_ticket({"username": user, "password": pw})
+    if not d or not d.get("ticket"):
+        return None, None
+    if d.get("NeedTFA"):
+        return d.get("username") or user, d["ticket"]
+    return d.get("username"), None
+
+
+def pve_tfa(user, challenge, code):
+    """Second step: TOTP code (or "recovery:<code>") against the challenge ticket."""
+    code = code if ":" in code else "totp:" + code
+    d = pve_ticket({"username": user, "tfa-challenge": challenge, "password": code})
+    return d.get("username") if d and d.get("ticket") and not d.get("NeedTFA") else None
 
 
 def authenticate(user, pw):
+    """(user, None) ok, (None, None) failed, (user, challenge) second factor needed."""
     cfg = STATE["cfg"]
     if cfg.get("pass_hash"):
-        ok = hmac.compare_digest(user, cfg.get("local_user", "admin")) and check_password(pw, cfg["pass_hash"])
-        return user if ok else None
-    u = pve_login(user, pw)
-    return u if u and u in cfg.get("allowed_users", []) else None
+        ok = hmac.compare_digest(user.encode(), cfg.get("local_user", "admin").encode()) and check_password(pw, cfg["pass_hash"])
+        return (user if ok else None), None
+    u, challenge = pve_login(user, pw)
+    if not u or u not in cfg.get("allowed_users", []):
+        return None, None
+    return u, challenge
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -1415,7 +1538,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def body(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        raw = (self.headers.get("Content-Length") or "0").strip()
+        if not raw.isdigit():  # "-1" would make rfile.read() read until the client hangs up
+            raise ApiError("invalid Content-Length", 400)
+        n = int(raw)
         if n > 65536:
             raise ApiError("request too large", 413)
         try:
@@ -1430,10 +1556,20 @@ class Handler(BaseHTTPRequestHandler):
                 return v
         return None
 
+    def client_ip(self):
+        return norm_ip(self.client_address[0])
+
+    def ua_hash(self):
+        return hashlib.sha256((self.headers.get("User-Agent") or "").encode()).hexdigest()[:16]
+
+    def sid_cookie(self):
+        # __Host- needs Secure; cookies are not isolated by port, so the session is also bound to IP + browser
+        return "__Host-pvegw_sid" if self.server.tls else "pvegw_sid"
+
     def session_user(self):
-        tok = self.cookie("pvegw_sid")
+        tok = self.cookie(self.sid_cookie())
         s = SESSIONS.get(tok) if tok else None
-        if s and s[1] > time.time():
+        if s and s[1] > time.time() and s[2] == self.client_ip() and s[3] == self.ua_hash():
             s[1] = time.time() + SESSION_TTL
             return s[0]
         return None
@@ -1453,6 +1589,11 @@ class Handler(BaseHTTPRequestHandler):
     def route(self, method):
         path = urllib.parse.urlsplit(self.path).path
         try:
+            if not host_allowed(self.headers.get("Host"), STATE["cfg"]):
+                log("rejected Host %r from %s" % (self.headers.get("Host"), self.client_ip()), "warn")
+                return self.send(421, "pve-gateway: unknown hostname %r. Open the UI by IP address, or allow the name:\n"
+                                 "  pve-gateway ui-host %s\n" % (self.headers.get("Host"), (self.headers.get("Host") or "").split(":")[0]),
+                                 "text/plain")
             if method == "GET" and path in STATIC:
                 ctype, content = STATIC[path]
                 return self.send(200, content, ctype)
@@ -1464,10 +1605,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/login" and method == "POST":
                 return self.login()
             if path == "/api/authinfo" and method == "GET":
-                cfg = STATE["cfg"]
-                local = bool(cfg.get("pass_hash"))
+                local = bool(STATE["cfg"].get("pass_hash"))
                 return self.send(200, {"mode": "local" if local else "pve", "mock": bool(MOCK),
-                                       "user": cfg.get("local_user", "admin") if local else "root@pam"})
+                                       "user": "admin" if MOCK else "" if local else "root@pam"})
             user = self.session_user()
             if not user:
                 return self.send(401, {"error": "login required"})
@@ -1479,36 +1619,60 @@ class Handler(BaseHTTPRequestHandler):
             self.send(500, {"error": "internal error"})
 
     def login(self):
-        ip = self.client_address[0]
-        now = time.time()
-        f = FAILS.get(ip)
-        if f and now - f[1] > 300:
-            FAILS.pop(ip, None)
-            f = None
-        if f and f[0] >= 5:
-            raise ApiError("too many failed attempts, try again in a few minutes", 429)
-        d = self.body()
-        user = authenticate(str(d.get("username", "")), str(d.get("password", "")))
+        ip, now = self.client_ip(), time.time()
+        with LOGIN_LOCK:
+            for k in [k for k, v in FAILS.items() if now - v[1] > LOGIN_WINDOW]:
+                FAILS.pop(k, None)
+            for k in [k for k, v in TFA_PENDING.items() if v["exp"] < now]:
+                TFA_PENDING.pop(k, None)
+            f = FAILS.get(ip)
+            if f and f[0] >= LOGIN_MAX_FAILS:
+                raise ApiError("too many failed attempts - try again in %d minutes"
+                               % max(1, int((f[1] + LOGIN_WINDOW - now) // 60) + 1), 429)
+            if ip in LOGIN_INFLIGHT or len(LOGIN_INFLIGHT) >= 8:
+                raise ApiError("another login is being checked - try again in a moment", 429)
+            LOGIN_INFLIGHT.add(ip)
+            FAILS.setdefault(ip, [0, now])[0] += 1  # counted before checking, so parallel guesses can't skip it
+        try:
+            d = self.body()
+            if d.get("tfa_id"):
+                p = TFA_PENDING.pop(str(d["tfa_id"]), None)
+                user = None
+                if p and p["ip"] == ip and p["exp"] > now:
+                    user = pve_tfa(p["user"], p["ticket"], str(d.get("code", "")).strip())
+                    user = user if user in STATE["cfg"].get("allowed_users", []) else None
+            else:
+                user, challenge = authenticate(str(d.get("username", "")), str(d.get("password", "")))
+                if user and challenge:
+                    tid = secrets.token_urlsafe(16)
+                    TFA_PENDING[tid] = {"user": user, "ticket": challenge, "ip": ip, "exp": now + 300}
+                    return self.send(200, {"tfa": tid})
+        finally:
+            with LOGIN_LOCK:
+                LOGIN_INFLIGHT.discard(ip)
         if not user:
-            FAILS.setdefault(ip, [0, now])[0] += 1
             time.sleep(1)
             raise ApiError("invalid credentials or user not allowed", 401)
-        FAILS.pop(ip, None)
+        with LOGIN_LOCK:
+            FAILS.pop(ip, None)
         for k in [k for k, v in SESSIONS.items() if v[1] < now]:
             SESSIONS.pop(k, None)
         tok = secrets.token_urlsafe(32)
-        SESSIONS[tok] = [user, now + SESSION_TTL]
+        SESSIONS[tok] = [user, now + SESSION_TTL, ip, self.ua_hash()]
+        log("login %s from %s" % (user, ip))
         secure = "; Secure" if self.server.tls else ""
-        self.send(200, {"user": user}, cookies=["pvegw_sid=%s; Path=/; HttpOnly; SameSite=Strict%s" % (tok, secure)])
+        self.send(200, {"user": user}, cookies=["%s=%s; Path=/; HttpOnly; SameSite=Strict%s" % (self.sid_cookie(), tok, secure)])
 
     def api(self, method, path, user):
         cfg = STATE["cfg"]
         if path == "/api/logout" and method == "POST":
-            SESSIONS.pop(self.cookie("pvegw_sid"), None)
-            return self.send(200, {"ok": True}, cookies=["pvegw_sid=; Path=/; Max-Age=0"])
+            SESSIONS.pop(self.cookie(self.sid_cookie()), None)
+            return self.send(200, {"ok": True}, cookies=["%s=; Path=/; Max-Age=0%s" % (
+                self.sid_cookie(), "; Secure" if self.server.tls else "")])
         if path == "/api/state" and method == "GET":
             return self.send(200, {
                 "user": user, "version": VERSION, "rules": cfg["rules"], "counters": counters(),
+                "ui_open": not cfg.get("ui_allow"),
                 "ifaces": list_ifaces(), "networks": host_networks(), "dry_run": DRY_RUN, "mock": bool(MOCK),
                 "status": {"ip_forward": ip_forward_on(), "active": DRY_RUN or hooks_active(),
                            "last_apply": STATE["last_apply"], "last_error": STATE["last_error"]},
@@ -1516,6 +1680,24 @@ class Handler(BaseHTTPRequestHandler):
                 "wildcards": cfg["wildcards"], "wildcard_status": wildcard_status(cfg), "dns_providers": DNS_PROVIDERS,
                 "nginx": {"last_apply": NGINX["last_apply"], "last_error": NGINX["last_error"]},
             })
+        if path == "/api/settings" and method == "GET":
+            return self.send(200, {"ui_allow": cfg.get("ui_allow", []), "allowed_hosts": cfg.get("allowed_hosts", []),
+                                   "client_ip": self.client_ip(), "own_hosts": sorted(own_hostnames())})
+        if path == "/api/settings" and method == "PUT":
+            d = self.body()
+            with LOCK:
+                new = dict(STATE["cfg"], ui_allow=parse_networks(d.get("ui_allow", [])),
+                           allowed_hosts=parse_hostnames(d.get("allowed_hosts", [])))
+                if not ui_client_allowed(self.client_ip(), new):
+                    raise ApiError("this would lock you out: your IP %s is not in the allowed list" % self.client_ip())
+                if not host_allowed(self.headers.get("Host"), new):
+                    raise ApiError("this would lock you out: you opened the UI as %r, keep it in allowed hostnames"
+                                   % self.headers.get("Host"))
+                save_config(new)
+                STATE["cfg"] = new
+            log("%s set web UI access: allow %s, hosts %s" % (user, ", ".join(new["ui_allow"]) or "anyone",
+                                                               ", ".join(new["allowed_hosts"]) or "-"))
+            return self.send(200, {"ok": True})
         if path == "/api/guests" and method == "GET":
             return self.send(200, {"guests": list_guests()})
         if path == "/api/apply" and method == "POST":
@@ -1691,6 +1873,33 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     tls = False
+    max_conns, max_per_ip = 64, 16  # one thread per connection: cap them (slowloris)
+
+    def __init__(self, *a, **kw):
+        self.conn_lock, self.active = threading.Lock(), {}
+        super().__init__(*a, **kw)
+
+    def verify_request(self, request, client_address):
+        ip = norm_ip(client_address[0])
+        if not ui_client_allowed(ip, STATE["cfg"]):
+            log("refused connection from %s (not in ui_allow)" % ip, "debug")
+            return False
+        with self.conn_lock:
+            if sum(self.active.values()) >= self.max_conns or self.active.get(ip, 0) >= self.max_per_ip:
+                log("too many connections, dropping %s" % ip, "debug")
+                return False
+            self.active[ip] = self.active.get(ip, 0) + 1
+        return True
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            ip = norm_ip(client_address[0])
+            with self.conn_lock:
+                self.active[ip] = self.active.get(ip, 1) - 1
+                if self.active[ip] <= 0:
+                    self.active.pop(ip, None)
 
 
 def tls_context(cfg):
@@ -1767,6 +1976,7 @@ INDEX_HTML = r"""<!doctype html>
     <p class="muted" id="loginHint">Sign in with your Proxmox account</p>
     <label>User<input name="username" autocomplete="username" value="root@pam" required></label>
     <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <label id="tfaRow" hidden>Two-factor code<input name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456 (or recovery:…)"></label>
     <button type="submit">Sign in</button>
     <p id="loginErr" class="err"></p>
   </form>
@@ -1774,7 +1984,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="app" hidden>
   <header>
     <h1>PVE Gateway</h1>
-    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#debug" data-view="debug">Debug</a></nav>
+    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
     <div id="status" class="chips"></div>
     <span class="spacer"></span>
     <span id="who" class="muted"></span>
@@ -1823,6 +2033,20 @@ INDEX_HTML = r"""<!doctype html>
     <p class="muted small">nginx on this host answers on ports 80/443 and proxies each domain to a guest
       (<code>/etc/nginx/conf.d/pve-gateway.conf</code>). With Let's Encrypt, certbot gets and renews certificates automatically.
       DNS must point at this host's public IP, and if the host is behind a router, the router must forward ports 80 and 443 to it.</p>
+  </main>
+  <main id="view-settings" hidden>
+    <div class="card form-card">
+      <h2>Web UI access</h2>
+      <p class="muted small">Only these source IPs / networks can open this page (port <span id="uiPort"></span>).
+        Leave empty to allow everyone. Connections from this host itself (localhost) always work, so you can't lock yourself out
+        of an ssh tunnel - and <code>pve-gateway ui-allow any</code> on the host resets it.</p>
+      <label>Allowed source IPs / networks<textarea id="uiAllow" rows="4" spellcheck="false" placeholder="203.0.113.7&#10;10.20.0.0/24"></textarea></label>
+      <p class="hint">Your IP: <b id="myIp" class="mono"></b> <button type="button" class="link" id="addMyIp">+ add it</button></p>
+      <label>Extra hostnames for this UI<textarea id="uiHosts" rows="2" spellcheck="false" placeholder="pve.example.com"></textarea></label>
+      <p class="hint" id="ownHosts"></p>
+      <p id="setErr" class="err"></p>
+      <div class="actions"><span id="setMsg" class="muted small"></span><button type="button" id="saveSettings">Save</button></div>
+    </div>
   </main>
   <main id="view-debug" hidden>
     <div class="bar">
@@ -1956,6 +2180,11 @@ td.arrow{color:var(--muted);padding:0 2px}
 .center{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
 .login{width:100%;max-width:340px;padding:24px;display:flex;flex-direction:column;gap:12px}
 label{display:flex;flex-direction:column;gap:4px;font-size:12px;font-weight:600;color:var(--muted)}
+textarea{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);background:var(--input);border:1px solid var(--line);border-radius:7px;padding:7px 9px;resize:vertical}
+textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.form-card{padding:18px 20px;max-width:680px;display:flex;flex-direction:column;gap:12px}.form-card h2{margin:0}
+.form-card .actions{align-items:center}
+a.chip{text-decoration:none}
 input,select{font:inherit;color:var(--fg);background:var(--input);border:1px solid var(--line);border-radius:7px;padding:7px 9px;font-weight:400}
 input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
 label.check{flex-direction:row;align-items:flex-start;gap:8px;font-weight:400;color:var(--fg);font-size:13px}
@@ -2056,7 +2285,7 @@ async function load() {
   render();
   if (!load.started) { load.started = true; setView(); }
   if (!timer) timer = setInterval(() => {
-    if (!document.hidden && view !== 'debug' && ![...document.querySelectorAll('dialog')].some(x => x.open)) load().catch(() => {});
+    if (!document.hidden && view !== 'debug' && view !== 'settings' && ![...document.querySelectorAll('dialog')].some(x => x.open)) load().catch(() => {});
   }, 5000);
 }
 
@@ -2090,11 +2319,13 @@ function renderNet() {
 function render() {
   renderDomains();
   renderNet();
-  $('#who').textContent = S.user;
+  $('#who').textContent = S.user + ' · v' + S.version;
   const st = $('#status'); st.replaceChildren();
   const chip = (cls, t, title) => st.append(el('span', {class: 'chip ' + cls, textContent: t, title: title || ''}));
   if (S.dry_run) chip('warn', 'DRY RUN', 'iptables commands are only printed');
   if (S.mock) chip('warn', 'MOCK', 'simulated Proxmox host - nothing real is touched');
+  if (S.ui_open) st.append(el('a', {class: 'chip warn', href: '#settings', textContent: 'UI open to all IPs',
+    title: 'anyone can reach this login page - restrict it in Settings'}));
   chip(S.status.active ? 'ok' : 'bad', S.status.active ? 'rules active' : 'rules not loaded');
   chip(S.status.ip_forward ? 'ok' : 'bad', S.status.ip_forward ? 'ip_forward on' : 'ip_forward off');
   if (S.status.last_error) chip('bad', 'error', S.status.last_error);
@@ -2190,14 +2421,22 @@ $('#reapply').onclick = async () => {
 };
 $('#logout').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); showLogin(); };
 
+let tfaId = null;
+function resetTfa() { tfaId = null; $('#tfaRow').hidden = true; $('#loginForm').code.required = false; $('#loginForm').code.value = ''; }
 $('#loginForm').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, btn = f.querySelector('button');
   $('#loginErr').textContent = ''; btn.disabled = true;
   try {
-    await api('POST', '/api/login', {username: f.username.value.trim(), password: f.password.value});
-    f.password.value = ''; await load();
-  } catch (err) { $('#loginErr').textContent = err.message; }
+    const r = await api('POST', '/api/login', tfaId ? {tfa_id: tfaId, code: f.code.value.trim()}
+      : {username: f.username.value.trim(), password: f.password.value});
+    if (r.tfa) {  // Proxmox account with two-factor: ask for the code
+      tfaId = r.tfa; $('#tfaRow').hidden = false; f.code.required = true; f.code.focus();
+    } else { resetTfa(); f.password.value = ''; await load(); }
+  } catch (err) {
+    $('#loginErr').textContent = err.message + (tfaId ? ' - enter your password again' : '');
+    if (tfaId) resetTfa();
+  }
   btn.disabled = false;
 });
 
@@ -2477,10 +2716,34 @@ $('#dbgVerbose').onchange = async e => {
   catch (err) { e.target.checked = !e.target.checked; $('#dbgMsg').textContent = err.message; }
 };
 
+// ---- settings
+async function loadSettings() {
+  try {
+    const d = await api('GET', '/api/settings');
+    $('#uiAllow').value = d.ui_allow.join('\n'); $('#uiHosts').value = d.allowed_hosts.join('\n');
+    $('#myIp').textContent = d.client_ip; $('#uiPort').textContent = location.port || (location.protocol === 'https:' ? 443 : 80);
+    $('#ownHosts').textContent = 'Always allowed: any IP address, ' + d.own_hosts.join(', ') + '.';
+    $('#setErr').textContent = '';
+  } catch (e) { $('#setErr').textContent = e.message; }
+}
+$('#addMyIp').onclick = () => {
+  const t = $('#uiAllow'), ip = $('#myIp').textContent;
+  if (!t.value.split(/[\s,]+/).includes(ip)) t.value = (t.value.trim() ? t.value.trim() + '\n' : '') + ip;
+};
+$('#saveSettings').onclick = async () => {
+  $('#setErr').textContent = '';
+  try {
+    await api('PUT', '/api/settings', {ui_allow: $('#uiAllow').value, allowed_hosts: $('#uiHosts').value});
+    $('#setMsg').textContent = 'Saved'; setTimeout(() => $('#setMsg').textContent = '', 3000);
+    loadSettings(); load().catch(() => {});
+  } catch (e) { $('#setErr').textContent = e.message; }
+};
+
 function setView() {
-  view = {'#debug': 'debug', '#domains': 'domains'}[location.hash] || 'rules';
+  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings'}[location.hash] || 'rules';
   for (const a of document.querySelectorAll('.tabs a')) a.classList.toggle('on', a.dataset.view === view);
-  for (const v of ['rules', 'domains', 'debug']) $('#view-' + v).hidden = view !== v;
+  for (const v of ['rules', 'domains', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
+  if (view === 'settings' && !$('#app').hidden) loadSettings();
   if ($('#app').hidden) return;
   if (view === 'debug') loadDebug(); else load().catch(() => {});
 }
@@ -2524,6 +2787,8 @@ def main():
   apply            re-apply saved rules
   flush            remove all forwarding rules and chains (config is kept)
   passwd           set a local login instead of Proxmox accounts
+  ui-allow [IP...]  limit the web UI to these IPs/networks ("any" = everyone); no args = show
+  ui-host [NAME..] hostnames the UI may be opened by besides IPs ("none" = clear); no args = show
   domains          list domains, wildcard certificates and expiry
   cert NAME        request / renew a certificate now (domain, or *.zone for a wildcard)
   mock SCENARIO    (--mock only) break the simulated host: %s
@@ -2533,9 +2798,10 @@ local development (macOS etc.):
             "reset, unhook, ip-forward-off, forward-drop, pvefw-first, foreign-dnat, traffic"))
     ap.add_argument("cmd", nargs="?", default="serve",
                     choices=["serve", "status", "test", "debug", "show", "apply", "flush", "passwd", "mock",
-                             "domains", "cert"])
+                             "domains", "cert", "ui-allow", "ui-host"])
     ap.add_argument("rules", nargs="*", help=argparse.SUPPRESS)
     ap.add_argument("-v", "--verbose", action="store_true", help="log every iptables command and HTTP request")
+    ap.add_argument("--version", action="version", version="pve-gateway " + VERSION)
     ap.add_argument("--dry-run", action="store_true", help="log iptables changes instead of running them")
     ap.add_argument("--mock", action="store_true", help="simulate a Proxmox host (for local development, uses dev/mock.py)")
     ap.add_argument("--config-dir", help="default: %s (with --mock: ./.dev)" % CONF_DIR)
@@ -2578,6 +2844,23 @@ local development (macOS etc.):
         sys.stdout.write(build_ruleset(cfg))
     elif a.cmd == "apply":
         sys.exit(1 if apply_rules() or apply_nginx() else 0)
+    elif a.cmd in ("ui-allow", "ui-host"):
+        key = "ui_allow" if a.cmd == "ui-allow" else "allowed_hosts"
+        if a.rules:
+            clear = [x.lower() for x in a.rules] in (["any"], ["all"], ["none"])
+            try:
+                cfg[key] = [] if clear else (parse_networks if key == "ui_allow" else parse_hostnames)(a.rules)
+            except ApiError as e:
+                sys.exit(str(e))
+            save_config(cfg)
+            if not MOCK and not DRY_RUN and run(["systemctl", "try-restart", "pve-gateway"], check_only=True)[0] == 0:
+                print("saved; pve-gateway restarted")
+            else:
+                print("saved; restart to apply: systemctl restart pve-gateway")
+        if key == "ui_allow":
+            print("web UI allowed from: " + (", ".join(cfg[key]) + " (and localhost)" if cfg[key] else "anyone"))
+        else:
+            print("allowed hostnames: " + ", ".join(sorted(own_hostnames()) + cfg[key]) + " (and any IP address)")
     elif a.cmd == "domains":
         if not cfg["domains"]:
             print("no domains (add them in the web UI)")

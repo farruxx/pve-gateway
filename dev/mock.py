@@ -142,12 +142,9 @@ class Mock:
     def _load(self):
         try:
             with open(self.path) as f:
-                st = json.load(f)
+                return json.load(f)
         except (OSError, ValueError):
             return default_state()
-        for k, v in default_state().items():  # state files from older versions
-            st.setdefault(k, v)
-        return st
 
     def _save(self, st):
         tmp = self.path + ".tmp"

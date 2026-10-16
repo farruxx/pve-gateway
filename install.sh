@@ -123,9 +123,15 @@ fi
 command -v python3  >/dev/null || { echo "python3 missing: apt install python3-minimal"; exit 1; }
 command -v iptables >/dev/null || { echo "iptables missing: apt install iptables"; exit 1; }
 
-# ---- source files: next to this script (git clone / scp), otherwise download them
-SRC="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
-if [ ! -f "$SRC/pve-gateway.py" ] || [ ! -f "$SRC/pve-gateway.service" ]; then
+# ---- source files: next to this script when it is run as a file (git clone), otherwise download them.
+# Piped (curl | sh) $0 is "sh", so the current directory is never used - it may hold an old copy.
+SRC=""
+case "$0" in
+    *install.sh)
+        d="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+        [ -f "$d/pve-gateway.py" ] && [ -f "$d/pve-gateway.service" ] && SRC="$d" ;;
+esac
+if [ -z "$SRC" ]; then
     SRC="$(mktemp -d)"
     trap 'rm -rf "$SRC"' EXIT
     echo "downloading pve-gateway (${PVE_GATEWAY_REF:-master}) ..."
@@ -169,20 +175,6 @@ if [ -n "$WITH_NGINX" ]; then
     systemctl enable --now nginx
 fi
 
-# ---- migrate from the old name (pve-portfwd): config, credentials, ACME webroot, certbot renewal configs
-if [ -e /etc/systemd/system/pve-portfwd.service ] || [ -d /etc/pve-portfwd ]; then
-    echo "migrating from pve-portfwd ..."
-    systemctl disable --now pve-portfwd 2>/dev/null || true
-    [ -x /usr/local/bin/pve-portfwd ] && /usr/local/bin/pve-portfwd flush || true   # drop old PORTFWD_* chains
-    if [ -d /etc/pve-portfwd ] && [ ! -e /etc/pve-gateway ]; then mv /etc/pve-portfwd /etc/pve-gateway; fi
-    if [ -d /var/lib/pve-portfwd ] && [ ! -e /var/lib/pve-gateway ]; then mv /var/lib/pve-portfwd /var/lib/pve-gateway; fi
-    if [ -d /etc/letsencrypt/renewal ]; then
-        sed -i 's#/etc/pve-portfwd/#/etc/pve-gateway/#g; s#/var/lib/pve-portfwd/#/var/lib/pve-gateway/#g' /etc/letsencrypt/renewal/*.conf 2>/dev/null || true
-    fi
-    rm -f /etc/nginx/conf.d/pve-portfwd.conf   # regenerated as pve-gateway.conf on start
-    rm -f /usr/local/bin/pve-portfwd /etc/systemd/system/pve-portfwd.service /etc/sysctl.d/99-pve-portfwd.conf
-fi
-
 install -m 0755 "$SRC/pve-gateway.py" /usr/local/bin/pve-gateway
 install -m 0644 "$SRC/pve-gateway.service" /etc/systemd/system/pve-gateway.service
 echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-pve-gateway.conf
@@ -197,4 +189,5 @@ systemctl --no-pager --lines=5 status pve-gateway || true
 
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo
+echo "installed $(/usr/local/bin/pve-gateway --version 2>/dev/null) from ${SRC}"
 echo "Open: https://${IP:-<host-ip>}:8099  (log in with root@pam)"

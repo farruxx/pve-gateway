@@ -10,13 +10,6 @@ const PORT = 9333;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 mkdirSync(OUT, { recursive: true });
 
-// 1. log in through the API to get a session cookie
-const login = await fetch(BASE + "/api/login", {
-  method: "POST", headers: { "Content-Type": "application/json", "X-PVEGW": "1" },
-  body: JSON.stringify({ username: "admin", password: "admin" }),
-});
-const sid = /pvegw_sid=([^;]+)/.exec(login.headers.get("set-cookie"))[1];
-
 // 2. headless chrome
 const chrome = spawn(CHROME, ["--headless=new", `--remote-debugging-port=${PORT}`, "--hide-scrollbars",
   `--user-data-dir=${process.env.PROFILE_DIR}`, "--no-first-run", "--no-default-browser-check", "about:blank"],
@@ -42,6 +35,15 @@ const js = async expr => {
   if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
   return r.result.value;
 };
+
+// log in with Chrome's own User-Agent: sessions are bound to the client IP + User-Agent
+const { userAgent } = await cdp("Browser.getVersion");
+const login = await fetch(BASE + "/api/login", {
+  method: "POST", headers: { "Content-Type": "application/json", "X-PVEGW": "1", "User-Agent": userAgent },
+  body: JSON.stringify({ username: "admin", password: "admin" }),
+});
+const sid = /pvegw_sid=([^;]+)/.exec(login.headers.get("set-cookie") || "")?.[1];
+if (!sid) throw new Error("login failed: " + login.status + " " + (await login.text()));
 
 await cdp("Page.enable");
 await cdp("Network.enable");
@@ -96,6 +98,10 @@ await shot("wildcard", { hash: "#domains", height: 820, setup: `
   openWcDlg(null); const f = document.querySelector('#wcForm');
   f.zone.value = 'example.com'; f.zone.dispatchEvent(new Event('input'));
   document.querySelector('#wcFields input').value = 'x'.repeat(40); document.activeElement.blur();` });
+await shot("settings", { hash: "#settings", fit: true, setup: `
+  ${waitFor("document.querySelector('#myIp').textContent")}
+  document.querySelector('#myIp').textContent = '203.0.113.7';
+  document.querySelector('#ownHosts').textContent = 'Always allowed: any IP address, localhost, pve, pve.example.com.';` });
 await shot("debug", { hash: "#debug", height: 900, setup: `
   ${waitFor("document.querySelectorAll('#checks li').length > 3")}
   ${CLEAN}

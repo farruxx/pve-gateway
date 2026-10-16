@@ -15,12 +15,10 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 | **Ports**: forward host ports to guests, with source/interface filters and live hit counters | **Add domain**: pick a guest, choose Let's Encrypt, a wildcard certificate or plain HTTP |
 | ![Built-in test explains what is wrong](docs/screenshots/domain-test.png) | ![Wildcard certificate via DNS provider API](docs/screenshots/wildcard.png) |
 | **Test**: checks DNS, nginx, the upstream, the certificate and a real request, with how to fix each failure | **Wildcard certificates**: `*.example.com` through your DNS provider's API ([guide](wildcard.md)) |
-| ![Debug tab with health checks](docs/screenshots/debug.png) | |
-| **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report | |
+| ![Web UI access settings](docs/screenshots/settings.png) | ![Debug tab with health checks](docs/screenshots/debug.png) |
+| **Settings**: only the IPs/networks you list can reach the web UI | **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report |
 
 <sub>Screenshots use sample data from the built-in mock mode (`./dev.sh`). Regenerate them with `dev/screenshots.sh`.</sub>
-
-> Upgrading from **pve-portfwd** (the old name)? Run `sh install.sh` as usual. It migrates the config, DNS credentials, ACME webroot and certbot renewal settings, and removes the old service and iptables chains.
 
 - **No dependencies.** It's one Python 3 file using only the standard library, and it drives `iptables`. Both already ship with Proxmox VE 7 and 8.
 - **Login with your Proxmox account.** Credentials are checked against the local PVE API, and only `root@pam` is allowed by default. You can switch to a local password instead.
@@ -135,6 +133,9 @@ Guests sit on a private bridge (for example `vmbr1`, `10.10.10.0/24`), and the h
 pve-gateway serve           # web UI (what systemd runs)
 pve-gateway status          # rules, hit counters, hook status
 pve-gateway test [NAME...]  # reachability test (rule id/name/host port or domain; default: all enabled)
+pve-gateway ui-allow IP...  # web UI only from these IPs/networks ("any" = everyone, no args = show)
+pve-gateway ui-host NAME..  # extra hostnames the web UI may be opened by ("none" = clear)
+pve-gateway --version       # installed version
 pve-gateway domains         # list domains, wildcard certificates and expiry
 pve-gateway cert NAME       # request / renew now: a domain, or '*.example.com' for a wildcard
 pve-gateway debug           # full diagnostic report, paste it when asking for help
@@ -210,6 +211,21 @@ To break the host on purpose, run a scenario. They're also available as buttons 
 The simulated guests are 100 web, 101 db, 102 game (stopped), 103 nextcloud, 104 win11 (no guest agent, ignores ping) and 105 office-gw (behind a gateway). The sample rules show every test outcome. The sample domains are `cloud.example.com` (HTTPS working), `app.example.com` (HTTP only, with an alias) and `broken.invalid` (no DNS and nothing listening upstream). The sample wildcard is `*.example.com` (Cloudflare), used by `status.example.com`. The mock certbot fails for names ending in `.invalid` and succeeds after 2 s for everything else. For wildcards, the API token `bad` gets Cloudflare's "invalid credentials" error, and only the Cloudflare, DigitalOcean and RFC 2136 plugins count as installed, so OVH shows the "plugin missing" message. Generated nginx files end up under `.dev/mock-fs/`. Delete `.dev/` to start over.
 
 `--dry-run` is different. It's meant for a **real** host: read-only commands run for real, and changes are only logged.
+
+## Securing the web UI
+
+The UI runs as root, can change the host's firewall and nginx, and logs in with `root@pam`. Don't leave it open to the internet:
+
+- **Restrict who can connect:** go to **Settings → Web UI access** and list the IPs/networks allowed to open the page, e.g. your office IP or VPN range. Everyone else is refused before they can even reach the login form.
+  - Connections from the host itself (`localhost`, e.g. through an ssh tunnel) always work.
+  - The UI refuses a list that would lock out the IP you're saving it from.
+  - From an ssh session: `pve-gateway ui-allow 203.0.113.7 10.20.0.0/24`, or `pve-gateway ui-allow any` to undo.
+- **Login protection:**
+  - After 5 failed logins an IP is blocked for 15 minutes.
+  - Only one login per IP is checked at a time, so parallel guessing doesn't help.
+  - Proxmox accounts with **two-factor (TOTP)** work: the login asks for the code.
+- **Sessions** are tied to the IP and browser they were created from, so a copied cookie is useless elsewhere. Browsers don't separate cookies by port, so a guest service you open on the same host IP could otherwise see it.
+- **Hostname check:** the UI only answers to IP addresses, this host's own names, and hostnames you add (Settings, or `pve-gateway ui-host pve.example.com`). This blocks DNS-rebinding attacks.
 
 ## Config: `/etc/pve-gateway/config.json`
 
