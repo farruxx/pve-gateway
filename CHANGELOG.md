@@ -4,6 +4,15 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.4.0 - 2026-10-16
+- Monitor tab - health checks: HTTP(S) (expected status, certificate expiry), TCP and ping checks on guests and
+  domains every N seconds; up / failing / down status, response time, uptime, last 60 results. "Add checks for my
+  domains & ports" creates one check per domain and port rule. CLI: `pve-gateway monitors`.
+- Alerts when a check goes down (after N failures in a row), comes back up, or a certificate is about to expire:
+  e-mail (the host's sendmail/postfix), webhook (Slack, Discord, any URL) and Telegram; "Send test alert".
+- Port scanner: TCP connect scan from the host (common ports, ranges up to 5000 ports) with service names and risk
+  levels; limited to this host, private networks and known guests. CLI: `pve-gateway scan IP [PORTS]`.
+
 ## 1.3.0 - 2026-10-16
 - While domains exist, ports 80/443 to this host are reserved for nginx here: a rule at the top of pve-gateway's nat
   chain stops DNAT rules from other tools (e.g. old port forwards to a firewall VM) from sending them to a guest, and

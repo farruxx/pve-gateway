@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.4.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -83,6 +83,9 @@ DEFAULTS = {
     "update_ref": "master",
     "update_check": True,
     "auto_update": False,  # install new versions automatically after the daily check
+    # Monitoring: health checks of guests/domains and where to send alerts (secrets masked in the API/debug)
+    "monitors": [],
+    "alerts": {"email": "", "webhook": "", "telegram_token": "", "telegram_chat": "", "fail_after": 2, "cert_days": 14},
 }
 
 LOCK = threading.RLock()
@@ -141,6 +144,14 @@ def load_config():
         except (ApiError, ValueError) as e:
             log("skipping invalid wildcard %r: %s" % (w.get("zone") or w.get("id"), e), "warn")
     cfg["wildcards"] = wildcards
+    mons = []
+    for m in cfg.get("monitors", []):
+        try:
+            mons.append(validate_monitor(m, mons, m.get("id")))
+        except (ApiError, ValueError) as e:
+            log("skipping invalid check %r: %s" % (m.get("name") or m.get("id"), e), "warn")
+    cfg["monitors"] = mons
+    cfg["alerts"] = dict(DEFAULTS["alerts"], **(cfg.get("alerts") or {}))
     domains = []
     for d in cfg.get("domains", []):
         try:
@@ -1829,6 +1840,10 @@ def checks():
             add("apt repositories", "warn", "Proxmox enterprise repos are enabled (%s) but there is no subscription, so "
                 "apt update fails with 401 - switch to no-subscription: curl -fsSL %s/master/install.sh | sh -s -- fix-repos"
                 % (", ".join(repos), REPO_RAW))
+    down = [m["name"] or m["target"] for m in cfg.get("monitors", []) if MON.get(m["id"], {}).get("status") == "down"]
+    if cfg.get("monitors"):
+        add("health checks", "fail" if down else "ok", ("down: " + ", ".join(down)) if down else
+            "%d checks, all up or pending" % len(cfg["monitors"]))
     info = update_info()
     if info["available"]:
         add("pve-gateway version", "warn", "%s installed, %s available - update in Settings or run: pve-gateway update"
@@ -1932,7 +1947,7 @@ def sections():
         rc, out = sh(["iptables-save", "-c", "-t", table])
         return "\n".join(line for line in out.splitlines() if "PVEGW" in line) or "(none loaded)" if rc == 0 else out
 
-    safe_cfg = dict(cfg, pass_hash="***" if cfg.get("pass_hash") else "")
+    safe_cfg = dict(cfg, pass_hash="***" if cfg.get("pass_hash") else "", alerts=masked_alerts(cfg.get("alerts", {})))
     return [
         {"title": "Service log", "text": "\n".join(LOGS) or "(empty)", "open": True},
         {"title": "Generated ruleset (iptables-restore input)", "text": build_ruleset(cfg)},
@@ -1983,12 +1998,12 @@ def report_text(d):
     return "\n".join(out) + "\n"
 
 
-def tcp_probe(ip, port):
+def tcp_probe(ip, port, timeout=3):
     """('ok'|'refused'|'timeout'|error text, ms)"""
     if MOCK:
         return MOCK.tcp_probe(ip, port)
-    s = socket.socket()
-    s.settimeout(3)
+    s = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET)
+    s.settimeout(timeout)
     t = time.time()
     try:
         s.connect((ip, port))
@@ -2055,6 +2070,346 @@ def test_rule(r):
         add("return path", "info", "without Masquerade the guest's default gateway must be this host%s"
             % (" (%s)" % src.group(1) if src else ""))
     return steps
+
+
+# --------------------------------------------------------------------------- monitoring
+
+MON_TYPES = ("http", "tcp", "ping")
+MON = {}            # monitor id -> live state
+MON_LOCK = threading.Lock()
+SCANS = {}          # scan id -> {"target", "total", "done", "open", "state", "started"}
+COMMON_PORTS = [21, 22, 23, 25, 53, 80, 81, 88, 110, 111, 135, 139, 143, 389, 443, 445, 465, 514, 587, 631, 636, 853, 873,
+                993, 995, 1080, 1194, 1433, 1521, 1723, 1883, 2049, 2082, 2083, 2181, 2375, 2376, 2379, 3000, 3128, 3306,
+                3389, 3478, 4443, 5000, 5060, 5222, 5432, 5601, 5672, 5900, 5901, 5984, 6379, 6443, 7001, 8000, 8006,
+                8007, 8008, 8080, 8081, 8086, 8088, 8099, 8123, 8200, 8443, 8888, 9000, 9042, 9090, 9092, 9100, 9200,
+                9300, 9418, 9443, 10000, 10050, 10051, 10250, 10443, 11211, 15672, 25565, 27017, 51820]
+SERVICE_NAMES = {21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP", 110: "POP3", 111: "rpcbind",
+                 139: "SMB", 143: "IMAP", 389: "LDAP", 443: "HTTPS", 445: "SMB", 465: "SMTPS", 587: "SMTP submission",
+                 993: "IMAPS", 995: "POP3S", 1194: "OpenVPN", 1433: "MS SQL", 1521: "Oracle", 1883: "MQTT", 2049: "NFS",
+                 2375: "Docker API", 2376: "Docker API (TLS)", 3000: "web app", 3128: "Proxmox spice / proxy",
+                 3306: "MySQL/MariaDB", 3389: "RDP", 3478: "STUN/TURN", 5060: "SIP", 5432: "PostgreSQL",
+                 5672: "AMQP", 5900: "VNC", 6379: "Redis", 6443: "Kubernetes API", 8006: "Proxmox VE", 8007: "Proxmox Backup",
+                 8080: "HTTP alt", 8086: "InfluxDB", 8099: "pve-gateway", 8443: "HTTPS alt", 9000: "web app",
+                 9090: "Prometheus", 9100: "node_exporter", 9200: "Elasticsearch", 10050: "Zabbix agent",
+                 10250: "kubelet", 11211: "memcached", 15672: "RabbitMQ", 25565: "Minecraft", 27017: "MongoDB",
+                 51820: "WireGuard"}
+
+
+def port_risk(port):
+    if port in RISKY_PORTS or 5900 <= port <= 5999 or port in (23, 21, 1433, 1521, 3389):
+        return "high"
+    if port in (22, 8006, 8007, 8099, 3128, 10000, 6443, 2379):
+        return "admin"
+    return "low"
+
+
+def parse_port_list(spec, limit=5000):
+    """"common" | "22,80,8000-8100" -> sorted ports."""
+    spec = str(spec or "common").strip().lower()
+    if spec == "common":
+        return list(COMMON_PORTS)
+    ports = set()
+    for part in re.split(r"[\s,]+", spec):
+        if part:
+            a, b = parse_ports(part)
+            ports.update(range(a, b + 1))
+            if len(ports) > limit:
+                raise ApiError("at most %d ports per scan" % limit)
+    if not ports:
+        raise ApiError("no ports given")
+    return sorted(ports)
+
+
+def validate_monitor(data, others, mid=None):
+    if not isinstance(data, dict):
+        raise ApiError("check must be an object")
+    m = {"id": mid or uuid.uuid4().hex[:8]}
+    m["name"] = str(data.get("name", "")).strip()
+    if not NAME_RE.match(m["name"]):
+        raise ApiError("name: max 40 chars, letters/digits/space/_.:/@+- only")
+    m["type"] = str(data.get("type", "http"))
+    if m["type"] not in MON_TYPES:
+        raise ApiError("type must be http, tcp or ping")
+    t = str(data.get("target", "")).strip()
+    if m["type"] == "http":
+        u = urllib.parse.urlsplit(t)
+        if u.scheme not in ("http", "https") or not u.hostname or len(t) > 300 or any(c in t for c in " \r\n"):
+            raise ApiError("target must be a URL like https://cloud.example.com/health")
+    elif m["type"] == "tcp":
+        host, _, port = t.rpartition(":")
+        if not host or not port.isdigit() or not 1 <= int(port) <= 65535 or not HOSTNAME_RE.match(host.lower().strip("[]")) \
+                and not _is_ip(host.strip("[]")):
+            raise ApiError("target must be host:port, e.g. 10.10.10.11:5432")
+    elif not (HOSTNAME_RE.match(t.lower()) or _is_ip(t)):
+        raise ApiError("target must be an IP address or hostname")
+    m["target"] = t
+    try:
+        m["interval"] = int(data.get("interval", 60))
+        m["timeout"] = int(data.get("timeout", 5))
+    except (TypeError, ValueError):
+        raise ApiError("interval and timeout must be numbers (seconds)")
+    if not 30 <= m["interval"] <= 86400 or not 1 <= m["timeout"] <= 30:
+        raise ApiError("interval: 30-86400 s, timeout: 1-30 s")
+    m["expect"] = str(data.get("expect", "200-399") or "200-399").strip()
+    if not re.match(r"^\d{3}(-\d{3})?$", m["expect"]):
+        raise ApiError("expected status: e.g. 200 or 200-399")
+    m["verify_tls"] = bool(data.get("verify_tls", True))
+    m["alert"] = bool(data.get("alert", True))
+    m["enabled"] = bool(data.get("enabled", True))
+    if len(others) >= 200:
+        raise ApiError("at most 200 checks")
+    return m
+
+
+def _is_ip(x):
+    try:
+        ipaddress.ip_address(x)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_alerts(data, old):
+    a = dict(old or {})
+    for k in ("email", "webhook", "telegram_token", "telegram_chat"):
+        if k in data:
+            v = str(data[k] or "").strip()
+            if v == "saved":  # masked value sent back unchanged
+                continue
+            if len(v) > 500 or any(c in v for c in "\r\n"):
+                raise ApiError("invalid %s" % k)
+            a[k] = v
+    if a.get("email") and not all(EMAIL_RE.match(e.strip()) for e in a["email"].split(",")):
+        raise ApiError("invalid alert e-mail address")
+    if a.get("webhook") and not re.match(r"^https?://[^\s]+$", a["webhook"]):
+        raise ApiError("webhook must be an http(s) URL")
+    if a.get("telegram_token") and not re.match(r"^\d+:[\w-]{20,}$", a["telegram_token"]):
+        raise ApiError("Telegram bot token looks wrong (format 123456:ABC...)")
+    for k, lo, hi in (("fail_after", 1, 20), ("cert_days", 1, 60)):
+        if k in data:
+            try:
+                a[k] = int(data[k])
+            except (TypeError, ValueError):
+                raise ApiError("%s must be a number" % k)
+            if not lo <= a[k] <= hi:
+                raise ApiError("%s: %d-%d" % (k, lo, hi))
+    return a
+
+
+def masked_alerts(a):
+    return dict(a, telegram_token="saved" if a.get("telegram_token") else "", webhook="saved" if a.get("webhook") else "")
+
+
+def send_alert(subject, text):
+    """Send to every configured channel, in the background. Failures are logged, never raised."""
+    a = STATE["cfg"].get("alerts", {})
+    host = socket.gethostname()
+    msg = "[pve-gateway %s] %s\n%s" % (host, subject, text)
+
+    def job():
+        sent = []
+        if MOCK:
+            log("[mock] alert (not sent): %s - %s" % (subject, text), "warn")
+            return
+        if a.get("email"):
+            mail = "To: %s\nSubject: [pve-gateway %s] %s\nContent-Type: text/plain; charset=utf-8\n\n%s\n" % (
+                a["email"], host, subject, text)
+            rc, out = run(["sendmail", "-t"], data=mail, timeout=30)
+            sent.append("e-mail" if rc == 0 else "e-mail failed (%s)" % out[:80])
+        for name, url, body in (
+                ("webhook", a.get("webhook"), {"text": msg, "content": msg}),
+                ("telegram", "https://api.telegram.org/bot%s/sendMessage" % a["telegram_token"]
+                 if a.get("telegram_token") and a.get("telegram_chat") else None, {"chat_id": a.get("telegram_chat"), "text": msg})):
+            if not url:
+                continue
+            try:
+                req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json",
+                                                                                "User-Agent": "pve-gateway/" + VERSION})
+                urllib.request.urlopen(req, timeout=15).read()
+                sent.append(name)
+            except Exception as e:
+                sent.append("%s failed (%s)" % (name, str(e)[:80]))
+        log("alert '%s': %s" % (subject, ", ".join(sent) or "no channel configured"), "info" if sent else "warn")
+
+    threading.Thread(target=job, daemon=True).start()
+
+
+def tls_cert_days(host, port, timeout):
+    """Days until the (verified) certificate of host:port expires, or None."""
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                end = tls.getpeercert().get("notAfter")
+        return int((ssl.cert_time_to_seconds(end) - time.time()) // 86400) if end else None
+    except (OSError, ssl.SSLError, ValueError):
+        return None
+
+
+def run_monitor(m):
+    """One check: (ok, ms, detail, cert_days)."""
+    t, start = m["target"], time.time()
+    if m["type"] == "ping":
+        host = t
+        rc, out = sh(["ping", "-c", "1", "-W", str(m["timeout"]), host], timeout=m["timeout"] + 3)
+        ms = re.search(r"time=([\d.]+) ms", out or "")
+        return rc == 0, float(ms.group(1)) if ms else (time.time() - start) * 1000, "reply" if rc == 0 else "no reply", None
+    if m["type"] == "tcp":
+        host, _, port = t.rpartition(":")
+        res, ms = tcp_probe(host.strip("[]"), int(port), timeout=m["timeout"])
+        return res == "ok", ms, "connected" if res == "ok" else res, None
+    if MOCK:
+        return MOCK.monitor_http(m)
+    u = urllib.parse.urlsplit(t)
+    lo, _, hi = m["expect"].partition("-")
+    ctx = ssl.create_default_context() if m["verify_tls"] else ssl._create_unverified_context()
+    try:
+        req = urllib.request.Request(t, headers={"User-Agent": "pve-gateway-monitor/" + VERSION})
+        try:
+            r = urllib.request.urlopen(req, timeout=m["timeout"], context=ctx)
+            status = r.status
+            r.read(65536)
+        except urllib.error.HTTPError as e:
+            status = e.code
+        ms = (time.time() - start) * 1000
+        ok = int(lo) <= status <= int(hi or lo)
+        days = tls_cert_days(u.hostname, u.port or 443, m["timeout"]) if u.scheme == "https" and m["verify_tls"] else None
+        return ok, ms, "HTTP %d" % status + ("" if ok else " (expected %s)" % m["expect"]), days
+    except Exception as e:
+        reason = getattr(e, "reason", e)
+        return False, (time.time() - start) * 1000, str(reason)[:200], None
+
+
+def record_result(m, ok, ms, detail, days):
+    a = STATE["cfg"].get("alerts", {})
+    now = time.time()
+    with MON_LOCK:
+        st = MON.setdefault(m["id"], {"status": "unknown", "since": now, "fails": 0, "history": deque(maxlen=288),
+                                      "cert_alerted": 0})
+        st.update(checked=now, ms=round(ms, 1), detail=detail, cert_days=days, running=False)
+        st["history"].append((int(now), bool(ok), round(ms, 1)))
+        prev = st["status"]
+        if ok:
+            st["fails"] = 0
+            if prev != "up":
+                st.update(status="up", since=now)
+                if prev == "down" and m["alert"]:
+                    send_alert("UP: %s" % (m["name"] or m["target"]), "%s is reachable again (%s, %.0f ms)" % (m["target"], detail, ms))
+        else:
+            st["fails"] += 1
+            if st["fails"] >= a.get("fail_after", 2) and prev != "down":
+                st.update(status="down", since=now)
+                if m["alert"]:
+                    send_alert("DOWN: %s" % (m["name"] or m["target"]), "%s failed %d times in a row: %s"
+                               % (m["target"], st["fails"], detail))
+        if days is not None and days < a.get("cert_days", 14) and m["alert"] and now - st["cert_alerted"] > 86400:
+            st["cert_alerted"] = now
+            send_alert("CERTIFICATE: %s" % (m["name"] or m["target"]), "the certificate of %s expires in %d days" % (m["target"], days))
+
+
+def check_now(m):
+    with MON_LOCK:
+        MON.setdefault(m["id"], {"status": "unknown", "since": time.time(), "fails": 0, "history": deque(maxlen=288),
+                                 "cert_alerted": 0})["running"] = True
+    try:
+        record_result(m, *run_monitor(m))
+    except Exception as e:
+        record_result(m, False, 0, "check crashed: %s" % e, None)
+
+
+def monitor_loop():
+    """Run due checks, at most 8 at a time."""
+    pool = ThreadPoolExecutor(8)
+    time.sleep(3)
+    while True:
+        now = time.time()
+        for m in list(STATE["cfg"].get("monitors", [])):
+            st = MON.get(m["id"], {})
+            if m["enabled"] and not st.get("running") and now - st.get("checked", 0) >= m["interval"]:
+                with MON_LOCK:
+                    MON.setdefault(m["id"], {"status": "unknown", "since": now, "fails": 0,
+                                             "history": deque(maxlen=288), "cert_alerted": 0})["running"] = True
+                pool.submit(check_now, m)
+        time.sleep(5)
+
+
+def monitor_status():
+    out = {}
+    with MON_LOCK:
+        for mid, st in MON.items():
+            h = list(st["history"])
+            out[mid] = {k: st.get(k) for k in ("status", "since", "checked", "ms", "detail", "cert_days", "running", "fails")}
+            out[mid]["uptime"] = round(100.0 * sum(1 for x in h if x[1]) / len(h), 1) if h else None
+            out[mid]["history"] = [[x[0], 1 if x[1] else 0, x[2]] for x in h[-60:]]
+    return out
+
+
+def suggest_monitors(cfg):
+    """Checks for every domain and enabled port rule that isn't monitored yet."""
+    have = {m["target"] for m in cfg.get("monitors", [])}
+    new = []
+    for d in cfg["domains"]:
+        if d["enabled"]:
+            url = "%s://%s/" % ("https" if d["tls"] != "none" else "http", d["domain"])
+            if url not in have:
+                new.append({"name": d["domain"][:40], "type": "http", "target": url, "expect": "200-499"})
+    for r in cfg["rules"]:
+        if r["enabled"] and "tcp" in protos(r["proto"]):
+            port = r["int_port"] or r["ext_port"].split("-")[0]
+            t = "%s:%s" % (r["ip"], port)
+            if t not in have and not any(x["target"] == t for x in new):
+                new.append({"name": (r["name"] or t)[:40], "type": "tcp", "target": t})
+    return new
+
+
+def scan_allowed(ip):
+    """Only this host, private/local ranges and known guests - never arbitrary internet hosts."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    own = {n["ip"] for n in host_networks()}
+    guests = {i for g in GUEST_CACHE.get("data") or [] for i in g.get("ips", [])}
+    return a.is_private or a.is_loopback or ip in own or ip in guests
+
+
+def start_scan(target, ports):
+    if not scan_allowed(target):
+        raise ApiError("only this host's addresses, private networks and known guests can be scanned")
+    if sum(1 for x in SCANS.values() if x["state"] == "running") >= 2:
+        raise ApiError("two scans are already running - wait for them to finish", 429)
+    sid = uuid.uuid4().hex[:8]
+    SCANS[sid] = {"id": sid, "target": target, "total": len(ports), "done": 0, "open": [], "state": "running",
+                  "started": time.time()}
+    for k in sorted(SCANS, key=lambda k: SCANS[k]["started"])[:-6]:
+        SCANS.pop(k, None)
+
+    def probe(port):
+        if MOCK:
+            ok = MOCK.port_open(target, port)
+        else:
+            try:
+                with socket.create_connection((target, port), 0.8):
+                    ok = True
+            except OSError:
+                ok = False
+        SCANS[sid]["done"] += 1
+        if ok:
+            try:
+                name = SERVICE_NAMES.get(port) or socket.getservbyport(port, "tcp")
+            except OSError:
+                name = ""
+            SCANS[sid]["open"].append({"port": port, "service": name, "risk": port_risk(port)})
+
+    def job():
+        with ThreadPoolExecutor(64) as ex:
+            list(ex.map(probe, ports))
+        SCANS[sid]["open"].sort(key=lambda x: x["port"])
+        SCANS[sid]["state"] = "done"
+        log("port scan of %s: %d open of %d" % (target, len(SCANS[sid]["open"]), len(ports)))
+
+    threading.Thread(target=job, daemon=True).start()
+    return SCANS[sid]
 
 
 # --------------------------------------------------------------------------- updates
@@ -2397,6 +2752,70 @@ class Handler(BaseHTTPRequestHandler):
                 "wildcards": cfg["wildcards"], "wildcard_status": wildcard_status(cfg), "dns_providers": DNS_PROVIDERS,
                 "nginx": {"last_apply": NGINX["last_apply"], "last_error": NGINX["last_error"]},
             })
+        if path == "/api/monitors" and method == "GET":
+            return self.send(200, {"monitors": cfg.get("monitors", []), "status": monitor_status(),
+                                   "alerts": masked_alerts(cfg.get("alerts", {})),
+                                   "scans": sorted(SCANS.values(), key=lambda x: -x["started"])})
+        if path == "/api/monitors/suggest" and method == "POST":
+            with LOCK:
+                mons = list(STATE["cfg"].get("monitors", []))
+                added = [validate_monitor(m, mons) for m in suggest_monitors(STATE["cfg"])]
+                new = dict(STATE["cfg"], monitors=mons + added)
+                save_config(new)
+                STATE["cfg"] = new
+            for m in added:
+                threading.Thread(target=check_now, args=(m,), daemon=True).start()
+            return self.send(200, {"added": len(added)})
+        m = re.match(r"^/api/monitors(?:/([0-9a-f]{1,16}))?(/run)?$", path)
+        if m:
+            mid = m.group(1)
+            if m.group(2):
+                mon = next((x for x in cfg.get("monitors", []) if x["id"] == mid), None)
+                if not mon or method != "POST":
+                    raise ApiError("check not found", 404)
+                check_now(mon)
+                return self.send(200, {"status": monitor_status().get(mid)})
+            with LOCK:
+                mons = list(STATE["cfg"].get("monitors", []))
+                idx = next((i for i, x in enumerate(mons) if x["id"] == mid), None) if mid else None
+                if mid and idx is None:
+                    raise ApiError("check not found", 404)
+                if method == "POST" and not mid:
+                    mon = validate_monitor(self.body(), mons)
+                    mons.append(mon)
+                elif method == "PUT" and mid:
+                    mon = validate_monitor(self.body(), [x for x in mons if x["id"] != mid], mid)
+                    mons[idx] = mon
+                elif method == "DELETE" and mid:
+                    mons.pop(idx)
+                    mon = None
+                    with MON_LOCK:
+                        MON.pop(mid, None)
+                else:
+                    raise ApiError("method not allowed", 405)
+                new = dict(STATE["cfg"], monitors=mons)
+                save_config(new)
+                STATE["cfg"] = new
+            if mon and mon["enabled"]:
+                threading.Thread(target=check_now, args=(mon,), daemon=True).start()
+            return self.send(200, {"ok": True})
+        if path == "/api/alerts" and method == "PUT":
+            with LOCK:
+                new = dict(STATE["cfg"], alerts=validate_alerts(self.body(), STATE["cfg"].get("alerts")))
+                save_config(new)
+                STATE["cfg"] = new
+            return self.send(200, {"alerts": masked_alerts(new["alerts"])})
+        if path == "/api/alerts/test" and method == "POST":
+            send_alert("test alert", "If you can read this, alerts from pve-gateway reach you.")
+            return self.send(200, {"ok": True})
+        if path == "/api/scan" and method == "POST":
+            d = self.body()
+            return self.send(200, start_scan(str(d.get("target", "")).strip(), parse_port_list(d.get("ports", "common"))))
+        m = re.match(r"^/api/scan/([0-9a-f]{1,16})$", path)
+        if m and method == "GET":
+            if m.group(1) not in SCANS:
+                raise ApiError("scan not found", 404)
+            return self.send(200, SCANS[m.group(1)])
         if path == "/api/update" and method == "GET":
             return self.send(200, update_info())
         if path == "/api/update/check" and method == "POST":
@@ -2686,6 +3105,7 @@ def serve(cfg):
     apply_nginx()
     threading.Thread(target=watchdog, daemon=True).start()
     threading.Thread(target=update_checker, daemon=True).start()
+    threading.Thread(target=monitor_loop, daemon=True).start()
     try:
         httpd = Server((cfg["listen"], int(cfg["port"])), Handler)
     except OSError as e:
@@ -2730,7 +3150,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="app" hidden>
   <header>
     <h1 class="brand"><img src="/favicon.svg" alt="" width="26" height="26">PVE Gateway</h1>
-    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
+    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#monitor" data-view="monitor">Monitor</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
     <div id="status" class="chips"></div>
     <span class="spacer"></span>
     <span id="who" class="muted"></span>
@@ -2780,6 +3200,46 @@ INDEX_HTML = r"""<!doctype html>
     <p class="muted small">nginx on this host answers on ports 80/443 and proxies each domain to a guest
       (<code>/etc/nginx/conf.d/pve-gateway.conf</code>). With Let's Encrypt, certbot gets and renews certificates automatically.
       DNS must point at this host's public IP, and if the host is behind a router, the router must forward ports 80 and 443 to it.</p>
+  </main>
+  <main id="view-monitor" hidden>
+    <div class="bar">
+      <button id="addMonBtn">+ Add check</button>
+      <button id="suggestMon" class="ghost" title="HTTP checks for every domain, TCP checks for every port rule">Add checks for my domains &amp; ports</button>
+      <span id="monMsg" class="muted small"></span>
+    </div>
+    <div class="card scroll">
+      <table>
+        <thead><tr><th>Status</th><th>Name</th><th>Target</th><th>Last 60</th><th class="num">Response</th><th class="num">Uptime</th><th>Since</th><th></th></tr></thead>
+        <tbody id="monitors"></tbody>
+      </table>
+      <p id="monEmpty" class="muted pad" hidden>No health checks yet. Click <b>Add checks for my domains &amp; ports</b> to start with one check per domain and port rule.</p>
+    </div>
+    <div class="sub-head"><h2>Alerts</h2></div>
+    <div class="card form-card" id="alertsCard">
+      <p class="muted small">Sent when a check goes down (after the configured number of failures), comes back up, or a certificate is about to expire.</p>
+      <div class="grid">
+        <label>E-mail to<input id="alEmail" placeholder="you@example.com (uses this host's mail system)"></label>
+        <label>Webhook URL<input id="alHook" placeholder="Slack / Discord / any URL (JSON POST)"></label>
+        <label>Telegram bot token<input id="alTgToken" type="password" autocomplete="off" placeholder="123456:ABC…"></label>
+        <label>Telegram chat id<input id="alTgChat" placeholder="e.g. 123456789"></label>
+        <label>Alert after failures in a row<input id="alFails" inputmode="numeric"></label>
+        <label>Warn when a certificate expires within (days)<input id="alCert" inputmode="numeric"></label>
+      </div>
+      <p id="alErr" class="err"></p>
+      <div class="actions"><span id="alMsg" class="muted small"></span><button type="button" class="ghost" id="alTest">Send test alert</button><button type="button" id="alSave">Save</button></div>
+    </div>
+    <div class="sub-head"><h2>Port scanner</h2></div>
+    <div class="card form-card">
+      <p class="muted small">TCP scan from this host. It shows what this host can reach - the view from the internet can differ (provider firewall, rules that only match outside traffic). Only this host, private networks and your guests can be scanned.</p>
+      <div class="grid">
+        <label>Target<input id="scanTarget" list="scanTargets" placeholder="IP address" autocomplete="off"><datalist id="scanTargets"></datalist></label>
+        <label>Ports<select id="scanPorts"><option value="common">~90 common ports</option><option value="1-1024">1-1024</option><option value="1-5000">1-5000</option><option value="custom">custom…</option></select></label>
+        <label class="wide" id="scanCustomRow" hidden>Custom ports<input id="scanCustom" placeholder="22,80,443,8000-8100"></label>
+      </div>
+      <p id="scanErr" class="err"></p>
+      <div class="actions"><span id="scanMsg" class="muted small"></span><button type="button" id="scanBtn">Scan</button></div>
+      <div class="scroll"><table id="scanTable" hidden><thead><tr><th class="num">Port</th><th>Service</th><th>Risk</th></tr></thead><tbody id="scanRows"></tbody></table></div>
+    </div>
   </main>
   <main id="view-settings" hidden>
     <div class="card form-card">
@@ -2869,6 +3329,25 @@ INDEX_HTML = r"""<!doctype html>
     <p class="hint">Credentials are stored on this host only (mode 0600) and are never shown again.</p>
     <p id="wcErr" class="err"></p>
     <div class="actions"><button type="button" id="wcCancel" class="ghost">Cancel</button><button type="submit">Save &amp; issue</button></div>
+  </form>
+</dialog>
+
+<dialog id="monDlg">
+  <form id="monForm" class="form">
+    <h2 id="monTitle">Add check</h2>
+    <div class="grid">
+      <label>Name<input name="name" maxlength="40" placeholder="e.g. website"></label>
+      <label>Type<select name="type"><option value="http">HTTP(S)</option><option value="tcp">TCP port</option><option value="ping">Ping</option></select></label>
+      <label class="wide">Target<input name="target" required autocapitalize="off" spellcheck="false"></label>
+      <label>Every (seconds)<input name="interval" inputmode="numeric" value="60"></label>
+      <label>Timeout (seconds)<input name="timeout" inputmode="numeric" value="5"></label>
+      <label class="http-only">Expected status<input name="expect" value="200-399"></label>
+      <label class="check wide http-only"><input type="checkbox" name="verify_tls" checked> Verify the TLS certificate (and warn before it expires)</label>
+      <label class="check wide"><input type="checkbox" name="alert" checked> Send alerts for this check</label>
+      <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled</label>
+    </div>
+    <p id="monErr" class="err"></p>
+    <div class="actions"><button type="button" id="monCancel" class="ghost">Cancel</button><button type="submit">Save</button></div>
   </form>
 </dialog>
 
@@ -2984,6 +3463,10 @@ button.net{display:inline-flex;gap:6px;align-items:center;background:var(--bg);c
 padding:3px 10px;font-weight:400;font-size:12px;border-radius:99px}
 button.net:hover{border-color:var(--muted)}button.net.wan{border-color:var(--accent)}
 .net .nif{font-weight:600}.ntag{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--accent)}.ntag.pub{color:var(--ok)}
+.bars{display:flex;gap:1px;align-items:flex-end;height:18px}.bars i{width:3px;height:100%;border-radius:1px;background:var(--ok);opacity:.85}
+.bars i.no{background:var(--bad)}.pill.up{background:var(--ok-bg);color:var(--ok)}.pill.down{background:var(--bad-bg);color:var(--bad)}
+.pill.unknown{background:var(--line);color:var(--muted)}.pill.failing{background:var(--warn-bg);color:var(--warn)}.pill.high{background:var(--bad-bg);color:var(--bad)}
+.pill.admin{background:var(--warn-bg);color:var(--warn)}.pill.low{background:var(--line);color:var(--muted)}
 .sub-head{display:flex;align-items:center;gap:10px;margin:22px 0 10px}.sub-head h2{margin:0;font-size:15px}
 .sub-head button{padding:4px 12px;font-size:13px}
 .hint{margin:-4px 0 0;font-size:12px;color:var(--muted)}.hint.bad{color:var(--bad)}
@@ -3054,6 +3537,7 @@ async function load() {
   if (!load.started) { load.started = true; setView(); }
   if (!timer) timer = setInterval(() => {
     if (!document.hidden && view !== 'debug' && view !== 'settings' && ![...document.querySelectorAll('dialog')].some(x => x.open)) load().catch(() => {});
+    if (!document.hidden && view === 'monitor' && !$('#monDlg').open) loadMonitor();
   }, 5000);
 }
 
@@ -3512,6 +3996,114 @@ $('#dbgVerbose').onchange = async e => {
   catch (err) { e.target.checked = !e.target.checked; $('#dbgMsg').textContent = err.message; }
 };
 
+// ---- monitoring
+let MONS = {monitors: [], status: {}, alerts: {}}, editingMon = null;
+const since = t => { if (!t) return '—'; const m = Math.round((Date.now() / 1000 - t) / 60);
+  return m < 1 ? 'just now' : m < 60 ? m + ' min' : m < 1440 ? Math.round(m / 60) + ' h' : Math.round(m / 1440) + ' d'; };
+async function loadMonitor() {
+  try { MONS = await api('GET', '/api/monitors'); renderMonitor(); } catch (e) { $('#monMsg').textContent = e.message; }
+}
+function renderMonitor() {
+  const tb = $('#monitors'); tb.replaceChildren();
+  $('#monEmpty').hidden = MONS.monitors.length > 0;
+  for (const m of MONS.monitors) {
+    const st = MONS.status[m.id] || {status: 'unknown'};
+    const s = !m.enabled ? 'unknown' : st.status !== 'down' && st.fails > 0 ? 'failing' : st.status;
+    tb.append(el('tr', {class: m.enabled ? '' : 'off'},
+      el('td', {}, el('span', {class: 'pill ' + s, textContent: m.enabled ? (st.running ? '…' : s) : 'off', title: st.detail || ''})),
+      el('td', {class: 'names'}, m.name || '—', el('span', {class: 'alias', textContent: m.type.toUpperCase() + ' · every ' + m.interval + 's'})),
+      el('td', {class: 'mono', textContent: m.target, title: st.detail || ''}),
+      el('td', {}, el('div', {class: 'bars', title: 'last checks, oldest left'}, ...(st.history || []).map(h =>
+        el('i', {class: h[1] ? '' : 'no', title: new Date(h[0] * 1000).toLocaleTimeString() + ' · ' + (h[1] ? h[2] + ' ms' : 'failed')})))),
+      el('td', {class: 'num', textContent: st.ms != null ? Math.round(st.ms) + ' ms' : '—'}),
+      el('td', {class: 'num', textContent: st.uptime != null ? st.uptime + ' %' : '—',
+        title: st.cert_days != null ? 'certificate expires in ' + st.cert_days + ' days' : ''}),
+      el('td', {class: 'small', textContent: since(st.since) + (st.cert_days != null && st.cert_days < 21 ? ' · cert ' + st.cert_days + 'd' : '')}),
+      el('td', {class: 'num'},
+        el('button', {class: 'link', textContent: 'Run', onclick: async () => {
+          try { await api('POST', '/api/monitors/' + m.id + '/run', {}); } catch (e) { $('#monMsg').textContent = e.message; }
+          loadMonitor(); }}),
+        el('button', {class: 'link', textContent: 'Edit', onclick: () => openMonDlg(m)}),
+        el('button', {class: 'link del', textContent: 'Delete', onclick: async () => {
+          if (!confirm('Delete check "' + (m.name || m.target) + '"?')) return;
+          await api('DELETE', '/api/monitors/' + m.id).catch(e => $('#monMsg').textContent = e.message); loadMonitor(); }}))));
+  }
+  const a = MONS.alerts || {};
+  if (!document.activeElement || !document.activeElement.closest('#alertsCard')) {
+    $('#alEmail').value = a.email || ''; $('#alHook').value = a.webhook || ''; $('#alTgToken').value = a.telegram_token || '';
+    $('#alTgChat').value = a.telegram_chat || ''; $('#alFails').value = a.fail_after || 2; $('#alCert').value = a.cert_days || 14;
+  }
+}
+function monTypeChanged() {
+  const f = $('#monForm'), t = f.type.value;
+  for (const x of document.querySelectorAll('#monForm .http-only')) x.hidden = t !== 'http';
+  f.target.placeholder = {http: 'https://cloud.example.com/health', tcp: '10.10.10.11:5432', ping: '10.10.10.11'}[t];
+}
+function openMonDlg(m) {
+  editingMon = m ? m.id : null;
+  const f = $('#monForm');
+  $('#monTitle').textContent = m ? 'Edit check' : 'Add check'; $('#monErr').textContent = '';
+  m = m || {type: 'http', interval: 60, timeout: 5, expect: '200-399', verify_tls: true, alert: true, enabled: true};
+  for (const k of ['name', 'type', 'target', 'interval', 'timeout', 'expect']) f[k].value = m[k] != null ? m[k] : '';
+  for (const k of ['verify_tls', 'alert', 'enabled']) f[k].checked = !!m[k];
+  monTypeChanged(); $('#monDlg').showModal(); f.target.focus();
+}
+$('#monForm').type.addEventListener('change', monTypeChanged);
+$('#monForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = e.target, d = {};
+  for (const k of ['name', 'type', 'target', 'interval', 'timeout', 'expect']) d[k] = f[k].value.trim();
+  for (const k of ['verify_tls', 'alert', 'enabled']) d[k] = f[k].checked;
+  try { await api(editingMon ? 'PUT' : 'POST', editingMon ? '/api/monitors/' + editingMon : '/api/monitors', d); $('#monDlg').close(); loadMonitor(); }
+  catch (err) { $('#monErr').textContent = err.message; }
+});
+$('#monCancel').onclick = () => $('#monDlg').close();
+$('#addMonBtn').onclick = () => openMonDlg(null);
+$('#suggestMon').onclick = async () => {
+  try { const r = await api('POST', '/api/monitors/suggest', {}); $('#monMsg').textContent = r.added ? 'Added ' + r.added + ' check(s)' : 'Every domain and port rule already has a check'; }
+  catch (e) { $('#monMsg').textContent = e.message; }
+  setTimeout(loadMonitor, 1200);
+};
+$('#alSave').onclick = async () => {
+  $('#alErr').textContent = '';
+  try {
+    await api('PUT', '/api/alerts', {email: $('#alEmail').value, webhook: $('#alHook').value, telegram_token: $('#alTgToken').value,
+      telegram_chat: $('#alTgChat').value, fail_after: $('#alFails').value, cert_days: $('#alCert').value});
+    $('#alMsg').textContent = 'Saved'; setTimeout(() => $('#alMsg').textContent = '', 3000); document.activeElement.blur(); loadMonitor();
+  } catch (e) { $('#alErr').textContent = e.message; }
+};
+$('#alTest').onclick = async () => {
+  try { await api('POST', '/api/alerts/test', {}); $('#alMsg').textContent = 'Test alert sent - check your e-mail / chat (and the Debug log if nothing arrives)'; }
+  catch (e) { $('#alErr').textContent = e.message; }
+};
+$('#scanPorts').onchange = e => $('#scanCustomRow').hidden = e.target.value !== 'custom';
+async function fillScanTargets() {
+  const opts = (S.networks || []).map(n => [n.ip, n.iface + ' (this host)']);
+  try { for (const g of (await api('GET', '/api/guests')).guests) for (const ip of g.ips) opts.push([ip, g.vmid + ' ' + g.name]); } catch (e) {}
+  $('#scanTargets').replaceChildren(...opts.map(([v, l]) => el('option', {value: v, label: l})));
+  if (!$('#scanTarget').value && opts.length) $('#scanTarget').value = opts[0][0];
+}
+$('#scanBtn').onclick = async () => {
+  const b = $('#scanBtn'); $('#scanErr').textContent = '';
+  const ports = $('#scanPorts').value === 'custom' ? $('#scanCustom').value : $('#scanPorts').value;
+  b.disabled = true;
+  try {
+    let sc = await api('POST', '/api/scan', {target: $('#scanTarget').value.trim(), ports});
+    while (sc.state === 'running') {
+      $('#scanMsg').textContent = 'Scanning ' + sc.target + '… ' + sc.done + ' / ' + sc.total;
+      await new Promise(r => setTimeout(r, 600));
+      sc = await api('GET', '/api/scan/' + sc.id);
+    }
+    $('#scanMsg').textContent = sc.target + ': ' + sc.open.length + ' open of ' + sc.total + ' scanned';
+    $('#scanTable').hidden = false;
+    $('#scanRows').replaceChildren(...sc.open.map(o => el('tr', {},
+      el('td', {class: 'num mono', textContent: o.port}), el('td', {textContent: o.service || '—'}),
+      el('td', {}, el('span', {class: 'pill ' + o.risk, textContent: o.risk, title: {high: 'should not be reachable from the internet',
+        admin: 'admin access - restrict who can reach it', low: ''}[o.risk]})))));
+  } catch (e) { $('#scanErr').textContent = e.message; }
+  b.disabled = false;
+};
+
 // ---- updates
 const ago = t => { const m = Math.round((Date.now() / 1000 - t) / 60); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.round(m / 60) + ' h ago'; };
 function renderUpdate(u) {
@@ -3588,9 +4180,10 @@ $('#saveSettings').onclick = async () => {
 };
 
 function setView() {
-  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings'}[location.hash] || 'rules';
+  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings', '#monitor': 'monitor'}[location.hash] || 'rules';
   for (const a of document.querySelectorAll('.tabs a')) a.classList.toggle('on', a.dataset.view === view);
-  for (const v of ['rules', 'domains', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
+  for (const v of ['rules', 'domains', 'monitor', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
+  if (view === 'monitor' && !$('#app').hidden) { loadMonitor(); fillScanTargets(); }
   if (view === 'settings' && !$('#app').hidden) loadSettings();
   if ($('#app').hidden) return;
   if (view === 'debug') loadDebug(); else load().catch(() => {});
@@ -3640,6 +4233,8 @@ def main():
   flush            remove all forwarding rules and chains (config is kept)
   passwd           set a local login instead of Proxmox accounts
   update [check]   check GitHub for a new version and install it ("check" = only check)
+  monitors         run every health check once and show the results
+  scan IP [PORTS]  TCP port scan from this host (PORTS: common | 22,80,8000-8100); own/private IPs only
   ui-allow [IP...]  limit the web UI to these IPs/networks ("any" = everyone); no args = show
   ui-host [NAME..] hostnames the UI may be opened by besides IPs ("none" = clear); no args = show
   domains          list domains, wildcard certificates and expiry
@@ -3651,7 +4246,7 @@ local development (macOS etc.):
             "reset, unhook, ip-forward-off, forward-drop, pvefw-first, foreign-dnat, traffic"))
     ap.add_argument("cmd", nargs="?", default="serve",
                     choices=["serve", "status", "test", "debug", "show", "apply", "flush", "passwd", "mock",
-                             "domains", "cert", "ui-allow", "ui-host", "update"])
+                             "domains", "cert", "ui-allow", "ui-host", "update", "monitors", "scan"])
     ap.add_argument("rules", nargs="*", help=argparse.SUPPRESS)
     ap.add_argument("-v", "--verbose", action="store_true", help="log every iptables command and HTTP request")
     ap.add_argument("--version", action="version", version="pve-gateway " + VERSION)
@@ -3682,6 +4277,8 @@ local development (macOS etc.):
             cfg["wildcards"].append(wc)
         for d in MOCK.sample_domains():
             cfg["domains"].append(validate_domain(d, cfg["domains"], cfg))
+        for m in MOCK.sample_monitors():
+            cfg["monitors"].append(validate_monitor(m, cfg["monitors"]))
         cfg["acme_email"] = "admin@example.com"
     if a.port:
         cfg["port"] = a.port
@@ -3697,6 +4294,25 @@ local development (macOS etc.):
         sys.stdout.write(build_ruleset(cfg))
     elif a.cmd == "apply":
         sys.exit(1 if apply_rules() or apply_nginx() else 0)
+    elif a.cmd == "monitors":
+        if not cfg["monitors"]:
+            print("no health checks (add them in the web UI: Monitor tab)")
+        for m in cfg["monitors"]:
+            ok, ms, detail, days = run_monitor(m)
+            print("%-5s %-28s %-5s %-40s %6.0f ms  %s%s" % ("UP" if ok else "DOWN", (m["name"] or "-")[:28], m["type"],
+                  m["target"][:40], ms, detail, "  cert %d days" % days if days is not None else ""))
+    elif a.cmd == "scan":
+        if not a.rules:
+            sys.exit("usage: scan IP [common | 22,80,8000-8100]")
+        try:
+            sc = start_scan(a.rules[0], parse_port_list(a.rules[1] if len(a.rules) > 1 else "common"))
+        except ApiError as e:
+            sys.exit(str(e))
+        while sc["state"] == "running":
+            time.sleep(0.3)
+        print("%s: %d open of %d scanned" % (sc["target"], len(sc["open"]), sc["total"]))
+        for o in sc["open"]:
+            print("  %5d/tcp  %-24s %s" % (o["port"], o["service"], o["risk"]))
     elif a.cmd == "update":
         info = check_update()
         if info["error"]:
