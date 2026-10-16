@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.8.1"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.8.2"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -5083,9 +5083,11 @@ INDEX_HTML = r"""<!doctype html>
 
 APP_CSS = r"""
 :root{--bg:#f5f6f8;--card:#fff;--fg:#1d2330;--muted:#6b7280;--line:#e3e6eb;--accent:#e57000;--accent-fg:#fff;
---ok:#15803d;--ok-bg:#dcfce7;--bad:#b91c1c;--bad-bg:#fee2e2;--warn:#a16207;--warn-bg:#fef9c3;--input:#fff}
+--ok:#15803d;--ok-bg:#dcfce7;--bad:#b91c1c;--bad-bg:#fee2e2;--warn:#a16207;--warn-bg:#fef9c3;--input:#fff;
+--btn:#eef0f3;--btn-line:#c9ced6;--link:#b35500}
 @media (prefers-color-scheme:dark){:root{--bg:#14171c;--card:#1d2128;--fg:#e6e8eb;--muted:#9aa3ae;--line:#2d333c;
---accent:#ff8a1f;--accent-fg:#14171c;--ok:#4ade80;--ok-bg:#14301f;--bad:#f87171;--bad-bg:#3a1717;--warn:#facc15;--warn-bg:#3a3010;--input:#14171c}}
+--accent:#ff8a1f;--accent-fg:#14171c;--ok:#4ade80;--ok-bg:#14301f;--bad:#f87171;--bad-bg:#3a1717;--warn:#facc15;--warn-bg:#3a3010;--input:#14171c;
+--btn:#2a3039;--btn-line:#48515d;--link:#ffa04d}}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -5100,10 +5102,13 @@ main{max-width:1200px;margin:0 auto;padding:16px 20px}
 .bar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
 button{font:inherit;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:7px 14px;border-radius:7px;cursor:pointer;font-weight:600}
 button:disabled{opacity:.5;cursor:default}
-button.ghost{background:transparent;color:var(--fg);border-color:var(--line);font-weight:500}
-button.ghost:hover{border-color:var(--muted)}
-button.link{background:none;border:none;color:var(--muted);padding:4px 6px;font-weight:500}
-button.link:hover{color:var(--fg)}button.link.del:hover{color:var(--bad)}
+button.ghost{background:var(--btn);color:var(--fg);border-color:var(--btn-line);font-weight:600}
+button.ghost:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+/* table/row actions (Edit, Test, Delete): coloured text so they read as buttons, a tint on hover */
+button.link{background:none;border:1px solid transparent;color:var(--link);padding:3px 7px;font-weight:600;border-radius:6px}
+button.link:hover:not(:disabled){background:var(--btn);border-color:var(--btn-line)}
+button.link.del{color:var(--bad)}button.link.del:hover:not(:disabled){background:var(--bad-bg);border-color:transparent}
+button.link:disabled{color:var(--muted)}
 table{width:100%;border-collapse:collapse;white-space:nowrap}
 th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line)}
 th{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}

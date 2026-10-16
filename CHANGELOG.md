@@ -4,6 +4,10 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.8.2 - 2026-10-16
+- Secondary buttons are easier to see: outlined buttons (Re-apply, + VNet, Cancel, ...) get a filled background and
+  a stronger border, and row actions (Test, Edit, Config, ...) are coloured with a hover highlight. Delete is red.
+
 ## 1.8.1 - 2026-10-16
 - Add rule / Add domain: guests whose IP wasn't detected can now be picked too. That fills the name, focuses the
   IP field and says why the IP is unknown, so you can type it yourself.
