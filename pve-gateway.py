@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.2.1"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -2352,11 +2352,11 @@ def serve(cfg):
 INDEX_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PVE Gateway</title><link rel="stylesheet" href="/app.css">
+<title>PVE Gateway</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><link rel="stylesheet" href="/app.css">
 </head><body>
 <div id="login" class="center" hidden>
   <form id="loginForm" class="card login">
-    <h1>PVE Gateway</h1>
+    <h1 class="brand"><img src="/favicon.svg" alt="" width="32" height="32">PVE Gateway</h1>
     <p class="muted" id="loginHint">Sign in with your Proxmox account</p>
     <label>User<input name="username" autocomplete="username" value="root@pam" required></label>
     <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
@@ -2367,7 +2367,7 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 <div id="app" hidden>
   <header>
-    <h1>PVE Gateway</h1>
+    <h1 class="brand"><img src="/favicon.svg" alt="" width="26" height="26">PVE Gateway</h1>
     <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
     <div id="status" class="chips"></div>
     <span class="spacer"></span>
@@ -2548,7 +2548,8 @@ APP_CSS = r"""
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-h1{font-size:17px;margin:0}h2{font-size:16px;margin:0 0 14px}
+h1{font-size:17px;margin:0}
+h1.brand{display:flex;align-items:center;gap:9px}h1.brand img{flex:none;border-radius:6px}h2{font-size:16px;margin:0 0 14px}
 code{font-size:12px;background:var(--line);padding:1px 4px;border-radius:4px}
 header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line)}
 main{max-width:1200px;margin:0 auto;padding:16px 20px}
@@ -3213,10 +3214,14 @@ window.addEventListener('hashchange', setView);
 load().catch(() => {});
 """
 
+# App logo / favicon: a gate (gateway) with three servers (guests) inside. Same file as docs/logo.svg.
+LOGO_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#E57000"/><path d="M14 52V30a18 18 0 0 1 36 0v22" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round"/><g fill="#fff"><rect x="23" y="27" width="18" height="6.5" rx="2"/><rect x="23" y="36" width="18" height="6.5" rx="2"/><rect x="23" y="45" width="18" height="6.5" rx="2"/></g><g fill="#E57000"><circle cx="36.5" cy="30.25" r="1.4"/><circle cx="36.5" cy="39.25" r="1.4"/><circle cx="36.5" cy="48.25" r="1.4"/></g></svg>"""
+
 STATIC = {
     "/": ("text/html", INDEX_HTML),
     "/app.css": ("text/css", APP_CSS),
     "/app.js": ("application/javascript", APP_JS),
+    "/favicon.svg": ("image/svg+xml", LOGO_SVG),
 }
 
 

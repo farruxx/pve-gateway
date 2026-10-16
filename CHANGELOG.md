@@ -4,6 +4,9 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.2.1 - 2026-10-16
+- App logo (a gate with three servers) in the header, on the login page and as the browser favicon.
+
 ## 1.2.0 - 2026-10-16
 - Domains: aliases can redirect (301) to the main domain instead of serving the same site.
 - Domains: "Behind the Cloudflare proxy" option - nginx trusts Cloudflare's ranges and uses the real visitor IP

@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" width="96" height="96" alt="pve-gateway logo"></p>
+
 # pve-gateway
 
 A small web UI that turns a Proxmox VE host into the gateway for its VMs and containers:
