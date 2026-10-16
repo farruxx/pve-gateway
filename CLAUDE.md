@@ -20,8 +20,9 @@ Guidance for AI-assisted work on **pve-gateway**: a web UI that runs on a Proxmo
 | `install.sh` | Installs on a PVE host (`--with-nginx`, `uninstall`) |
 | `pve-gateway.service` | systemd unit |
 | `README.md`, `wildcard.md` | User docs; keep them in sync with behavior changes |
+| `CHANGELOG.md` | Release notes, one `## X.Y.Z - date` section per version; shown in the UI's update card |
 
-`pve-gateway.py` is organised into sections marked `# ---- <name>`: config, validation, iptables, guests/interfaces, domains (nginx), diagnostics, auth, HTTP, UI, main. Keep new code in the matching section.
+`pve-gateway.py` is organised into sections marked `# ---- <name>`: config, validation, iptables, guests/interfaces, domains (nginx), diagnostics, updates, auth, HTTP, UI, main. Keep new code in the matching section.
 
 ## Run and verify
 
@@ -67,6 +68,13 @@ Untested on real hardware means untested: say so rather than claiming it works o
   - The UI must work in light and dark mode and at phone width (tables scroll inside `.card.scroll`).
   - Colors are CSS variables in `:root`.
 - **Diagnostics:** new features should add health checks to `checks()`, raw output to `sections()`, and, where a user can act on it, steps to `test_rule` / `test_domain`. Each check has a status of `ok`, `warn`, `fail` or `info`, plus a detail that says how to fix it.
+
+## Versioning and updates
+
+- `VERSION` in `pve-gateway.py` is the single source of truth (semantic versioning). Any PR with a user-visible change bumps it (patch for fixes, minor for features) and adds a `## X.Y.Z - YYYY-MM-DD` section at the top of `CHANGELOG.md`.
+- Installed copies compare their `VERSION` with the one on `update_ref` (default `master`) and offer the update in Settings. **Merging to `master` is what ships a release.**
+- `run_update()` downloads `pve-gateway.py`, `pve-gateway.service` and `install.sh`, compiles the script and runs the installer through `systemd-run`. The installer restarts the service, so it must not run as a child of it.
+- The web UI is restricted by `ui_allow` (source IPs) and `allowed_hosts` (Host header), and sessions are bound to IP + User-Agent. Tools that log in programmatically, like `dev/screenshots.mjs`, must use the same User-Agent as the browser that uses the cookie.
 
 ## Conventions
 

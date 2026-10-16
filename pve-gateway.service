@@ -1,5 +1,5 @@
 [Unit]
-Description=Port forwarding web UI for Proxmox VE
+Description=pve-gateway: port forwarding and domains for Proxmox VE guests
 After=network-online.target pve-cluster.service pve-firewall.service
 Wants=network-online.target
 
@@ -8,6 +8,16 @@ Type=simple
 ExecStart=/usr/bin/python3 /usr/local/bin/pve-gateway serve
 Restart=on-failure
 RestartSec=3
+# Runs as root (iptables, nginx, certbot, qm/pct); limit what that root process can do.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelModules=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target
