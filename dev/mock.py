@@ -135,6 +135,10 @@ def default_state():
                 "chains": {"PREROUTING": [], "INPUT": [], "OUTPUT": [],
                            "POSTROUTING": ["-s 10.10.10.0/24 -o vmbr0 -j MASQUERADE"]},
             },
+            "filter6": {
+                "policy": {"INPUT": "ACCEPT", "FORWARD": "ACCEPT", "OUTPUT": "ACCEPT"},
+                "chains": {"INPUT": [], "FORWARD": [], "OUTPUT": []},
+            },
             "filter": {
                 "policy": {"INPUT": "ACCEPT", "FORWARD": "ACCEPT", "OUTPUT": "ACCEPT"},
                 "chains": {"INPUT": ["-j PVEFW-INPUT"], "FORWARD": ["-j PVEFW-FORWARD"], "OUTPUT": ["-j PVEFW-OUTPUT"],
@@ -144,9 +148,17 @@ def default_state():
             },
         },
         "counters": {},  # "table|chain|rule" -> [packets, bytes]
+        "pvefw": {"options": {"enable": 0, "policy_in": "DROP"}, "node_enable": 1,
+                  "rules": [{"type": "in", "action": "ACCEPT", "proto": "tcp", "dport": "2222", "source": "198.51.100.0/24",
+                             "comment": "admin jump host", "enable": 1},
+                            {"type": "in", "action": "DROP", "proto": "tcp", "dport": "3306", "comment": "no db from outside",
+                             "enable": 1}]},
         "nginx_active": True,
         "f2b": {"installed": True, "jails": {"sshd": {"failed": 3, "failed_total": 412, "banned_total": 57,
-                                                       "ips": ["198.51.100.23", "203.0.113.99", "192.0.2.150"]},
+                                                       "ips": ["198.51.100.23", "203.0.113.99", "192.0.2.150"] +
+                                                              ["198.51.100.%d" % i for i in (41, 42, 57, 77, 120, 133, 201)] +
+                                                              ["203.0.113.%d" % i for i in (5, 18, 64, 200)] +
+                                                              ["2001:db8:7::%x" % i for i in (16, 80)]},
                                               "nginx-botsearch": {"failed": 0, "failed_total": 31, "banned_total": 4,
                                                                   "ips": ["66.133.109.36"]}}},
         "nginx_test_fail": False,
@@ -430,6 +442,7 @@ server {
             elif name == "no-fail2ban":
                 st["f2b"] = {"installed": False, "jails": {}}
             elif name == "pvefw-no-http":
+                st["pvefw"]["options"]["enable"] = 1
                 with open(self.path_for("/etc/pve/firewall/cluster.fw"), "w") as f:
                     f.write(PVEFW_OK.replace("IN HTTP(ACCEPT) -log nolog\n", "").replace("IN HTTPS(ACCEPT) -log nolog\n", ""))
             elif name == "cert-expiring":
@@ -920,13 +933,46 @@ server {
         return 0, "\n".join(out), False
 
     def c_pve_firewall(self, st, a, data):
-        return 0, "Status: enabled/running", False
+        return 0, "Status: %s/running" % ("enabled" if st["pvefw"]["options"].get("enable") else "disabled"), False
 
     # ------------------------------------------------------------------ proxmox tools
     def c_pvesh(self, st, a, data):
-        return 0, json.dumps([{"id": "%s/%d" % (g["type"], g["vmid"]), "vmid": g["vmid"], "name": g["name"],
-                               "type": g["type"], "status": g["status"], "node": self.node, "template": 0}
-                              for g in GUESTS]), False
+        verb, path = a[0], a[1] if len(a) > 1 else ""
+        fw = st["pvefw"]
+        opts = {a[i][2:]: a[i + 1] for i in range(2, len(a) - 1) if a[i].startswith("--")}
+        if path == "/cluster/resources":
+            return 0, json.dumps([{"id": "%s/%d" % (g["type"], g["vmid"]), "vmid": g["vmid"], "name": g["name"],
+                                   "type": g["type"], "status": g["status"], "node": self.node, "template": 0}
+                                  for g in GUESTS]), False
+        if re.match(r"^/nodes/[^/]+/firewall/rules$", path):
+            if verb == "get":
+                return 0, json.dumps([dict(r, pos=i) for i, r in enumerate(fw["rules"])]), False
+            if verb == "create":
+                rule = {k: v for k, v in opts.items() if k != "pos"}
+                rule["enable"] = int(rule.get("enable", 1))
+                fw["rules"].insert(int(opts.get("pos", len(fw["rules"]))), rule)
+                return 0, "", True
+        m = re.match(r"^/nodes/[^/]+/firewall/rules/(\d+)$", path)
+        if m and verb == "delete":
+            if int(m.group(1)) >= len(fw["rules"]):
+                return 1, "no rule at position %s" % m.group(1), False
+            fw["rules"].pop(int(m.group(1)))
+            return 0, "", True
+        if path == "/cluster/firewall/options":
+            if verb == "get":
+                return 0, json.dumps(fw["options"]), False
+            fw["options"].update({k: (int(v) if v.isdigit() else v) for k, v in opts.items()})
+            return 0, "", True
+        if re.match(r"^/nodes/[^/]+/firewall/options$", path) and verb == "set":
+            fw["node_enable"] = int(opts.get("enable", 1))
+            return 0, "", True
+        return 1, "(mock) unsupported pvesh call: %s %s" % (verb, path), False
+
+    def c_ip6tables(self, st, a, data):
+        return self.c_iptables(st, ["-t", "filter6"] + (a[2:] if a[:2] == ["-t", "filter"] else a), data)
+
+    def c_ip6tables_restore(self, st, a, data):
+        return self.c_iptables_restore(st, a, (data or "").replace("*filter", "*filter6"))
 
     def c_qm(self, st, a, data):
         if a[0] == "config":

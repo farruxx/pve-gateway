@@ -4,6 +4,19 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.6.0 - 2026-10-16
+- Firewall (Security tab) for incoming traffic to the host, with a choice of backend: pve-gateway's own
+  iptables + ip6tables chain, or the Proxmox firewall (rules created through the Proxmox API, visible in the PVE UI;
+  rules you made yourself stay untouched and are listed). Switching backends moves the rules.
+- Ordered allow / drop / reject rules (TCP, UDP, ICMP, any; port lists and ranges; source network), default policy
+  allow or drop, ping on/off, templates (web, mail, DNS, WireGuard, SSH, Proxmox, databases from LAN only) and
+  "risky ports open right now -> LAN only".
+- Lock-out protection: SSH, Proxmox UI, the pve-gateway port (from its allowed sources), 80/443 with domains, the
+  cluster ports and established connections always stay open; drop rules for everyone on those ports are refused;
+  every change must be confirmed within 60 s or the previous firewall is restored automatically.
+- Fail2ban: banned IPs in their own searchable list (IP, jail, network with how many bans come from it, unban), jail
+  rows link to their bans, "Copy list".
+
 ## 1.5.0 - 2026-10-16
 - Security tab - fail2ban: status and jails (failed / banned now and total), banned IPs with one-click unban,
   "Unban all", manual ban (never your own IP or localhost), and "Install fail2ban" when it's missing.

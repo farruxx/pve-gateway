@@ -20,7 +20,7 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 | ![Web UI access settings](docs/screenshots/settings.png) | ![Debug tab with health checks](docs/screenshots/debug.png) |
 | **Settings**: only the IPs/networks you list can reach the web UI | **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report |
 | ![Health checks, alerts and port scanner](docs/screenshots/monitor.png) | ![Fail2ban jails and settings](docs/screenshots/security.png) |
-| **Monitor**: health checks with uptime and history, alerts (e-mail, webhook, Telegram), port scanner | **Security**: fail2ban jails, banned IPs with unban, managed jail settings |
+| **Monitor**: health checks with uptime and history, alerts (e-mail, webhook, Telegram), port scanner | **Security**: firewall (own iptables or Proxmox firewall), fail2ban jails and banned IPs |
 
 <sub>Screenshots use sample data from the built-in mock mode (`./dev.sh`). Regenerate them with `dev/screenshots.sh`.</sub>
 
@@ -245,9 +245,27 @@ The **Monitor** tab watches your guests and domains:
 
 CLI: `pve-gateway monitors` runs every check once; `pve-gateway scan 10.10.10.11 1-1024` scans from the shell.
 
+## Firewall
+
+**Security → Firewall** protects the host itself (incoming traffic). You choose the backend:
+- **pve-gateway**: its own `PVEGW_IN` chain for iptables and ip6tables, hooked first in `INPUT`.
+- **Proxmox firewall**: pve-gateway creates its rules (comment `pvegw: …`) at the top of the node's firewall through the Proxmox API, so they also show in the Proxmox UI. Your own Proxmox rules are left alone and listed underneath.
+
+Rules are ordered **allow / drop / reject** entries:
+- protocol TCP, UDP, ICMP or any;
+- port lists and ranges;
+- an optional source network;
+- a comment.
+
+The default policy is *allow everything else* or *drop everything else*. Templates add common sets (web, mail, DNS, WireGuard, SSH, Proxmox, databases from private networks only). **Risky ports open right now → LAN only** uses the exposure check to keep services like rpcbind or databases off the internet.
+
+**You can't lock yourself out:**
+- **Always open:** SSH, the Proxmox UI (8006), pve-gateway's own port (from its allowed sources), 80/443 while you have domains, the cluster ports on clusters, and established connections. A drop rule for *everyone* on 22/8006/the UI port is refused.
+- **Every change is temporary at first:** you have **60 seconds to click Keep**. If the page can't reach the server any more, the previous firewall comes back by itself. Unconfirmed changes are never saved, so a restart also brings back the old rules.
+
 ## Fail2ban
 
-The **Security** tab shows fail2ban's jails with failed and banned counts and the banned IPs. You can **unban** one IP or all of them, and **ban** an IP by hand (never your own IP or localhost). **Install fail2ban** sets it up if it's missing.
+The **Security** tab shows fail2ban's jails with failed and banned counts. All banned IPs are in one searchable list (IP, jail, and how many bans come from the same network), with **Copy list**. You can **unban** one IP or all of them, and **ban** an IP by hand (never your own IP or localhost). **Install fail2ban** sets it up if it's missing.
 
 Tick *Let pve-gateway manage fail2ban* to configure it from the UI: ban time, find time, failures before a ban, a **never ban** list, and these jails:
 - **sshd**: SSH logins.

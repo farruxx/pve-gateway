@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.5.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.6.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -87,6 +87,8 @@ DEFAULTS = {
     "monitors": [],
     "alerts": {"email": "", "webhook": "", "telegram_token": "", "telegram_chat": "", "fail_after": 2, "cert_days": 14},
     # fail2ban: pve-gateway writes /etc/fail2ban/jail.d/pve-gateway.local only after "managed" is switched on
+    # Host firewall (inbound): backend "custom" = pve-gateway's own iptables/ip6tables chain, "pve" = Proxmox firewall
+    "firewall": {"backend": "custom", "enabled": False, "policy": "accept", "allow_ping": True, "rules": []},
     "fail2ban": {"managed": False, "bantime": "1h", "findtime": "10m", "maxretry": 5, "ignoreip": [],
                  "jails": {"sshd": True, "proxmox": True, "pve-gateway": True, "nginx-botsearch": True, "recidive": True}},
 }
@@ -155,6 +157,12 @@ def load_config():
             log("skipping invalid check %r: %s" % (m.get("name") or m.get("id"), e), "warn")
     cfg["monitors"] = mons
     cfg["alerts"] = dict(DEFAULTS["alerts"], **(cfg.get("alerts") or {}))
+    try:
+        cfg["firewall"] = validate_fw(dict(DEFAULTS["firewall"], **(cfg.get("firewall") or {})),
+                                      json.loads(json.dumps(DEFAULTS["firewall"])), cfg)
+    except ApiError as e:
+        log("firewall settings invalid (%s) - firewall disabled" % e, "error")
+        cfg["firewall"] = json.loads(json.dumps(DEFAULTS["firewall"]))
     f2b = json.loads(json.dumps(DEFAULTS["fail2ban"]))
     f2b.update({k: v for k, v in (cfg.get("fail2ban") or {}).items() if k != "jails"})
     f2b["jails"].update((cfg.get("fail2ban") or {}).get("jails") or {})
@@ -551,7 +559,12 @@ def watchdog():
             if not DRY_RUN and not hooks_active():
                 log("hooks missing (iptables flushed?), re-applying rules", "warn")
                 apply_rules()
-            elif not DRY_RUN and owns_web_ports(STATE["cfg"]) and hook_position("nat", "PREROUTING", CH_PRE) not in (None, 1):
+            fw = STATE["cfg"]["firewall"]
+            if not DRY_RUN and fw["enabled"] and fw["backend"] == "custom" and \
+                    run(["iptables", "-C", "INPUT", "-j", CH_IN], check_only=True)[0] != 0:
+                log("firewall hook missing, re-applying", "warn")
+                apply_fw(STATE["cfg"])
+            if not DRY_RUN and owns_web_ports(STATE["cfg"]) and hook_position("nat", "PREROUTING", CH_PRE) not in (None, 1):
                 # another tool inserted rules above ours; they could DNAT 80/443 away from nginx
                 log("moving pve-gateway's nat hook back to the top of PREROUTING", "warn")
                 with LOCK:
@@ -1851,6 +1864,13 @@ def checks():
             add("apt repositories", "warn", "Proxmox enterprise repos are enabled (%s) but there is no subscription, so "
                 "apt update fails with 401 - switch to no-subscription: curl -fsSL %s/master/install.sh | sh -s -- fix-repos"
                 % (", ".join(repos), REPO_RAW))
+    fw = cfg["firewall"]
+    if fw["enabled"]:
+        add("firewall", "ok", "%s backend, policy %s, %d rule(s)%s" % (
+            "pve-gateway" if fw["backend"] == "custom" else "Proxmox", fw["policy"], len(fw["rules"]),
+            " - waiting for confirmation" if FW_PENDING.get("deadline") else ""))
+        if fw["backend"] == "custom" and sh(["pve-firewall", "status"])[1].find("enabled") >= 0:
+            add("two firewalls", "info", "the Proxmox firewall is also enabled; pve-gateway's rules run first (INPUT #1)")
     if f2b_installed():
         rc, out = sh(["fail2ban-client", "status"])
         add("fail2ban", _st(rc == 0, warn=True), (re.search(r"Jail list:\s*(.*)", out).group(1) or "no jails")
@@ -2577,6 +2597,295 @@ def f2b_install():
     threading.Thread(target=job, daemon=True).start()
 
 
+# --------------------------------------------------------------------------- firewall
+
+CH_IN = "PVEGW_IN"
+FW_ACTIONS = ("ACCEPT", "DROP", "REJECT")
+FW_PROTOS = ("tcp", "udp", "icmp", "any")
+FW_PENDING = {}   # {"old": firewall cfg, "deadline": ts, "timer": Timer} while a change waits for confirmation
+FW_TEMPLATES = {
+    "web": ("Web server (HTTP/HTTPS)", [("ACCEPT", "tcp", "80,443", "")]),
+    "mail": ("Mail server", [("ACCEPT", "tcp", "25,465,587,110,995,143,993", "")]),
+    "dns": ("DNS server", [("ACCEPT", "tcp", "53", ""), ("ACCEPT", "udp", "53", "")]),
+    "wireguard": ("WireGuard VPN", [("ACCEPT", "udp", "51820", "")]),
+    "ssh": ("SSH", [("ACCEPT", "tcp", "22", "")]),
+    "proxmox": ("Proxmox web UI + console (8006, 3128, 5900-5999)", [("ACCEPT", "tcp", "8006,3128,5900-5999", "")]),
+    "database-lan": ("Databases from private networks only", [("ACCEPT", "tcp", "3306,5432,6379,27017", n) for n in
+                                                            ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")] +
+                     [("DROP", "tcp", "3306,5432,6379,27017", "")]),
+}
+PRIVATE_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+
+
+def fw_ports(spec):
+    """'22,80,8000-8100' -> normalised list of 'a' / 'a-b' (max 15 entries, iptables multiport)."""
+    out = []
+    if isinstance(spec, (list, tuple)):
+        spec = ",".join(str(x) for x in spec)
+    for part in re.split(r"[\s,]+", str(spec or "").strip()):
+        if part:
+            a, b = parse_ports(part)
+            out.append(str(a) if a == b else "%d-%d" % (a, b))
+    if len(out) > 15:
+        raise ApiError("at most 15 ports/ranges per rule")
+    return out
+
+
+def validate_fw_rule(data, cfg, rid=None):
+    if not isinstance(data, dict):
+        raise ApiError("rule must be an object")
+    r = {"id": rid or uuid.uuid4().hex[:8], "enabled": bool(data.get("enabled", True))}
+    r["action"] = str(data.get("action", "ACCEPT")).upper()
+    if r["action"] not in FW_ACTIONS:
+        raise ApiError("action must be ACCEPT, DROP or REJECT")
+    r["proto"] = str(data.get("proto", "tcp")).lower()
+    if r["proto"] not in FW_PROTOS:
+        raise ApiError("protocol must be tcp, udp, icmp or any")
+    r["ports"] = fw_ports(data.get("ports")) if r["proto"] in ("tcp", "udp") else []
+    if r["proto"] in ("tcp", "udp") and not r["ports"]:
+        raise ApiError("give the port(s) for a %s rule, e.g. 80,443 or 8000-8100" % r["proto"])
+    src = str(data.get("source", "") or "").strip()
+    if src:
+        try:
+            src = str(ipaddress.ip_network(src, strict=False))
+        except ValueError:
+            raise ApiError("source must be an IP address or network")
+        if src in ("0.0.0.0/0", "::/0"):  # = everyone
+            src = ""
+    r["source"] = src
+    r["comment"] = str(data.get("comment", "") or "").strip()
+    if not re.match(r"^[A-Za-z0-9 _.:/@+(),-]{0,50}$", r["comment"]):  # no quotes: it ends up in an iptables comment
+        raise ApiError("comment: max 50 chars, letters/digits/space and _.:/@+(),- only")
+    if r["action"] != "ACCEPT" and not r["source"] and r["enabled"]:  # never lock the admin out
+        vital = {22, 8006, int(cfg.get("port", 8099))}
+        covered = set()
+        for p in r["ports"] or (["1-65535"] if r["proto"] == "any" else []):
+            a, b = parse_ports(p)
+            covered |= {x for x in vital if a <= x <= b}
+        if covered:
+            raise ApiError("a %s rule for everyone on port %s would lock you out - give a source network"
+                           % (r["action"], ", ".join(map(str, sorted(covered)))))
+    return r
+
+
+def validate_fw(data, old, cfg):
+    f = json.loads(json.dumps(old))
+    if "backend" in data:
+        if data["backend"] not in ("custom", "pve"):
+            raise ApiError("backend must be custom or pve")
+        f["backend"] = data["backend"]
+    if "policy" in data:
+        if data["policy"] not in ("accept", "drop"):
+            raise ApiError("policy must be accept or drop")
+        f["policy"] = data["policy"]
+    for k in ("enabled", "allow_ping"):
+        if k in data:
+            f[k] = bool(data[k])
+    if "rules" in data:
+        if not isinstance(data["rules"], list) or len(data["rules"]) > 200:
+            raise ApiError("rules must be a list (max 200)")
+        f["rules"] = [validate_fw_rule(r, cfg, r.get("id") if isinstance(r, dict) else None) for r in data["rules"]]
+    return f
+
+
+def fw_safety(cfg):
+    """Rules the firewall always keeps open (before the user's rules) so the host stays manageable."""
+    f = cfg["firewall"]
+    ui_src = cfg.get("ui_allow") or [""]
+    rules = [("ACCEPT", "tcp", ["22"], "", "safety: SSH"), ("ACCEPT", "tcp", ["8006"], "", "safety: Proxmox UI")]
+    rules += [("ACCEPT", "tcp", [str(cfg.get("port", 8099))], s, "safety: pve-gateway UI") for s in ui_src]
+    if owns_web_ports(cfg):
+        rules.append(("ACCEPT", "tcp", ["80", "443"], "", "safety: domains (nginx)"))
+    if os.path.exists("/etc/pve/corosync.conf") and not MOCK:
+        rules.append(("ACCEPT", "udp", ["5405-5412"], "", "safety: cluster (corosync)"))
+    if f.get("allow_ping"):
+        rules.append(("ACCEPT", "icmp", [], "", "ping"))
+    return rules
+
+
+def fw_iptables(cfg, v6):
+    """iptables-restore payload for the PVEGW_IN chain (one address family)."""
+    f = cfg["firewall"]
+    out = ["*filter", ":%s - [0:0]" % CH_IN]
+    if not f["enabled"]:
+        return "\n".join(out + ["COMMIT"]) + "\n"
+    out += ["-A %s -i lo -j ACCEPT" % CH_IN, "-A %s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" % CH_IN,
+            "-A %s -m conntrack --ctstate INVALID -j DROP" % CH_IN]
+    if v6:  # neighbour discovery etc. - IPv6 breaks without it
+        out += ["-A %s -p ipv6-icmp -m icmp6 --icmpv6-type %s -j ACCEPT" % (CH_IN, t)
+                for t in ("neighbour-solicitation", "neighbour-advertisement", "router-advertisement", "packet-too-big")]
+
+    def emit(action, proto, ports, src, tag):
+        if src and (":" in src) != v6:
+            return
+        base = "-A %s" % CH_IN + (" -s %s" % src if src else "")
+        target = "-j %s" % action + (" --reject-with %s" % ("icmp6-port-unreachable" if v6 else "icmp-port-unreachable")
+                                     if action == "REJECT" else "")
+        cm = '-m comment --comment "gw:fw:%s"' % tag
+        if proto == "icmp":
+            out.append("%s -p %s %s %s" % (base, "ipv6-icmp -m icmp6 --icmpv6-type echo-request" if v6 else
+                                           "icmp -m icmp --icmp-type echo-request", cm, target))
+        elif proto == "any":
+            out.append("%s %s %s" % (base, cm, target))
+        else:
+            out.append("%s -p %s -m multiport --dports %s %s %s" % (base, proto, ",".join(p.replace("-", ":") for p in ports),
+                                                                     cm, target))
+    for action, proto, ports, src, why in fw_safety(cfg):
+        emit(action, proto, ports, src, "safety")
+    for r in f["rules"]:
+        if r["enabled"]:
+            emit(r["action"], r["proto"], r["ports"], r["source"], r["id"])
+    if f["policy"] == "drop":
+        out.append('-A %s -m comment --comment "gw:fw:policy" -j DROP' % CH_IN)
+    return "\n".join(out + ["COMMIT"]) + "\n"
+
+
+def apply_fw_custom(cfg):
+    for v6, restore, ipt in ((False, "iptables-restore", "iptables"), (True, "ip6tables-restore", "ip6tables")):
+        rc, out = run([restore, "--noflush"], fw_iptables(cfg, v6))
+        if rc != 0:
+            return "%s failed: %s" % (restore, out)
+        hooked = run([ipt, "-C", "INPUT", "-j", CH_IN], check_only=True)[0] == 0
+        if cfg["firewall"]["enabled"] and not hooked:
+            rc, out = run([ipt, "-I", "INPUT", "1", "-j", CH_IN])
+            if rc != 0:
+                return "cannot hook INPUT: %s" % out
+        elif not cfg["firewall"]["enabled"] and hooked:
+            run([ipt, "-D", "INPUT", "-j", CH_IN])
+    return None
+
+
+def node_name():
+    return socket.gethostname().split(".")[0]
+
+
+def pve_fw_rules():
+    """All rules of this node's Proxmox firewall (ordered)."""
+    rc, out = sh(["pvesh", "get", "/nodes/%s/firewall/rules" % node_name(), "--output-format", "json"])
+    if rc != 0:
+        raise ApiError("cannot read the Proxmox firewall rules: %s" % out[-200:], 500)
+    try:
+        return sorted(json.loads(out), key=lambda r: r.get("pos", 0))
+    except ValueError:
+        raise ApiError("unexpected answer from pvesh", 500)
+
+
+def apply_fw_pve(cfg):
+    """Replace pve-gateway's rules (comment pvegw:...) at the top of the node firewall, set options."""
+    f, node = cfg["firewall"], node_name()
+    try:
+        ours = [r for r in pve_fw_rules() if str(r.get("comment", "")).startswith("pvegw:")]
+    except ApiError as e:
+        return str(e)
+    for r in sorted(ours, key=lambda r: -r["pos"]):
+        rc, out = run(["pvesh", "delete", "/nodes/%s/firewall/rules/%d" % (node, r["pos"])])
+        if rc != 0:
+            return "cannot delete Proxmox firewall rule %d: %s" % (r["pos"], out)
+    wanted = []
+    if f["enabled"]:
+        wanted = [(a, p, ports, src, "safety: " + why.split(": ", 1)[-1]) for a, p, ports, src, why in fw_safety(cfg)]
+        wanted += [(r["action"], r["proto"], r["ports"], r["source"], r["comment"] or r["id"]) for r in f["rules"] if r["enabled"]]
+    for pos, (action, proto, ports, src, why) in enumerate(wanted):
+        cmd = ["pvesh", "create", "/nodes/%s/firewall/rules" % node, "--type", "in", "--action", action, "--enable", "1",
+               "--pos", str(pos), "--comment", ("pvegw: " + why)[:60]]
+        if proto == "icmp":
+            cmd += ["--macro", "Ping"]
+        elif proto != "any":
+            cmd += ["--proto", proto, "--dport", ",".join(p.replace("-", ":") for p in ports)]
+        if src:
+            cmd += ["--source", src]
+        rc, out = run(cmd)
+        if rc != 0:
+            return "cannot create Proxmox firewall rule (%s): %s" % (why, out[-200:])
+    if f["enabled"]:
+        for path, opts in (("/nodes/%s/firewall/options" % node, ["--enable", "1"]),
+                           ("/cluster/firewall/options", ["--enable", "1", "--policy_in", f["policy"].upper()])):
+            rc, out = run(["pvesh", "set", path] + opts)
+            if rc != 0:
+                return "cannot set Proxmox firewall options: %s" % out[-200:]
+    return None
+
+
+def apply_fw(cfg, old=None):
+    """Apply the firewall with the selected backend; when the backend changed, clear the previous one first."""
+    if old and old.get("backend") != cfg["firewall"]["backend"]:
+        prev = dict(cfg, firewall=dict(old, enabled=False))
+        (apply_fw_pve if old["backend"] == "pve" else apply_fw_custom)(prev)
+    with LOCK:
+        err = (apply_fw_pve if cfg["firewall"]["backend"] == "pve" else apply_fw_custom)(cfg)
+    if not err:
+        f = cfg["firewall"]
+        log("firewall (%s): %s, policy %s, %d rule(s)" % (f["backend"], "on" if f["enabled"] else "off", f["policy"], len(f["rules"])))
+    return err
+
+
+def fw_change(new_cfg, user):
+    """Apply now; keep it only if confirmed within 60 s (otherwise the previous firewall comes back)."""
+    old_fw = (FW_PENDING.get("old") if FW_PENDING else None) or STATE["cfg"]["firewall"]
+    if FW_PENDING.get("timer"):
+        FW_PENDING["timer"].cancel()
+    err = apply_fw(new_cfg, STATE["cfg"]["firewall"])
+    if err:
+        apply_fw(STATE["cfg"], new_cfg["firewall"])
+        raise ApiError(err, 500)
+    STATE["cfg"] = new_cfg
+    risky = new_cfg["firewall"]["enabled"]
+
+    def revert():
+        log("firewall change was not confirmed within 60 s - restoring the previous firewall", "warn")
+        cur = STATE["cfg"]["firewall"]
+        STATE["cfg"] = dict(STATE["cfg"], firewall=old_fw)
+        apply_fw(STATE["cfg"], cur)
+        FW_PENDING.clear()
+
+    if risky:
+        t = threading.Timer(60, revert)
+        t.daemon = True
+        t.start()
+        FW_PENDING.update(old=old_fw, deadline=time.time() + 60, timer=t)
+    else:
+        FW_PENDING.clear()
+        save_config(new_cfg)
+    log("%s changed the firewall%s" % (user, " (waiting for confirmation)" if risky else ""))
+
+
+def fw_confirm():
+    if FW_PENDING.get("timer"):
+        FW_PENDING["timer"].cancel()
+    FW_PENDING.clear()
+    save_config(STATE["cfg"])
+
+
+def fw_state(cfg):
+    f = cfg["firewall"]
+    res = {"settings": f, "safety": [{"action": a, "proto": p, "ports": po, "source": s, "why": w} for a, p, po, s, w in fw_safety(cfg)],
+           "pending": max(0, int(FW_PENDING["deadline"] - time.time())) if FW_PENDING.get("deadline") else 0,
+           "templates": {k: v[0] for k, v in FW_TEMPLATES.items()}, "other_rules": [], "pve_enabled": None}
+    rc, st = sh(["pve-firewall", "status"])
+    res["pve_enabled"] = rc == 0 and "enabled" in st
+    if f["backend"] == "pve":
+        try:
+            res["other_rules"] = [r for r in pve_fw_rules() if not str(r.get("comment", "")).startswith("pvegw:")]
+        except ApiError as e:
+            res["error"] = str(e)
+    return res
+
+
+def fw_template_rules(name):
+    if name == "risky-lan":
+        ports = sorted({port for proto, port, scope, proc in exposed_services()
+                        if RISKY_PORTS.get(port) or 5900 <= port <= 5999})
+        if not ports:
+            raise ApiError("no risky services listen on all interfaces right now")
+        spec = ",".join(map(str, ports[:15]))
+        return [{"action": "ACCEPT", "proto": "tcp", "ports": spec, "source": n, "comment": "risky ports: LAN"} for n in PRIVATE_NETS] + \
+               [{"action": "DROP", "proto": "tcp", "ports": spec, "source": "", "comment": "risky ports: not from internet"}]
+    if name not in FW_TEMPLATES:
+        raise ApiError("unknown template")
+    label, rules = FW_TEMPLATES[name]
+    return [{"action": a, "proto": p, "ports": ports, "source": src, "comment": label[:40]} for a, p, ports, src in rules]
+
+
 # --------------------------------------------------------------------------- updates
 
 UPDATE = {"latest": None, "changes": [], "checked": None, "error": None, "running": False, "started": None}
@@ -2918,6 +3227,29 @@ class Handler(BaseHTTPRequestHandler):
                 "wildcards": cfg["wildcards"], "wildcard_status": wildcard_status(cfg), "dns_providers": DNS_PROVIDERS,
                 "nginx": {"last_apply": NGINX["last_apply"], "last_error": NGINX["last_error"]},
             })
+        if path == "/api/firewall" and method == "GET":
+            return self.send(200, dict(fw_state(cfg), client_ip=self.client_ip()))
+        if path == "/api/firewall" and method == "PUT":
+            with LOCK:
+                new = dict(STATE["cfg"], firewall=validate_fw(self.body(), STATE["cfg"]["firewall"], STATE["cfg"]))
+            fw_change(new, user)
+            return self.send(200, dict(fw_state(STATE["cfg"]), client_ip=self.client_ip()))
+        if path == "/api/firewall/confirm" and method == "POST":
+            fw_confirm()
+            log("%s confirmed the firewall change" % user)
+            return self.send(200, {"ok": True})
+        if path == "/api/firewall/revert" and method == "POST":
+            if FW_PENDING.get("timer"):
+                FW_PENDING["timer"].cancel()
+                old = FW_PENDING["old"]
+                cur = STATE["cfg"]["firewall"]
+                STATE["cfg"] = dict(STATE["cfg"], firewall=old)
+                apply_fw(STATE["cfg"], cur)
+                FW_PENDING.clear()
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/firewall/template/([\w-]{1,30})$", path)
+        if m and method == "GET":
+            return self.send(200, {"rules": fw_template_rules(m.group(1))})
         if path == "/api/fail2ban" and method == "GET":
             return self.send(200, dict(f2b_status(), settings=cfg["fail2ban"], jail_info={j: d for j, (d, _) in F2B_JAILS.items()},
                                        file=F2B_JAIL_FILE, client_ip=self.client_ip()))
@@ -3301,6 +3633,10 @@ def cert_reloader(ctx, cert, key):
 def serve(cfg):
     apply_rules()
     apply_nginx()
+    if cfg["firewall"]["enabled"] and cfg["firewall"]["backend"] == "custom":
+        err = apply_fw(cfg)
+        if err:
+            log(err, "error")
     threading.Thread(target=watchdog, daemon=True).start()
     threading.Thread(target=update_checker, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
@@ -3440,13 +3776,52 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </main>
   <main id="view-security" hidden>
-    <div class="sub-head" style="margin-top:0"><h2>Fail2ban</h2><span id="f2bState"></span><span class="spacer"></span>
+    <div class="sub-head" style="margin-top:0"><h2>Firewall</h2><span id="fwState"></span><span class="spacer"></span>
+      <span id="fwDirty" class="muted small"></span><button type="button" id="fwApply">Apply</button></div>
+    <div id="fwPending" class="card banner warn-banner" hidden>The new firewall is active. <b>Can you still reach this page?</b>
+      It is reverted in <b id="fwLeft"></b> s unless you keep it.
+      <span class="spacer"></span><button type="button" id="fwKeep">Keep</button><button type="button" class="ghost" id="fwRevert">Revert now</button></div>
+    <p id="fwErr" class="err"></p>
+    <div class="card form-card">
+      <div class="grid">
+        <label>Backend<select id="fwBackend"><option value="custom">pve-gateway (iptables + ip6tables)</option>
+          <option value="pve">Proxmox firewall (rules visible in the Proxmox UI)</option></select></label>
+        <label>Traffic no rule matches<select id="fwPolicy"><option value="accept">allow (only DROP/REJECT rules block)</option>
+          <option value="drop">drop (only allowed ports are open)</option></select></label>
+        <label class="check"><input type="checkbox" id="fwEnabled"> Firewall enabled</label>
+        <label class="check"><input type="checkbox" id="fwPing"> Answer ping</label>
+      </div>
+      <p class="hint" id="fwSafety"></p>
+    </div>
+    <div class="bar" style="margin-top:12px">
+      <button type="button" class="ghost" id="fwAdd">+ Add rule</button>
+      <select id="fwTemplate"><option value="">Add from template…</option></select>
+    </div>
+    <div class="card scroll">
+      <table><thead><tr><th>#</th><th>On</th><th>Action</th><th>Proto</th><th>Ports</th><th>Source</th><th>Comment</th><th></th></tr></thead>
+        <tbody id="fwRules"></tbody></table>
+      <p id="fwEmpty" class="muted pad" hidden>No rules yet - add one or start from a template.</p>
+    </div>
+    <div id="fwOtherWrap" hidden>
+      <div class="sub-head"><h2>Other Proxmox firewall rules</h2><span class="muted small">not managed by pve-gateway, evaluated after its rules</span></div>
+      <div class="card scroll"><table><thead><tr><th>#</th><th>Action</th><th>Proto</th><th>Ports</th><th>Source</th><th>Comment</th></tr></thead>
+        <tbody id="fwOther"></tbody></table></div>
+    </div>
+    <div class="sub-head"><h2>Fail2ban</h2><span id="f2bState"></span><span class="spacer"></span>
       <button type="button" id="f2bInstall" hidden>Install fail2ban</button>
       <button type="button" class="ghost" id="f2bUnbanAll" hidden>Unban all</button></div>
     <p id="f2bMsg" class="muted small"></p>
     <div class="card scroll" id="f2bJailsCard" hidden>
-      <table><thead><tr><th>Jail</th><th class="num">Failed now / total</th><th class="num">Banned now / total</th><th>Banned IPs</th></tr></thead>
+      <table><thead><tr><th>Jail</th><th class="num">Failed now / total</th><th class="num">Banned now / total</th><th></th></tr></thead>
         <tbody id="f2bJails"></tbody></table>
+    </div>
+    <div class="sub-head" id="f2bBannedHead" hidden><h2>Banned IPs <span id="f2bBannedCount" class="muted"></span></h2>
+      <input id="f2bFilter" placeholder="filter by IP or jail" spellcheck="false" style="width:220px">
+      <span class="spacer"></span><button type="button" class="ghost" id="f2bCopy">Copy list</button></div>
+    <div class="card scroll" id="f2bBannedCard" hidden>
+      <table><thead><tr><th>IP address</th><th>Jail</th><th>Network</th><th></th></tr></thead><tbody id="f2bBanned"></tbody></table>
+      <p id="f2bBannedEmpty" class="muted pad" hidden>No banned IPs.</p>
+      <p id="f2bBannedMore" class="muted pad small" hidden></p>
     </div>
     <div class="bar" id="f2bBanBar" hidden style="margin-top:12px">
       <input id="f2bBanIp" placeholder="IP to ban" spellcheck="false" style="width:180px"><select id="f2bBanJail"></select>
@@ -3578,6 +3953,23 @@ INDEX_HTML = r"""<!doctype html>
   </form>
 </dialog>
 
+<dialog id="fwDlg">
+  <form id="fwForm" class="form">
+    <h2 id="fwTitle">Add rule</h2>
+    <div class="grid">
+      <label>Action<select name="action"><option value="ACCEPT">ACCEPT - allow</option><option value="DROP">DROP - silently block</option>
+        <option value="REJECT">REJECT - block and tell the sender</option></select></label>
+      <label>Protocol<select name="proto"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP (ping)</option><option value="any">any</option></select></label>
+      <label class="fw-ports">Ports<input name="ports" placeholder="80,443 or 8000-8100" spellcheck="false"></label>
+      <label>Source<input name="source" placeholder="anyone (or 203.0.113.0/24)" spellcheck="false"></label>
+      <label class="wide">Comment<input name="comment" maxlength="40"></label>
+      <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled</label>
+    </div>
+    <p id="fwFormErr" class="err"></p>
+    <div class="actions"><button type="button" id="fwCancel" class="ghost">Cancel</button><button type="submit">OK</button></div>
+  </form>
+</dialog>
+
 <dialog id="testDlg">
   <h2 id="testTitle">Test</h2>
   <ul id="testSteps" class="checks"></ul>
@@ -3627,6 +4019,7 @@ main{max-width:1200px;margin:0 auto;padding:16px 20px}
 .scroll{overflow-x:auto}
 .bar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
 button{font:inherit;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:7px 14px;border-radius:7px;cursor:pointer;font-weight:600}
+button:disabled{opacity:.5;cursor:default}
 button.ghost{background:transparent;color:var(--fg);border-color:var(--line);font-weight:500}
 button.ghost:hover{border-color:var(--muted)}
 button.link{background:none;border:none;color:var(--muted);padding:4px 6px;font-weight:500}
@@ -3694,6 +4087,7 @@ button.net:hover{border-color:var(--muted)}button.net.wan{border-color:var(--acc
 .bars i.no{background:var(--bad)}.pill.up{background:var(--ok-bg);color:var(--ok)}.pill.down{background:var(--bad-bg);color:var(--bad)}
 .pill.unknown{background:var(--line);color:var(--muted)}.pill.failing{background:var(--warn-bg);color:var(--warn)}.pill.high{background:var(--bad-bg);color:var(--bad)}
 .pill.admin{background:var(--warn-bg);color:var(--warn)}.pill.low{background:var(--line);color:var(--muted)}
+.warn-banner{color:var(--fg);border-color:var(--warn);background:var(--warn-bg);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .sub-head{display:flex;align-items:center;gap:10px;margin:22px 0 10px}.sub-head h2{margin:0;font-size:15px}
 .sub-head button{padding:4px 12px;font-size:13px}
 .hint{margin:-4px 0 0;font-size:12px;color:var(--muted)}.hint.bad{color:var(--bad)}
@@ -3765,7 +4159,7 @@ async function load() {
   if (!timer) timer = setInterval(() => {
     if (!document.hidden && view !== 'debug' && view !== 'settings' && ![...document.querySelectorAll('dialog')].some(x => x.open)) load().catch(() => {});
     if (!document.hidden && view === 'monitor' && !$('#monDlg').open) loadMonitor();
-    if (!document.hidden && view === 'security') loadSecurity();
+    if (!document.hidden && view === 'security') { loadSecurity(); if (!$('#fwDlg').open) loadFirewall(); }
   }, 5000);
 }
 
@@ -4332,6 +4726,92 @@ $('#scanBtn').onclick = async () => {
   b.disabled = false;
 };
 
+// ---- security: firewall (edits go to a draft; Apply activates it with a 60 s keep/revert window)
+let FW = null, FWD = null, fwEditing = null, fwTick = null;
+async function loadFirewall(force) {
+  try {
+    const r = await api('GET', '/api/firewall');
+    const dirty = FWD && JSON.stringify(FWD) !== JSON.stringify(FW && FW.settings);
+    FW = r; if (force || !dirty) FWD = JSON.parse(JSON.stringify(r.settings));
+    renderFirewall();
+  } catch (e) { $('#fwErr').textContent = e.message; }
+}
+function renderFirewall() {
+  const d = FWD, dirty = JSON.stringify(FWD) !== JSON.stringify(FW.settings);
+  $('#fwState').replaceChildren(el('span', {class: 'chip ' + (FW.settings.enabled ? 'ok' : 'warn'),
+    textContent: FW.settings.enabled ? 'on · ' + (FW.settings.backend === 'pve' ? 'Proxmox firewall' : 'pve-gateway') + ' · policy ' + FW.settings.policy : 'off'}));
+  $('#fwDirty').textContent = dirty ? 'unsaved changes' : ''; $('#fwApply').disabled = !dirty;
+  $('#fwBackend').value = d.backend; $('#fwPolicy').value = d.policy; $('#fwEnabled').checked = d.enabled; $('#fwPing').checked = d.allow_ping;
+  $('#fwSafety').textContent = 'Always open while enabled (so you are never locked out): ' +
+    FW.safety.map(x => x.why.replace('safety: ', '') + (x.ports.length ? ' (' + x.proto + ' ' + x.ports.join(',') + ')' : '')).join(', ') +
+    '. Already open connections are kept.' + (d.backend === 'custom' && FW.pve_enabled ? ' The Proxmox firewall is enabled too - pve-gateway\'s rules run first.' : '');
+  $('#fwTemplate').replaceChildren(el('option', {value: '', textContent: 'Add from template…'}),
+    ...Object.entries(FW.templates).map(([k, v]) => el('option', {value: k, textContent: v})),
+    el('option', {value: 'risky-lan', textContent: 'Risky ports open right now → LAN only'}));
+  $('#fwEmpty').hidden = d.rules.length > 0;
+  const move = (i, k) => { const r = d.rules.splice(i, 1)[0]; d.rules.splice(i + k, 0, r); renderFirewall(); };
+  $('#fwRules').replaceChildren(...d.rules.map((r, i) => el('tr', {class: r.enabled ? '' : 'off'},
+    el('td', {class: 'muted', textContent: i + 1}),
+    el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: r.enabled, onchange: e => { r.enabled = e.target.checked; renderFirewall(); }})),
+    el('td', {}, el('span', {class: 'pill ' + (r.action === 'ACCEPT' ? 'up' : 'down'), textContent: r.action})),
+    el('td', {}, el('span', {class: 'tag', textContent: r.proto})),
+    el('td', {class: 'mono', textContent: r.ports.join(',') || '—'}),
+    el('td', {class: 'mono', textContent: r.source || 'anyone'}),
+    el('td', {textContent: r.comment || ''}),
+    el('td', {class: 'num'},
+      el('button', {class: 'link', textContent: '↑', title: 'move up', disabled: i === 0, onclick: () => move(i, -1)}),
+      el('button', {class: 'link', textContent: '↓', title: 'move down', disabled: i === d.rules.length - 1, onclick: () => move(i, 1)}),
+      el('button', {class: 'link', textContent: 'Edit', onclick: () => openFwDlg(i)}),
+      el('button', {class: 'link del', textContent: 'Delete', onclick: () => { d.rules.splice(i, 1); renderFirewall(); }})))));
+  $('#fwOtherWrap').hidden = !(FW.other_rules || []).length;
+  $('#fwOther').replaceChildren(...(FW.other_rules || []).map(r => el('tr', {class: r.enable ? '' : 'off'},
+    el('td', {class: 'muted', textContent: r.pos}), el('td', {textContent: r.action + (r.macro ? ' (' + r.macro + ')' : '')}),
+    el('td', {textContent: r.proto || '—'}), el('td', {class: 'mono', textContent: r.dport || '—'}),
+    el('td', {class: 'mono', textContent: r.source || 'anyone'}), el('td', {textContent: r.comment || ''}))));
+  const pb = $('#fwPending'); pb.hidden = !FW.pending;
+  if (FW.pending && !fwTick) {
+    let left = FW.pending; $('#fwLeft').textContent = left;
+    fwTick = setInterval(() => { left--; $('#fwLeft').textContent = Math.max(0, left); if (left <= 0) { clearInterval(fwTick); fwTick = null; loadFirewall(true); } }, 1000);
+  }
+}
+for (const [id, key, prop] of [['#fwBackend', 'backend', 'value'], ['#fwPolicy', 'policy', 'value'], ['#fwEnabled', 'enabled', 'checked'], ['#fwPing', 'allow_ping', 'checked']])
+  $(id).addEventListener('change', e => { FWD[key] = e.target[prop]; renderFirewall(); });
+function fwProtoChanged() { $('#fwForm').querySelector('.fw-ports').hidden = !['tcp', 'udp'].includes($('#fwForm').proto.value); }
+function openFwDlg(i) {
+  fwEditing = i; const f = $('#fwForm'), r = i == null ? {action: 'ACCEPT', proto: 'tcp', ports: [], source: '', comment: '', enabled: true} : FWD.rules[i];
+  $('#fwTitle').textContent = i == null ? 'Add rule' : 'Edit rule'; $('#fwFormErr').textContent = '';
+  f.action.value = r.action; f.proto.value = r.proto; f.ports.value = r.ports.join(','); f.source.value = r.source; f.comment.value = r.comment; f.enabled.checked = r.enabled;
+  fwProtoChanged(); $('#fwDlg').showModal();
+}
+$('#fwForm').proto.addEventListener('change', fwProtoChanged);
+$('#fwForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const f = e.target, r = {id: fwEditing != null ? FWD.rules[fwEditing].id : undefined, action: f.action.value, proto: f.proto.value,
+    ports: ['tcp', 'udp'].includes(f.proto.value) ? f.ports.value.split(/[\s,]+/).filter(Boolean) : [], source: f.source.value.trim(),
+    comment: f.comment.value.trim(), enabled: f.enabled.checked};
+  if (['tcp', 'udp'].includes(r.proto) && !r.ports.length) { $('#fwFormErr').textContent = 'give the port(s)'; return; }
+  if (fwEditing != null) FWD.rules[fwEditing] = r; else FWD.rules.push(r);
+  $('#fwDlg').close(); renderFirewall();
+});
+$('#fwCancel').onclick = () => $('#fwDlg').close();
+$('#fwAdd').onclick = () => openFwDlg(null);
+$('#fwTemplate').onchange = async e => {
+  if (!e.target.value) return;
+  try { const r = await api('GET', '/api/firewall/template/' + e.target.value);
+    FWD.rules.push(...r.rules.map(x => Object.assign({enabled: true}, x, {ports: x.ports ? String(x.ports).split(',') : []}))); }
+  catch (err) { $('#fwErr').textContent = err.message; }
+  e.target.value = ''; renderFirewall();
+};
+$('#fwApply').onclick = async () => {
+  $('#fwErr').textContent = '';
+  try { FW = Object.assign(await api('PUT', '/api/firewall', FWD), {}); FWD = JSON.parse(JSON.stringify(FW.settings)); renderFirewall(); }
+  catch (e) { $('#fwErr').textContent = e.message; }
+};
+$('#fwKeep').onclick = async () => { await api('POST', '/api/firewall/confirm', {}).catch(e => $('#fwErr').textContent = e.message);
+  clearInterval(fwTick); fwTick = null; loadFirewall(true); };
+$('#fwRevert').onclick = async () => { await api('POST', '/api/firewall/revert', {}).catch(e => $('#fwErr').textContent = e.message);
+  clearInterval(fwTick); fwTick = null; loadFirewall(true); };
+
 // ---- security: fail2ban
 let F2B = null;
 async function loadSecurity() {
@@ -4352,8 +4832,9 @@ function renderF2b() {
     el('td', {class: 'names'}, el('b', {textContent: j.name}), el('span', {class: 'alias', textContent: f.jail_info[j.name] || ''})),
     el('td', {class: 'num', textContent: j.failed + ' / ' + j.failed_total}),
     el('td', {class: 'num', textContent: j.banned + ' / ' + j.banned_total}),
-    el('td', {}, ...(j.ips.length ? j.ips.map(ip => el('span', {class: 'tag mono', style: 'margin:2px 4px 2px 0;text-transform:none'}, ip + ' ',
-      el('button', {class: 'link', textContent: '×', title: 'Unban ' + ip, onclick: () => f2bAct('unban', {jail: j.name, ip})}))) : ['—'])))));
+    el('td', {class: 'num'}, j.ips.length ? el('button', {class: 'link', textContent: 'show ' + j.ips.length + ' banned',
+      onclick: () => { $('#f2bFilter').value = j.name; renderBanned(); $('#f2bFilter').focus(); }}) : null))));
+  renderBanned();
   $('#f2bBanJail').replaceChildren(...f.jails.map(j => el('option', {value: j.name, textContent: j.name})));
   if (document.activeElement && document.activeElement.closest('#f2bSettings')) return;  // don't overwrite while typing
   const c = f.settings;
@@ -4364,6 +4845,34 @@ function renderF2b() {
     el('input', {type: 'checkbox', name: 'jail', value: j, checked: !!c.jails[j]}), el('span', {}, el('b', {textContent: j}), ' - ' + d))));
   for (const x of $('#f2bFields').querySelectorAll('input,textarea,button')) x.disabled = !c.managed;
 }
+function ipNet(ip) {  // a rough "where is it from" without lookups: private/doc ranges or the /24 (/48 for IPv6)
+  if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip)) return 'private network';
+  if (/^(192\.0\.2|198\.51\.100|203\.0\.113)\./.test(ip)) return 'documentation range';
+  return ip.includes(':') ? ip.split(':').slice(0, 3).join(':') + '::/48' : ip.split('.').slice(0, 3).join('.') + '.0/24';
+}
+function renderBanned() {
+  const f = F2B; if (!f) return;
+  const all = f.jails.flatMap(j => j.ips.map(ip => ({ip, jail: j.name})));
+  const q = $('#f2bFilter').value.trim().toLowerCase();
+  const rows = all.filter(b => !q || b.ip.includes(q) || b.jail.toLowerCase().includes(q))
+    .sort((a, b) => a.ip.localeCompare(b.ip, undefined, {numeric: true}));
+  const net = {}; for (const b of all) net[ipNet(b.ip)] = (net[ipNet(b.ip)] || 0) + 1;
+  $('#f2bBannedHead').hidden = $('#f2bBannedCard').hidden = !f.installed;
+  $('#f2bBannedCount').textContent = '(' + (q ? rows.length + ' of ' : '') + all.length + ')';
+  $('#f2bBannedEmpty').hidden = rows.length > 0;
+  const shown = rows.slice(0, 300);
+  $('#f2bBannedMore').hidden = rows.length <= 300; $('#f2bBannedMore').textContent = 'Showing 300 of ' + rows.length + ' - use the filter.';
+  $('#f2bBanned').replaceChildren(...shown.map(b => el('tr', {},
+    el('td', {class: 'mono', textContent: b.ip}),
+    el('td', {}, el('span', {class: 'tag', textContent: b.jail})),
+    el('td', {class: 'small muted', textContent: ipNet(b.ip) + (net[ipNet(b.ip)] > 1 ? ' · ' + net[ipNet(b.ip)] + ' banned from it' : '')}),
+    el('td', {class: 'num'}, el('button', {class: 'link', textContent: 'Unban', onclick: () => f2bAct('unban', {jail: b.jail, ip: b.ip})})))));
+}
+$('#f2bFilter').addEventListener('input', renderBanned);
+$('#f2bCopy').onclick = () => {
+  const txt = F2B.jails.flatMap(j => j.ips.map(ip => ip + '\t' + j.name)).join('\n');
+  navigator.clipboard.writeText(txt).then(() => { $('#f2bCopy').textContent = 'Copied'; setTimeout(() => $('#f2bCopy').textContent = 'Copy list', 2000); }, () => {});
+};
 async function f2bAct(what, body) {
   $('#f2bActErr').textContent = '';
   try { await api('POST', '/api/fail2ban/' + what, body || {}); } catch (e) { $('#f2bActErr').textContent = e.message; }
@@ -4464,7 +4973,7 @@ function setView() {
   view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings', '#monitor': 'monitor', '#security': 'security'}[location.hash] || 'rules';
   for (const a of document.querySelectorAll('.tabs a')) a.classList.toggle('on', a.dataset.view === view);
   for (const v of ['rules', 'domains', 'monitor', 'security', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
-  if (view === 'security' && !$('#app').hidden) loadSecurity();
+  if (view === 'security' && !$('#app').hidden) { loadSecurity(); loadFirewall(); }
   if (view === 'monitor' && !$('#app').hidden) { loadMonitor(); fillScanTargets(); }
   if (view === 'settings' && !$('#app').hidden) loadSettings();
   if ($('#app').hidden) return;
