@@ -21,6 +21,8 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 | **Settings**: only the IPs/networks you list can reach the web UI | **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report |
 | ![Health checks, alerts and port scanner](docs/screenshots/monitor.png) | ![Fail2ban jails and settings](docs/screenshots/security.png) |
 | **Monitor**: health checks with uptime and history, alerts (e-mail, webhook, Telegram), port scanner | **Security**: firewall (own iptables or Proxmox firewall), fail2ban jails and banned IPs |
+| ![WireGuard tunnel with peers](docs/screenshots/vpn.png) | |
+| **VPN**: WireGuard tunnel, devices with downloadable configs, sites, live status | |
 
 <sub>Screenshots use sample data from the built-in mock mode (`./dev.sh`). Regenerate them with `dev/screenshots.sh`.</sub>
 
@@ -244,6 +246,16 @@ The **Monitor** tab watches your guests and domains:
 - **Port scanner:** a TCP connect scan from the host (about 90 common ports, or ranges up to 5000), with service names and risk levels. It shows what the host itself can reach; the internet's view can differ. To prevent misuse, only this host, private networks and known guests can be scanned.
 
 CLI: `pve-gateway monitors` runs every check once; `pve-gateway scan 10.10.10.11 1-1024` scans from the shell.
+
+## WireGuard VPN
+
+The **VPN** tab sets up WireGuard on the host:
+- **Tunnels:** a new tunnel comes pre-filled with sensible defaults: a free `10.99.x.0/24` subnet, UDP 51820, this host's public address as the endpoint, and the guest bridges as the networks clients can reach. Keys are generated on the host, and the tunnel starts now and at boot (`wg-quick@wg0`).
+- **Devices** (phone, laptop): keys are generated for them, and you get the **client config** to import into the WireGuard app (view, copy or download).
+- **Sites** (another router or office): paste its public key, plus the networks behind it, its endpoint and keepalive.
+- **Peer details:** optional pre-shared keys, and live status per peer: online, last handshake, endpoint and traffic.
+
+Peer changes are applied with `wg syncconf`, so connected clients stay connected. There are no free-form `PostUp` lines. NAT for VPN clients (*NAT to guest networks*) and forwarding are pve-gateway iptables rules, and the WireGuard port opens automatically in pve-gateway's firewall. Private keys stay in `/etc/pve-gateway/wireguard/` and `/etc/wireguard/` (mode 0600); they never appear in `config.json`, the API or the debug report.
 
 ## Firewall
 

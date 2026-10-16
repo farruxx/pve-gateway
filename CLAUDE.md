@@ -22,7 +22,7 @@ Guidance for AI-assisted work on **pve-gateway**: a web UI that runs on a Proxmo
 | `README.md`, `wildcard.md` | User docs; keep them in sync with behavior changes |
 | `CHANGELOG.md` | Release notes, one `## X.Y.Z - date` section per version; shown in the UI's update card |
 
-`pve-gateway.py` is organised into sections marked `# ---- <name>`: config, validation, iptables, guests/interfaces, domains (nginx), diagnostics, monitoring, fail2ban, firewall, updates, auth, HTTP, UI, main. Keep new code in the matching section.
+`pve-gateway.py` is organised into sections marked `# ---- <name>`: config, validation, iptables, guests/interfaces, domains (nginx), diagnostics, monitoring, fail2ban, firewall, wireguard, updates, auth, HTTP, UI, main. Keep new code in the matching section.
 
 ## Run and verify
 

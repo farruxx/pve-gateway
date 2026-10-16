@@ -110,6 +110,8 @@ await shot("monitor", { hash: "#monitor", height: 760, wait: 7000, setup: `
 await shot("security", { hash: "#security", height: 760, setup: `
   ${waitFor("document.querySelectorAll('#f2bJails tr').length > 1")}
   document.querySelector('#f2bMyIp').textContent = '203.0.113.7';` });
+await shot("vpn", { hash: "#vpn", fit: true, setup: `
+  ${waitFor("document.querySelectorAll('#wgTunnels tbody tr').length > 1")}` });
 await shot("debug", { hash: "#debug", height: 900, setup: `
   ${waitFor("document.querySelectorAll('#checks li').length > 3")}
   ${CLEAN}

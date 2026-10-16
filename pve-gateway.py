@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.6.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.7.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -89,6 +89,8 @@ DEFAULTS = {
     # fail2ban: pve-gateway writes /etc/fail2ban/jail.d/pve-gateway.local only after "managed" is switched on
     # Host firewall (inbound): backend "custom" = pve-gateway's own iptables/ip6tables chain, "pve" = Proxmox firewall
     "firewall": {"backend": "custom", "enabled": False, "policy": "accept", "allow_ping": True, "rules": []},
+    # WireGuard tunnels; private keys live in <config dir>/wireguard/*.key (0600), never in config.json
+    "wireguard": {"tunnels": []},
     "fail2ban": {"managed": False, "bantime": "1h", "findtime": "10m", "maxretry": 5, "ignoreip": [],
                  "jails": {"sshd": True, "proxmox": True, "pve-gateway": True, "nginx-botsearch": True, "recidive": True}},
 }
@@ -163,6 +165,19 @@ def load_config():
     except ApiError as e:
         log("firewall settings invalid (%s) - firewall disabled" % e, "error")
         cfg["firewall"] = json.loads(json.dumps(DEFAULTS["firewall"]))
+    wg = {"tunnels": []}
+    for t in (cfg.get("wireguard") or {}).get("tunnels", []):
+        try:
+            nt = validate_wg_tunnel(t, wg["tunnels"], cfg, t.get("id"))
+            nt["public_key"] = t.get("public_key", "")
+            for p in t.get("peers", []):
+                np_ = validate_wg_peer(p, nt, p.get("id"))
+                np_["public_key"] = p.get("public_key", "")
+                nt["peers"].append(np_)
+            wg["tunnels"].append(nt)
+        except (ApiError, ValueError) as e:
+            log("skipping invalid WireGuard tunnel %r: %s" % (t.get("name"), e), "warn")
+    cfg["wireguard"] = wg
     f2b = json.loads(json.dumps(DEFAULTS["fail2ban"]))
     f2b.update({k: v for k, v in (cfg.get("fail2ban") or {}).items() if k != "jails"})
     f2b["jails"].update((cfg.get("fail2ban") or {}).get("jails") or {})
@@ -438,6 +453,14 @@ def build_ruleset(cfg):
         # rule from another tool further down can't forward these ports to a guest. (Our hook is kept at #1.)
         nat.append('-A %s -p tcp -m addrtype --dst-type LOCAL -m multiport --dports 80,443 '
                    '-m comment --comment "gw:domains" -j ACCEPT' % CH_PRE)
+    for t in cfg.get("wireguard", {}).get("tunnels", []):
+        if t["enabled"]:  # VPN clients may reach guests; replies come back as established traffic
+            net = str(ipaddress.ip_interface(t["address"]).network)
+            flt.append('-A %s -i %s -m comment --comment "gw:wg" -j ACCEPT' % (CH_FWD, t["name"]))
+            flt.append('-A %s -o %s -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "gw:wg" -j ACCEPT'
+                       % (CH_FWD, t["name"]))
+            if t["nat"]:  # guests see the host's bridge address, so they don't need a route back to the VPN
+                nat.append('-A %s -s %s ! -d %s -m comment --comment "gw:wg" -j MASQUERADE' % (CH_POST, net, net))
     for r in cfg["rules"]:
         if not r["enabled"]:
             continue
@@ -1864,6 +1887,12 @@ def checks():
             add("apt repositories", "warn", "Proxmox enterprise repos are enabled (%s) but there is no subscription, so "
                 "apt update fails with 401 - switch to no-subscription: curl -fsSL %s/master/install.sh | sh -s -- fix-repos"
                 % (", ".join(repos), REPO_RAW))
+    for t in cfg["wireguard"]["tunnels"]:
+        if t["enabled"]:
+            stt = wg_status(t)
+            online = sum(1 for x in stt["peers"].values() if x["online"])
+            add("WireGuard %s" % t["name"], _st(stt["up"]), "up, %d/%d peers online, UDP %d" % (online, len(t["peers"]), t["port"])
+                if stt["up"] else "down - try: wg-quick up %s; journalctl -u wg-quick@%s" % (t["name"], t["name"]))
     fw = cfg["firewall"]
     if fw["enabled"]:
         add("firewall", "ok", "%s backend, policy %s, %d rule(s)%s" % (
@@ -1996,6 +2025,8 @@ def sections():
         {"title": "Routes", "text": sh(["ip", "-4", "route"])[1]},
         {"title": "Listening sockets on host", "text": sh(["ss", "-Hlntup"])[1]},
         {"title": "Config " + conf_file(), "text": json.dumps(safe_cfg, indent=2)},
+        {"title": "wg show (keys hidden)", "text": re.sub(r"(private key|preshared key): \S+", r"\1: (hidden)",
+                                                           sh(["wg", "show"])[1]) if cfg["wireguard"]["tunnels"] else "(no tunnels)"},
     ] + ([
         {"title": "nginx config " + cfg["nginx_conf"], "text": _read(nginx_conf_path(cfg)) or "(not written yet)"},
         {"title": "nginx -t", "text": sh(["nginx", "-t"])[1]},
@@ -2698,6 +2729,9 @@ def fw_safety(cfg):
         rules.append(("ACCEPT", "tcp", ["80", "443"], "", "safety: domains (nginx)"))
     if os.path.exists("/etc/pve/corosync.conf") and not MOCK:
         rules.append(("ACCEPT", "udp", ["5405-5412"], "", "safety: cluster (corosync)"))
+    for t in cfg.get("wireguard", {}).get("tunnels", []):
+        if t["enabled"]:
+            rules.append(("ACCEPT", "udp", [str(t["port"])], "", "safety: WireGuard %s" % t["name"]))
     if f.get("allow_ping"):
         rules.append(("ACCEPT", "icmp", [], "", "ping"))
     return rules
@@ -2886,6 +2920,288 @@ def fw_template_rules(name):
     return [{"action": a, "proto": p, "ports": ports, "source": src, "comment": label[:40]} for a, p, ports, src in rules]
 
 
+# --------------------------------------------------------------------------- wireguard
+
+WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$")  # base64 of 32 bytes
+WG_NAME_RE = re.compile(r"^[a-z][a-z0-9]{0,14}$")
+WG_JOB = {"state": None, "msg": ""}
+
+
+def wg_secret(name, value=None):
+    """Read or write <config dir>/wireguard/<name> (0600)."""
+    d = os.path.join(CONF_DIR, "wireguard")
+    p = os.path.join(d, name)
+    if value is None:
+        return (_read(p) or "").strip()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(p + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(value.strip() + "\n")
+    os.replace(p + ".tmp", p)
+
+
+def wg_forget(name):
+    try:
+        os.remove(os.path.join(CONF_DIR, "wireguard", name))
+    except OSError:
+        pass
+
+
+def wg_installed():
+    return sh(["wg", "--version"])[0] == 0
+
+
+def wg_genkey():
+    rc, priv = run(["wg", "genkey"], check_only=True)
+    if rc != 0 or not WG_KEY_RE.match(priv.strip()):
+        raise ApiError("cannot generate a WireGuard key (is wireguard-tools installed?)", 500)
+    return priv.strip(), wg_pubkey(priv.strip())
+
+
+def wg_pubkey(priv):
+    rc, pub = run(["wg", "pubkey"], data=priv + "\n", check_only=True)
+    if rc != 0 or not WG_KEY_RE.match(pub.strip()):
+        raise ApiError("cannot derive the WireGuard public key", 500)
+    return pub.strip()
+
+
+def wg_defaults(cfg):
+    """Suggestions for a new tunnel: a free 10.99.x.0/24, port 51820, the public endpoint, guest networks."""
+    used = [ipaddress.ip_network(n["network"]) for n in host_networks()]
+    used += [ipaddress.ip_interface(t["address"]).network for t in cfg["wireguard"]["tunnels"]]
+    sub = next(n for n in ipaddress.ip_network("10.99.0.0/16").subnets(new_prefix=24) if not any(n.overlaps(u) for u in used))
+    ports = {t["port"] for t in cfg["wireguard"]["tunnels"]}
+    nets = host_networks()
+    pub = [n["ip"] for n in nets if n["public"]] or [n["ip"] for n in nets if n["wan"]]
+    return {"name": "wg%d" % len(cfg["wireguard"]["tunnels"]), "address": "%s/24" % next(sub.hosts()),
+            "port": next(p for p in range(51820, 52000) if p not in ports), "endpoint": pub[0] if pub else "",
+            "client_routes": [n["network"] for n in nets if not n["public"] and not n["wan"]]}
+
+
+def validate_wg_tunnel(data, others, cfg, tid=None):
+    t = {"id": tid or uuid.uuid4().hex[:8], "enabled": bool(data.get("enabled", True)), "nat": bool(data.get("nat", True))}
+    t["name"] = str(data.get("name", "")).strip()
+    if not WG_NAME_RE.match(t["name"]):
+        raise ApiError("interface name: lowercase letters/digits, e.g. wg0")
+    try:
+        itf = ipaddress.IPv4Interface(str(data.get("address", "")).strip())
+    except ValueError:
+        raise ApiError("tunnel address must be like 10.99.0.1/24")
+    if itf.network.prefixlen > 30 or itf.ip in (itf.network.network_address, itf.network.broadcast_address):
+        raise ApiError("tunnel address: a host address in a /30 or bigger network, e.g. 10.99.0.1/24")
+    t["address"] = str(itf)
+    try:
+        t["port"] = int(data.get("port", 51820))
+    except (TypeError, ValueError):
+        raise ApiError("port must be a number")
+    if not 1 <= t["port"] <= 65535:
+        raise ApiError("port out of range")
+    t["endpoint"] = str(data.get("endpoint", "") or "").strip().lower()
+    if t["endpoint"] and not (HOSTNAME_RE.match(t["endpoint"]) or _is_ip(t["endpoint"])):
+        raise ApiError("endpoint: this host's public hostname or IP that clients connect to")
+    t["client_routes"] = parse_networks(data.get("client_routes", []))
+    t["dns"] = [x for x in _as_list(data.get("dns", [])) if x.strip()]
+    if any(not _is_ip(x) for x in t["dns"]):
+        raise ApiError("DNS servers must be IP addresses")
+    for o in others:
+        if o["name"] == t["name"]:
+            raise ApiError("a tunnel named %s already exists" % t["name"])
+        if o["port"] == t["port"]:
+            raise ApiError("port %d is used by tunnel %s" % (t["port"], o["name"]))
+        if ipaddress.ip_interface(o["address"]).network.overlaps(itf.network):
+            raise ApiError("%s overlaps tunnel %s" % (itf.network, o["name"]))
+    for n in host_networks():
+        if ipaddress.ip_network(n["network"]).overlaps(itf.network):
+            raise ApiError("%s overlaps the host network on %s - pick another subnet" % (itf.network, n["iface"]))
+    t["peers"] = []
+    return t
+
+
+def validate_wg_peer(data, tunnel, pid=None):
+    p = {"id": pid or uuid.uuid4().hex[:8], "enabled": bool(data.get("enabled", True)), "psk": bool(data.get("psk", True))}
+    p["name"] = str(data.get("name", "")).strip()
+    if not p["name"] or not NAME_RE.match(p["name"]):
+        raise ApiError("name: 1-40 chars, letters/digits/space/_.:/@+- only")
+    p["kind"] = "site" if data.get("kind") == "site" else "device"
+    net = ipaddress.ip_interface(tunnel["address"]).network
+    taken = {ipaddress.ip_interface(tunnel["address"]).ip} | {ipaddress.ip_interface(x["address"]).ip
+                                                             for x in tunnel["peers"] if x["id"] != p["id"]}
+    addr = str(data.get("address", "") or "").strip()
+    if not addr:  # next free address in the tunnel
+        ip = next((h for h in net.hosts() if h not in taken), None)
+        if ip is None:
+            raise ApiError("the tunnel subnet is full")
+    else:
+        try:
+            ip = ipaddress.IPv4Interface(addr if "/" in addr else addr + "/32").ip
+        except ValueError:
+            raise ApiError("address must be an IP in %s" % net)
+        if ip not in net or ip in taken or ip in (net.network_address, net.broadcast_address):
+            raise ApiError("%s is not a free address in %s" % (ip, net))
+    p["address"] = "%s/32" % ip
+    p["allowed_ips"] = parse_networks(data.get("allowed_ips", [])) if p["kind"] == "site" else []
+    p["public_key"] = str(data.get("public_key", "") or "").strip()
+    if p["kind"] == "site" and not WG_KEY_RE.match(p["public_key"]):
+        raise ApiError("paste the site's WireGuard public key (44 characters ending in =)")
+    p["endpoint"] = str(data.get("endpoint", "") or "").strip()
+    if p["endpoint"]:
+        host, _, port = p["endpoint"].rpartition(":")
+        if not port.isdigit() or not 1 <= int(port) <= 65535 or not (HOSTNAME_RE.match(host.lower()) or _is_ip(host.strip("[]"))):
+            raise ApiError("endpoint must be host:port, e.g. office.example.com:51820")
+    try:
+        p["keepalive"] = int(data.get("keepalive", 25 if p["kind"] == "device" else 0) or 0)
+    except (TypeError, ValueError):
+        raise ApiError("keepalive must be seconds")
+    if not 0 <= p["keepalive"] <= 3600:
+        raise ApiError("keepalive: 0-3600 seconds")
+    for o in tunnel["peers"]:
+        if o["id"] != p["id"] and p["public_key"] and o["public_key"] == p["public_key"]:
+            raise ApiError("this public key is already used by peer %s" % o["name"])
+    return p
+
+
+def wg_server_conf(t):
+    out = ["# Generated by pve-gateway %s - managed in the web UI (VPN tab); changes here are overwritten." % VERSION,
+           "[Interface]", "Address = %s" % t["address"], "ListenPort = %d" % t["port"],
+           "PrivateKey = %s" % wg_secret(t["id"] + ".key")]
+    for p in t["peers"]:
+        if not p["enabled"] or not p["public_key"]:
+            continue
+        out += ["", "# %s (%s)" % (p["name"], p["kind"]), "[Peer]", "PublicKey = %s" % p["public_key"]]
+        psk = wg_secret(p["id"] + ".psk") if p["psk"] else ""
+        if psk:
+            out.append("PresharedKey = %s" % psk)
+        out.append("AllowedIPs = %s" % ", ".join([p["address"]] + p["allowed_ips"]))
+        if p["endpoint"]:
+            out.append("Endpoint = %s" % p["endpoint"])
+        if p["keepalive"] and p["kind"] == "site":
+            out.append("PersistentKeepalive = %d" % p["keepalive"])
+    return "\n".join(out) + "\n"
+
+
+def wg_client_conf(t, p):
+    priv = wg_secret(p["id"] + ".key")
+    if not priv:
+        raise ApiError("this device's private key isn't stored (it was created elsewhere) - nothing to download", 404)
+    net = str(ipaddress.ip_interface(t["address"]).network)
+    endpoint = t["endpoint"] or wg_defaults(STATE["cfg"])["endpoint"]
+    out = ["# %s - WireGuard config from pve-gateway (tunnel %s)" % (p["name"], t["name"]), "[Interface]",
+           "PrivateKey = %s" % priv, "Address = %s" % p["address"]]
+    if t["dns"]:
+        out.append("DNS = %s" % ", ".join(t["dns"]))
+    out += ["", "[Peer]", "PublicKey = %s" % t["public_key"]]
+    psk = wg_secret(p["id"] + ".psk") if p["psk"] else ""
+    if psk:
+        out.append("PresharedKey = %s" % psk)
+    out += ["Endpoint = %s:%d" % (("[%s]" % endpoint) if ":" in endpoint else endpoint, t["port"]),
+            "AllowedIPs = %s" % ", ".join([net] + t["client_routes"]),
+            "PersistentKeepalive = %d" % (p["keepalive"] or 25)]
+    return "\n".join(out) + "\n"
+
+
+def wg_conf_path(t):
+    p = "/etc/wireguard/%s.conf" % t["name"]
+    return MOCK.path_for(p) if MOCK else p
+
+
+def wg_is_up(name):
+    return sh(["wg", "show", name])[0] == 0
+
+
+def apply_wg(cfg, old=None):
+    """Write /etc/wireguard/<name>.conf (0600), bring tunnels up/down, sync peers without dropping sessions."""
+    if not cfg["wireguard"]["tunnels"] and not (old and old["wireguard"]["tunnels"]):
+        return None
+    if not wg_installed():
+        return "wireguard-tools is not installed - click Install or run: apt install wireguard-tools"
+    names = {t["name"] for t in cfg["wireguard"]["tunnels"]}
+    for t in (old or {}).get("wireguard", {}).get("tunnels", []):
+        if t["name"] not in names:  # tunnel removed
+            if wg_is_up(t["name"]):
+                run(["wg-quick", "down", t["name"]])
+            run(["systemctl", "disable", "wg-quick@%s" % t["name"]])
+            try:
+                os.remove(wg_conf_path(t))
+            except OSError:
+                pass
+    for t in cfg["wireguard"]["tunnels"]:
+        if DRY_RUN:
+            log("[dry-run] would write %s" % wg_conf_path(t))
+            continue
+        path = wg_conf_path(t)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(wg_server_conf(t))
+        os.replace(path + ".tmp", path)
+        up = wg_is_up(t["name"])
+        if t["enabled"]:
+            if up:  # reload peers in place: established sessions keep running
+                rc, stripped = run(["wg-quick", "strip", t["name"]], check_only=True)
+                tmp = os.path.join(os.path.dirname(path), ".%s.strip" % t["name"])
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(stripped + "\n")
+                rc, out = run(["wg", "syncconf", t["name"], tmp])
+                os.remove(tmp)
+            else:
+                rc, out = run(["wg-quick", "up", t["name"]])
+            if rc != 0:
+                return "WireGuard %s: %s" % (t["name"], out[-300:])
+            run(["systemctl", "enable", "wg-quick@%s" % t["name"]])
+        else:
+            if up:
+                run(["wg-quick", "down", t["name"]])
+            run(["systemctl", "disable", "wg-quick@%s" % t["name"]])
+    log("wireguard: %s" % ", ".join("%s %s (%d peers)" % (t["name"], "up" if t["enabled"] else "down", len(t["peers"]))
+                                    for t in cfg["wireguard"]["tunnels"]) or "no tunnels")
+    return None
+
+
+def wg_status(t):
+    """{"up", "peers": {public_key: {"endpoint", "handshake", "rx", "tx", "online"}}}"""
+    rc, out = sh(["wg", "show", t["name"], "dump"])
+    res = {"up": rc == 0, "peers": {}}
+    for line in out.splitlines()[1:] if rc == 0 else []:
+        f = line.split("\t")
+        if len(f) >= 8:
+            hs = int(f[4]) if f[4].isdigit() else 0
+            res["peers"][f[0]] = {"endpoint": "" if f[2] == "(none)" else f[2], "handshake": hs,
+                                  "rx": int(f[5]) if f[5].isdigit() else 0, "tx": int(f[6]) if f[6].isdigit() else 0,
+                                  "online": bool(hs) and time.time() - hs < 180}
+    return res
+
+
+def wg_install():
+    if WG_JOB.get("state") == "pending":
+        return
+    WG_JOB.update(state="pending", msg="installing wireguard-tools ...")
+
+    def job():
+        rc, out = run(["apt-get", "install", "-y", "-q", "wireguard-tools"], timeout=600)
+        WG_JOB.update(state="ok" if rc == 0 else "error",
+                      msg="wireguard-tools installed" if rc == 0 else "apt-get install failed: %s" % out[-300:])
+
+    threading.Thread(target=job, daemon=True).start()
+
+
+def wg_save(new, old, user, what):
+    """Apply WireGuard + the iptables side (NAT / forwarding / firewall port), then save."""
+    with LOCK:
+        err = apply_wg(new, old)
+        if err:
+            apply_wg(old, new)
+            raise ApiError(err, 500)
+        err = apply_rules(new)
+        if not err and new["firewall"]["enabled"]:
+            err = apply_fw(new)
+        if err:
+            raise ApiError(err, 500)
+        save_config(new)
+        STATE["cfg"] = new
+    log("%s %s" % (user, what))
+
+
 # --------------------------------------------------------------------------- updates
 
 UPDATE = {"latest": None, "changes": [], "checked": None, "error": None, "running": False, "started": None}
@@ -3064,7 +3380,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log("%s %s" % (self.client_address[0], fmt % args), "debug")
 
-    def send(self, code, body, ctype="application/json", cookies=()):
+    def send(self, code, body, ctype="application/json", cookies=(), headers=()):
         if ctype == "application/json":
             body = json.dumps(body)
         body = body.encode() if isinstance(body, str) else body
@@ -3077,6 +3393,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
         for c in cookies:
             self.send_header("Set-Cookie", c)
+        for k, v in headers:
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -3227,6 +3545,18 @@ class Handler(BaseHTTPRequestHandler):
                 "wildcards": cfg["wildcards"], "wildcard_status": wildcard_status(cfg), "dns_providers": DNS_PROVIDERS,
                 "nginx": {"last_apply": NGINX["last_apply"], "last_error": NGINX["last_error"]},
             })
+        if path == "/api/wireguard" and method == "GET":
+            tunnels = []
+            for t in cfg["wireguard"]["tunnels"]:
+                tunnels.append(dict(t, status=wg_status(t), peers=[dict(p, has_key=bool(wg_secret(p["id"] + ".key")))
+                                                                   for p in t["peers"]]))
+            return self.send(200, {"installed": wg_installed(), "job": WG_JOB, "tunnels": tunnels, "defaults": wg_defaults(cfg)})
+        if path == "/api/wireguard/install" and method == "POST":
+            wg_install()
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/wireguard/tunnels(?:/([0-9a-f]{1,16}))?(?:/peers(?:/([0-9a-f]{1,16}))?(/config)?)?$", path)
+        if m:
+            return self.wireguard_api(method, path, m.group(1), m.group(2), bool(m.group(3)), user)
         if path == "/api/firewall" and method == "GET":
             return self.send(200, dict(fw_state(cfg), client_ip=self.client_ip()))
         if path == "/api/firewall" and method == "PUT":
@@ -3516,6 +3846,79 @@ class Handler(BaseHTTPRequestHandler):
             issue_cert(dom["id"])  # no-op for certbot if the cert already covers these names
         return self.send(200, {"ok": True})
 
+    def wireguard_api(self, method, path, tid, pid, config, user):
+        cfg = STATE["cfg"]
+        tunnels = json.loads(json.dumps(cfg["wireguard"]["tunnels"]))
+        t = next((x for x in tunnels if x["id"] == tid), None) if tid else None
+        if tid and not t:
+            raise ApiError("tunnel not found", 404)
+        if "/peers" not in path:  # tunnel itself
+            if method == "POST" and not tid:
+                if not wg_installed():
+                    raise ApiError("wireguard-tools is not installed - click Install first")
+                new_t = validate_wg_tunnel(self.body(), tunnels, cfg)
+                priv, new_t["public_key"] = wg_genkey()
+                wg_secret(new_t["id"] + ".key", priv)
+                tunnels.append(new_t)
+                what = "created WireGuard tunnel %s" % new_t["name"]
+            elif method == "PUT" and t:
+                upd = validate_wg_tunnel(dict(t, **self.body()), [x for x in tunnels if x["id"] != tid], cfg, tid)
+                upd.update(public_key=t["public_key"], peers=t["peers"])
+                tunnels[tunnels.index(t)] = upd
+                what = "changed WireGuard tunnel %s" % upd["name"]
+            elif method == "DELETE" and t:
+                tunnels.remove(t)
+                for x in [t] + t["peers"]:
+                    wg_forget(x["id"] + ".key")
+                    wg_forget(x["id"] + ".psk")
+                what = "deleted WireGuard tunnel %s" % t["name"]
+            else:
+                raise ApiError("method not allowed", 405)
+            wg_save(dict(cfg, wireguard={"tunnels": tunnels}), cfg, user, what)
+            return self.send(200, {"ok": True})
+        if not t:
+            raise ApiError("tunnel not found", 404)
+        peer = next((x for x in t["peers"] if x["id"] == pid), None) if pid else None
+        if pid and not peer:
+            raise ApiError("peer not found", 404)
+        if config:
+            if method != "GET":
+                raise ApiError("method not allowed", 405)
+            conf = wg_client_conf(t, peer)
+            fname = re.sub(r"[^A-Za-z0-9_.-]+", "-", peer["name"]).strip("-")[:30] or "peer"
+            return self.send(200, conf, "text/plain", headers=[("Content-Disposition", 'attachment; filename="%s.conf"' % fname)])
+        result = {"ok": True}
+        if method == "POST" and not pid:
+            np_ = validate_wg_peer(self.body(), t)
+            if np_["kind"] == "device":
+                priv, np_["public_key"] = wg_genkey()
+                wg_secret(np_["id"] + ".key", priv)
+            if np_["psk"]:
+                rc, psk = run(["wg", "genpsk"], check_only=True)
+                if rc == 0 and WG_KEY_RE.match(psk.strip()):
+                    wg_secret(np_["id"] + ".psk", psk.strip())
+            t["peers"].append(np_)
+            what, peer = "added WireGuard peer %s to %s" % (np_["name"], t["name"]), np_
+        elif method == "PUT" and peer:
+            body = self.body()
+            upd = validate_wg_peer(dict(peer, **body), t, pid)
+            if upd["kind"] == "device":
+                upd["public_key"] = peer["public_key"]
+            t["peers"][t["peers"].index(peer)] = upd
+            what, peer = "changed WireGuard peer %s" % upd["name"], upd
+        elif method == "DELETE" and peer:
+            t["peers"].remove(peer)
+            wg_forget(peer["id"] + ".key")
+            wg_forget(peer["id"] + ".psk")
+            what, peer = "removed WireGuard peer %s" % peer["name"], None
+        else:
+            raise ApiError("method not allowed", 405)
+        wg_save(dict(cfg, wireguard={"tunnels": tunnels}), cfg, user, what)
+        if peer and method == "POST" and peer["kind"] == "device":
+            result["config"] = wg_client_conf(t, peer)
+            result["peer"] = peer["id"]
+        return self.send(200, result)
+
     def wildcards_api(self, method, wid, cfg, user):
         with LOCK:
             wcs = list(cfg["wildcards"])
@@ -3633,6 +4036,10 @@ def cert_reloader(ctx, cert, key):
 def serve(cfg):
     apply_rules()
     apply_nginx()
+    if cfg["wireguard"]["tunnels"]:
+        err = apply_wg(cfg)
+        if err:
+            log(err, "error")
     if cfg["firewall"]["enabled"] and cfg["firewall"]["backend"] == "custom":
         err = apply_fw(cfg)
         if err:
@@ -3684,7 +4091,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="app" hidden>
   <header>
     <h1 class="brand"><img src="/favicon.svg" alt="" width="26" height="26">PVE Gateway</h1>
-    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#monitor" data-view="monitor">Monitor</a><a href="#security" data-view="security">Security</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
+    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#monitor" data-view="monitor">Monitor</a><a href="#security" data-view="security">Security</a><a href="#vpn" data-view="vpn">VPN</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
     <div id="status" class="chips"></div>
     <span class="spacer"></span>
     <span id="who" class="muted"></span>
@@ -3843,6 +4250,15 @@ INDEX_HTML = r"""<!doctype html>
       <div class="actions"><span id="f2bSaved" class="muted small"></span><button type="button" id="f2bSave">Save &amp; apply</button></div>
     </div>
   </main>
+  <main id="view-vpn" hidden>
+    <div class="sub-head" style="margin-top:0"><h2>WireGuard VPN</h2><span id="wgState"></span><span class="spacer"></span>
+      <button type="button" id="wgInstall" hidden>Install WireGuard</button>
+      <button type="button" id="wgNewTunnel" class="ghost" hidden>+ New tunnel</button></div>
+    <p id="wgMsg" class="muted small"></p>
+    <div id="wgTunnels"></div>
+    <p class="muted small">Clients reach the tunnel network and the routes you list (e.g. the guest bridges). With NAT on, guests see
+      this host's bridge address, so they need no route back to the VPN. The WireGuard port is opened in pve-gateway's firewall automatically.</p>
+  </main>
   <main id="view-settings" hidden>
     <div class="card form-card">
       <h2>Updates</h2>
@@ -3968,6 +4384,52 @@ INDEX_HTML = r"""<!doctype html>
     <p id="fwFormErr" class="err"></p>
     <div class="actions"><button type="button" id="fwCancel" class="ghost">Cancel</button><button type="submit">OK</button></div>
   </form>
+</dialog>
+
+<dialog id="wgTDlg">
+  <form id="wgTForm" class="form">
+    <h2 id="wgTTitle">New tunnel</h2>
+    <div class="grid">
+      <label>Interface<input name="name" placeholder="wg0" spellcheck="false"></label>
+      <label>UDP port<input name="port" inputmode="numeric"></label>
+      <label>Tunnel address (this host)<input name="address" placeholder="10.99.0.1/24" spellcheck="false"></label>
+      <label>Public endpoint for clients<input name="endpoint" placeholder="this host's public IP or name" spellcheck="false"></label>
+      <label class="wide">Networks clients can reach (besides the tunnel)<textarea name="client_routes" rows="2" spellcheck="false" placeholder="10.10.10.0/24"></textarea></label>
+      <label>DNS for clients<input name="dns" placeholder="optional, e.g. 10.10.10.1" spellcheck="false"></label>
+      <label class="check"><input type="checkbox" name="nat" checked> NAT to guest networks</label>
+      <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled (up now and at boot)</label>
+    </div>
+    <p id="wgTErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" id="wgTCancel">Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="wgPDlg">
+  <form id="wgPForm" class="form">
+    <h2 id="wgPTitle">Add device</h2>
+    <div class="grid">
+      <label class="wide">Name<input name="name" maxlength="40" placeholder="e.g. laptop"></label>
+      <label>Type<select name="kind"><option value="device">Device (phone, laptop) - keys generated here</option>
+        <option value="site">Site / router - it has its own key</option></select></label>
+      <label>VPN address<input name="address" placeholder="next free" spellcheck="false"></label>
+      <label class="wide site-only">Its public key<input name="public_key" placeholder="44 characters, ends with =" spellcheck="false"></label>
+      <label class="wide site-only">Networks behind it<input name="allowed_ips" placeholder="e.g. 192.168.77.0/24 (optional)" spellcheck="false"></label>
+      <label class="site-only">Its endpoint<input name="endpoint" placeholder="optional: host:port" spellcheck="false"></label>
+      <label class="site-only">Keepalive (s)<input name="keepalive" inputmode="numeric" placeholder="0"></label>
+      <label class="check"><input type="checkbox" name="psk" checked> Pre-shared key (extra protection)</label>
+      <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+    </div>
+    <p id="wgPErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" id="wgPCancel">Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="wgCDlg">
+  <h2 id="wgCTitle">Client configuration</h2>
+  <p class="muted small">Import this into the WireGuard app on the device. It contains the device's private key - keep it private.</p>
+  <textarea id="wgCText" rows="14" readonly style="width:100%"></textarea>
+  <div class="actions"><button type="button" class="ghost" id="wgCCopy">Copy</button><button type="button" class="ghost" id="wgCDown">Download</button>
+    <button type="button" id="wgCClose">Close</button></div>
 </dialog>
 
 <dialog id="testDlg">
@@ -4160,6 +4622,7 @@ async function load() {
     if (!document.hidden && view !== 'debug' && view !== 'settings' && ![...document.querySelectorAll('dialog')].some(x => x.open)) load().catch(() => {});
     if (!document.hidden && view === 'monitor' && !$('#monDlg').open) loadMonitor();
     if (!document.hidden && view === 'security') { loadSecurity(); if (!$('#fwDlg').open) loadFirewall(); }
+    if (!document.hidden && view === 'vpn' && ![...document.querySelectorAll('dialog')].some(x => x.open)) loadVpn();
   }, 5000);
 }
 
@@ -4726,6 +5189,111 @@ $('#scanBtn').onclick = async () => {
   b.disabled = false;
 };
 
+// ---- VPN: WireGuard
+let WG = null, wgTEdit = null, wgPEdit = null, wgPTunnel = null, wgCName = 'peer';
+async function loadVpn() {
+  try { WG = await api('GET', '/api/wireguard'); renderVpn(); } catch (e) { $('#wgMsg').textContent = e.message; }
+}
+function renderVpn() {
+  const job = WG.job || {};
+  $('#wgState').replaceChildren(el('span', {class: 'chip ' + (WG.installed ? 'ok' : 'bad'), textContent: WG.installed ? 'installed' : 'not installed'}));
+  $('#wgInstall').hidden = WG.installed; $('#wgInstall').disabled = job.state === 'pending';
+  $('#wgNewTunnel').hidden = !WG.installed;
+  $('#wgMsg').textContent = job.state === 'pending' || job.state === 'error' ? job.msg : !WG.installed ? 'WireGuard gives you secure access to this host and its guests from anywhere.' :
+    !WG.tunnels.length ? 'No tunnel yet - click + New tunnel (the defaults are fine for most setups).' : '';
+  $('#wgTunnels').replaceChildren(...WG.tunnels.map(t => {
+    const st = t.status || {peers: {}};
+    return el('div', {class: 'card form-card', style: 'margin-bottom:14px;max-width:none'},
+      el('div', {class: 'sub-head', style: 'margin:0'}, el('h2', {textContent: t.name}),
+        el('span', {class: 'chip ' + (st.up ? 'ok' : t.enabled ? 'bad' : 'warn'), textContent: st.up ? 'up' : t.enabled ? 'down' : 'disabled'}),
+        el('span', {class: 'mono small', textContent: t.address + ' · UDP ' + t.port + (t.nat ? ' · NAT' : '')}),
+        el('span', {class: 'spacer'}),
+        el('button', {class: 'ghost', textContent: '+ Device', onclick: () => openWgPeer(t, null, 'device')}),
+        el('button', {class: 'ghost', textContent: '+ Site', onclick: () => openWgPeer(t, null, 'site')}),
+        el('button', {class: 'link', textContent: 'Edit', onclick: () => openWgTunnel(t)}),
+        el('button', {class: 'link del', textContent: 'Delete', onclick: async () => {
+          if (!confirm('Delete tunnel ' + t.name + ' and its ' + t.peers.length + ' peers? Their keys are deleted too.')) return;
+          await api('DELETE', '/api/wireguard/tunnels/' + t.id).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); }})),
+      el('p', {class: 'hint'}, 'Server public key: ', el('span', {class: 'mono', textContent: t.public_key}), ' ',
+        el('button', {class: 'link', textContent: 'copy', onclick: () => navigator.clipboard.writeText(t.public_key)})),
+      el('div', {class: 'scroll'}, el('table', {},
+        el('thead', {}, el('tr', {}, ...['', 'Peer', 'VPN address', 'Endpoint', 'Last handshake', 'Received / sent', ''].map(h => el('th', {textContent: h})))),
+        el('tbody', {}, ...t.peers.map(p => {
+          const ps = st.peers[p.public_key] || {};
+          const s = !p.enabled ? 'unknown' : ps.online ? 'up' : 'down';
+          return el('tr', {class: p.enabled ? '' : 'off'},
+            el('td', {}, el('span', {class: 'pill ' + s, textContent: !p.enabled ? 'off' : ps.online ? 'online' : 'offline'})),
+            el('td', {class: 'names'}, p.name, el('span', {class: 'alias', textContent: p.kind === 'site' ? 'site / router' : 'device'})),
+            el('td', {class: 'mono', textContent: p.address.replace('/32', '') + (p.allowed_ips.length ? ' + ' + p.allowed_ips.join(', ') : '')}),
+            el('td', {class: 'mono small', textContent: ps.endpoint || p.endpoint || '—'}),
+            el('td', {class: 'small', textContent: ps.handshake ? since(ps.handshake).replace(/^(\d.*)$/, '$1 ago') : 'never'}),
+            el('td', {class: 'num small', textContent: ps.rx || ps.tx ? fmtBytes(ps.rx) + ' / ' + fmtBytes(ps.tx) : '—'}),
+            el('td', {class: 'num'},
+              p.kind === 'device' && p.has_key ? el('button', {class: 'link', textContent: 'Config', onclick: () => showWgConfig(t, p)}) : null,
+              el('button', {class: 'link', textContent: 'Edit', onclick: () => openWgPeer(t, p)}),
+              el('button', {class: 'link del', textContent: 'Delete', onclick: async () => {
+                if (!confirm('Remove ' + p.name + '? It can no longer connect.')) return;
+                await api('DELETE', '/api/wireguard/tunnels/' + t.id + '/peers/' + p.id).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); }})));
+        }))),
+        t.peers.length ? null : el('p', {class: 'muted pad', textContent: 'No peers yet - add a device (phone, laptop) or a site (another router).'})));
+  }));
+}
+function openWgTunnel(t) {
+  wgTEdit = t ? t.id : null; const f = $('#wgTForm'), d = t || WG.defaults;
+  $('#wgTTitle').textContent = t ? 'Edit tunnel ' + t.name : 'New tunnel'; $('#wgTErr').textContent = '';
+  f.name.value = d.name; f.name.disabled = !!t; f.port.value = d.port; f.address.value = d.address; f.endpoint.value = d.endpoint || '';
+  f.client_routes.value = (d.client_routes || []).join('\n'); f.dns.value = (d.dns || []).join(', ');
+  f.nat.checked = t ? t.nat : true; f.enabled.checked = t ? t.enabled : true; $('#wgTDlg').showModal();
+}
+$('#wgTForm').addEventListener('submit', async e => {
+  e.preventDefault(); const f = e.target;
+  const d = {name: f.name.value.trim(), port: f.port.value, address: f.address.value.trim(), endpoint: f.endpoint.value.trim(),
+    client_routes: f.client_routes.value, dns: f.dns.value, nat: f.nat.checked, enabled: f.enabled.checked};
+  try { await api(wgTEdit ? 'PUT' : 'POST', '/api/wireguard/tunnels' + (wgTEdit ? '/' + wgTEdit : ''), d); $('#wgTDlg').close(); loadVpn(); }
+  catch (err) { $('#wgTErr').textContent = err.message; }
+});
+function wgKindChanged() { for (const x of document.querySelectorAll('#wgPForm .site-only')) x.hidden = $('#wgPForm').kind.value !== 'site'; }
+function openWgPeer(t, p, kind) {
+  wgPTunnel = t; wgPEdit = p ? p.id : null; const f = $('#wgPForm');
+  $('#wgPTitle').textContent = p ? 'Edit ' + p.name : kind === 'site' ? 'Add site' : 'Add device'; $('#wgPErr').textContent = '';
+  p = p || {kind, name: '', address: '', public_key: '', allowed_ips: [], endpoint: '', keepalive: kind === 'site' ? 25 : 0, psk: true, enabled: true};
+  f.name.value = p.name; f.kind.value = p.kind; f.kind.disabled = !!wgPEdit; f.address.value = p.address.replace('/32', '');
+  f.public_key.value = p.kind === 'site' ? p.public_key : ''; f.public_key.disabled = !!wgPEdit && p.kind !== 'site';
+  f.allowed_ips.value = p.allowed_ips.join(', '); f.endpoint.value = p.endpoint; f.keepalive.value = p.keepalive || '';
+  f.psk.checked = p.psk; f.psk.disabled = !!wgPEdit; f.enabled.checked = p.enabled;
+  wgKindChanged(); $('#wgPDlg').showModal(); f.name.focus();
+}
+$('#wgPForm').kind.addEventListener('change', wgKindChanged);
+$('#wgPForm').addEventListener('submit', async e => {
+  e.preventDefault(); const f = e.target;
+  const d = {name: f.name.value.trim(), kind: f.kind.value, address: f.address.value.trim(), public_key: f.public_key.value.trim(),
+    allowed_ips: f.allowed_ips.value, endpoint: f.endpoint.value.trim(), keepalive: f.keepalive.value, psk: f.psk.checked, enabled: f.enabled.checked};
+  try {
+    const r = await api(wgPEdit ? 'PUT' : 'POST', '/api/wireguard/tunnels/' + wgPTunnel.id + '/peers' + (wgPEdit ? '/' + wgPEdit : ''), d);
+    $('#wgPDlg').close(); await loadVpn();
+    if (r.config) showWgConfigText(d.name, r.config);
+  } catch (err) { $('#wgPErr').textContent = err.message; }
+});
+async function showWgConfig(t, p) {
+  try { const r = await fetch('/api/wireguard/tunnels/' + t.id + '/peers/' + p.id + '/config', {credentials: 'same-origin'});
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+    showWgConfigText(p.name, await r.text()); } catch (e) { $('#wgMsg').textContent = e.message; }
+}
+function showWgConfigText(name, text) {
+  wgCName = name.replace(/[^A-Za-z0-9_.-]+/g, '-') || 'peer';
+  $('#wgCTitle').textContent = 'Client configuration - ' + name; $('#wgCText').value = text; $('#wgCDlg').showModal();
+}
+$('#wgCCopy').onclick = () => navigator.clipboard.writeText($('#wgCText').value).then(() => $('#wgCCopy').textContent = 'Copied', () => {});
+$('#wgCDown').onclick = () => {
+  const url = URL.createObjectURL(new Blob([$('#wgCText').value], {type: 'text/plain'}));
+  const a = el('a', {href: url, download: wgCName + '.conf'}); document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+$('#wgCClose').onclick = () => { $('#wgCText').value = ''; $('#wgCCopy').textContent = 'Copy'; $('#wgCDlg').close(); };
+$('#wgTCancel').onclick = () => $('#wgTDlg').close();
+$('#wgPCancel').onclick = () => $('#wgPDlg').close();
+$('#wgNewTunnel').onclick = () => openWgTunnel(null);
+$('#wgInstall').onclick = async () => { await api('POST', '/api/wireguard/install', {}).catch(e => $('#wgMsg').textContent = e.message); loadVpn(); };
+
 // ---- security: firewall (edits go to a draft; Apply activates it with a 60 s keep/revert window)
 let FW = null, FWD = null, fwEditing = null, fwTick = null;
 async function loadFirewall(force) {
@@ -4970,9 +5538,10 @@ $('#saveSettings').onclick = async () => {
 };
 
 function setView() {
-  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings', '#monitor': 'monitor', '#security': 'security'}[location.hash] || 'rules';
+  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings', '#monitor': 'monitor', '#security': 'security', '#vpn': 'vpn'}[location.hash] || 'rules';
   for (const a of document.querySelectorAll('.tabs a')) a.classList.toggle('on', a.dataset.view === view);
-  for (const v of ['rules', 'domains', 'monitor', 'security', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
+  for (const v of ['rules', 'domains', 'monitor', 'security', 'vpn', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
+  if (view === 'vpn' && !$('#app').hidden) loadVpn();
   if (view === 'security' && !$('#app').hidden) { loadSecurity(); loadFirewall(); }
   if (view === 'monitor' && !$('#app').hidden) { loadMonitor(); fillScanTargets(); }
   if (view === 'settings' && !$('#app').hidden) loadSettings();
@@ -5070,6 +5639,18 @@ local development (macOS etc.):
             cfg["domains"].append(validate_domain(d, cfg["domains"], cfg))
         for m in MOCK.sample_monitors():
             cfg["monitors"].append(validate_monitor(m, cfg["monitors"]))
+        t = validate_wg_tunnel(wg_defaults(cfg), [], cfg)
+        priv, t["public_key"] = wg_genkey()
+        wg_secret(t["id"] + ".key", priv)
+        for name, kind, extra in (("laptop", "device", {}), ("phone", "device", {}),
+                                  ("office router", "site", {"public_key": wg_genkey()[1], "allowed_ips": "192.168.77.0/24",
+                                                             "endpoint": "office.example.com:51820"})):
+            peer = validate_wg_peer(dict(name=name, kind=kind, **extra), t)
+            if kind == "device":
+                pk, peer["public_key"] = wg_genkey()
+                wg_secret(peer["id"] + ".key", pk)
+            t["peers"].append(peer)
+        cfg["wireguard"]["tunnels"].append(t)
         cfg["acme_email"] = "admin@example.com"
     if a.port:
         cfg["port"] = a.port

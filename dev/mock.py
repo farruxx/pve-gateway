@@ -8,6 +8,7 @@ pve-firewall, pvesh, qm, pct, lxc-info, plus net.ipv4.ip_forward and TCP probes.
 The fake "kernel" state lives in <config-dir>/mock-state.json, so the web UI
 and CLI commands (status / test / debug / flush / mock ...) all see the same thing.
 """
+import base64
 import hashlib
 import urllib.parse
 import json
@@ -56,6 +57,7 @@ SCENARIOS = {
     "f2b-ban": "fail2ban banned Let's Encrypt's validation servers on ports 80/443 (after failed challenges)",
     "pvefw-no-http": "Proxmox firewall enabled without a rule accepting HTTP/HTTPS",
     "no-fail2ban": "fail2ban is not installed (use the Install button)",
+    "no-wireguard": "wireguard-tools is not installed (use the Install button)",
     "dnat-80": "another tool's iptables rule forwards ports 80/443 to a firewall VM instead of the host's nginx",
 }
 
@@ -154,6 +156,7 @@ def default_state():
                             {"type": "in", "action": "DROP", "proto": "tcp", "dport": "3306", "comment": "no db from outside",
                              "enable": 1}]},
         "nginx_active": True,
+        "wg": {"installed": True, "up": []},
         "f2b": {"installed": True, "jails": {"sshd": {"failed": 3, "failed_total": 412, "banned_total": 57,
                                                        "ips": ["198.51.100.23", "203.0.113.99", "192.0.2.150"] +
                                                               ["198.51.100.%d" % i for i in (41, 42, 57, 77, 120, 133, 201)] +
@@ -439,6 +442,8 @@ server {
             elif name == "dnat-80":
                 nat["PREROUTING"].insert(0, "-d %s/32 -p tcp -m multiport --dports 80,443 -j DNAT --to-destination 10.10.10.254"
                                          % HOST_IP)
+            elif name == "no-wireguard":
+                st["wg"] = {"installed": False, "up": []}
             elif name == "no-fail2ban":
                 st["f2b"] = {"installed": False, "jails": {}}
             elif name == "pvefw-no-http":
@@ -796,8 +801,65 @@ server {
             return 0, "1", True
         return 1, "(mock) unsupported fail2ban-client call", False
 
+    def c_wg(self, st, a, data):
+        if not st["wg"]["installed"]:
+            return 127, "(mock) command not found: wg", False
+        if a == ["--version"]:
+            return 0, "wireguard-tools v1.0.20210914 - https://git.zx2c4.com/wireguard-tools/", False
+        if a in (["genkey"], ["genpsk"]):
+            return 0, base64.b64encode(os.urandom(32)).decode(), False
+        if a == ["pubkey"]:
+            return 0, base64.b64encode(hashlib.sha256((data or "").strip().encode()).digest()).decode(), False
+        if a[:1] == ["syncconf"]:
+            return (0, "", False) if a[1] in st["wg"]["up"] else (1, "Unable to access interface: No such device", False)
+        if a[:1] == ["show"]:
+            if len(a) == 1:
+                return 0, "\n".join("interface: %s\n  public key: (mock)\n  private key: (hidden)\n  listening port: 51820"
+                                    % n for n in st["wg"]["up"]), False
+            if a[1] not in st["wg"]["up"]:
+                return 1, "Unable to access interface: No such device", False
+            if a[2:] == ["dump"]:
+                conf = _read_text(self.path_for("/etc/wireguard/%s.conf" % a[1]))
+                port = re.search(r"ListenPort = (\d+)", conf)
+                out = ["(hidden)\t(mock-public)\t%s\toff" % (port.group(1) if port else "51820")]
+                for i, block in enumerate(conf.split("[Peer]")[1:]):
+                    pub = re.search(r"PublicKey = (\S+)", block).group(1)
+                    allowed = re.search(r"AllowedIPs = (.+)", block).group(1).replace(" ", "")
+                    online = i % 2 == 0
+                    seed = int(hashlib.md5(pub.encode()).hexdigest()[:6], 16)
+                    out.append("\t".join([pub, "(none)", "198.51.100.%d:%d" % (seed % 200 + 20, 40000 + seed % 20000) if online else "(none)",
+                                          allowed, str(int(time.time()) - 25 - seed % 60) if online else "0",
+                                          str(seed * 913 if online else 0), str(seed * 211 if online else 0), "off"]))
+                return 0, "\n".join(out), False
+            return 0, "interface: %s" % a[1], False
+        return 1, "(mock) unsupported wg call", False
+
+    def c_wg_quick(self, st, a, data):
+        if not st["wg"]["installed"]:
+            return 127, "(mock) command not found: wg-quick", False
+        verb, name = a[0], a[1]
+        conf = _read_text(self.path_for("/etc/wireguard/%s.conf" % name))
+        if verb == "up":
+            if name in st["wg"]["up"]:
+                return 1, "wg-quick: `%s' already exists" % name, False
+            if not conf:
+                return 1, "wg-quick: `/etc/wireguard/%s.conf' does not exist" % name, False
+            st["wg"]["up"].append(name)
+            return 0, "[#] ip link add %s type wireguard" % name, True
+        if verb == "down":
+            if name not in st["wg"]["up"]:
+                return 1, "wg-quick: `%s' is not a WireGuard interface" % name, False
+            st["wg"]["up"].remove(name)
+            return 0, "[#] ip link delete dev %s" % name, True
+        if verb == "strip":
+            return 0, "\n".join(l for l in conf.splitlines() if not re.match(r"^(Address|DNS|MTU|Table|PreUp|PostUp|PreDown|PostDown)\s*=", l)), False
+        return 1, "(mock) unsupported wg-quick call", False
+
     def c_apt_get(self, st, a, data):
         time.sleep(1.5)
+        if "wireguard-tools" in a:
+            st["wg"]["installed"] = True
+            return 0, "Setting up wireguard-tools (1.0.20210914-1.1) ...", True
         if "fail2ban" in a:
             st["f2b"] = {"installed": True, "jails": {"sshd": {"failed": 0, "failed_total": 0, "banned_total": 0, "ips": []}}}
             return 0, "Setting up fail2ban (1.1.0-7) ...", True
@@ -807,6 +869,8 @@ server {
         return 0, "", False
 
     def c_systemctl(self, st, a, data):
+        if a[-1].startswith("wg-quick@"):
+            return 0, "", False
         if a[-1] != "nginx":
             return 1, "(mock) only nginx is simulated", False
         if a[0] == "is-active":

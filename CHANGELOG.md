@@ -4,6 +4,17 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.7.0 - 2026-10-16
+- VPN tab - WireGuard: create tunnels (suggested free subnet, port, public endpoint, guest networks for clients),
+  server keys generated on the host, up now and at boot (wg-quick@). Peers: devices (keys generated, client config
+  to view / copy / download) and sites/routers (their public key, networks behind them, endpoint, keepalive),
+  optional pre-shared keys. Live status: online, last handshake, endpoint, traffic. Peer changes are applied with
+  `wg syncconf`, so connected peers stay connected.
+- No free-form config lines (no PostUp/PostDown): NAT for VPN clients and forwarding are pve-gateway iptables rules;
+  the WireGuard port is opened automatically when pve-gateway's firewall is on. Private keys are stored only in
+  <config dir>/wireguard (0600) and /etc/wireguard (0600), never in config.json, the API or the debug report.
+  `install` button for wireguard-tools.
+
 ## 1.6.0 - 2026-10-16
 - Firewall (Security tab) for incoming traffic to the host, with a choice of backend: pve-gateway's own
   iptables + ip6tables chain, or the Proxmox firewall (rules created through the Proxmox API, visible in the PVE UI;
