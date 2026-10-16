@@ -26,7 +26,17 @@ GUESTS = [
     {"vmid": 104, "name": "win11", "type": "qemu", "status": "running", "ip": "10.10.10.14", "ports": [3389], "agent": False,
      "no_ping": True},
     {"vmid": 105, "name": "office-gw", "type": "qemu", "status": "running", "ip": "192.168.50.20", "ports": [443], "agent": True},
+    # no guest agent and never talked to the host: IP can't be discovered
+    {"vmid": 106, "name": "quiet-vm", "type": "qemu", "status": "running", "ip": "10.10.10.16", "ports": [22], "agent": False,
+     "no_arp": True},
+    # no guest agent, but cloud-init sets a static IP
+    {"vmid": 107, "name": "ci-node", "type": "qemu", "status": "running", "ip": "10.10.10.17", "ports": [22, 9000],
+     "agent": False, "no_arp": True, "cloudinit": True},
 ]
+
+
+def _mac(vmid):
+    return "bc:24:11:00:%02x:%02x" % (vmid // 256, vmid % 256)
 
 SCENARIOS = {
     "reset": "fresh host: empty iptables, ip_forward on (rules are re-applied by the running server)",
@@ -402,6 +412,13 @@ class Mock:
 
     # ------------------------------------------------------------------ network tools
     def c_ip(self, st, a, data):
+        if "neigh" in a:
+            out = ["192.168.1.1 dev vmbr0 lladdr 00:1a:2b:3c:4d:5e REACHABLE"]
+            for g in GUESTS:
+                if g["status"] == "running" and not g.get("no_arp") and g["ip"].startswith("10.10.10."):
+                    out.append("%s dev vmbr1 lladdr %s %s" % (g["ip"], _mac(g["vmid"]), random.choice(["REACHABLE", "STALE"])))
+            out.append("10.10.10.99 dev vmbr1 FAILED")
+            return 0, "\n".join(out), False
         if a[:2] == ["route", "get"]:
             ip = a[2]
             if ip.startswith("10.10.10."):
@@ -584,6 +601,18 @@ class Mock:
                               for g in GUESTS]), False
 
     def c_qm(self, st, a, data):
+        if a[0] == "config":
+            g = next((x for x in GUESTS if x["vmid"] == int(a[1]) and x["type"] == "qemu"), None)
+            if not g:
+                return 2, "Configuration file 'nodes/%s/qemu-server/%s.conf' does not exist" % (self.node, a[1]), False
+            lines = ["boot: order=scsi0", "cores: 2", "memory: 4096", "name: " + g["name"],
+                     "net0: virtio=%s,bridge=vmbr1,firewall=1" % _mac(g["vmid"]).upper(), "ostype: l26",
+                     "scsi0: local-lvm:vm-%d-disk-0,size=32G" % g["vmid"]]
+            if g.get("agent"):
+                lines.insert(0, "agent: 1")
+            if g.get("cloudinit"):
+                lines.append("ipconfig0: ip=%s/24,gw=%s" % (g["ip"], BRIDGE_IP))
+            return 0, "\n".join(sorted(lines)), False
         vmid = int(a[2])
         g = next((x for x in GUESTS if x["vmid"] == vmid), None)
         if not g:
