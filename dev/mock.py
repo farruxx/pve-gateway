@@ -50,6 +50,7 @@ SCENARIOS = {
     "nginx-stopped": "stop nginx (domains stop answering)",
     "nginx-test-fails": "make the next `nginx -t` fail (shows the automatic rollback)",
     "cert-expiring": "make all certificates expire in 5 days",
+    "foreign-site": "install another panel's nginx site bound to the host IP that redirects everything to HTTPS",
 }
 
 # rules seeded into a fresh ./.dev config, chosen to show every test outcome
@@ -216,22 +217,68 @@ class Mock:
             return [PUBLIC_IP, "2001:db8:ffff::10"]  # AAAA left over from an old server
         return [PUBLIC_IP]
 
-    def http_check(self, host, tls):
-        """Answer a request through the simulated nginx by reading the generated config."""
+    FOREIGN_SITE = """# another panel installed on the same host (e.g. its own setup script)
+server {
+    listen %(ip)s:80 default_server;
+    server_name admin.example.net _;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen %(ip)s:443 ssl default_server;
+    server_name admin.example.net;
+    ssl_certificate /etc/letsencrypt/live/admin.example.net/fullchain.pem;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    return 403;
+}
+"""
+
+    def _server_blocks(self):
+        """[(file, listens, names, body)] for every server block nginx would load (ours + sites-enabled)."""
+        files = [(self.path_for("/etc/nginx/conf.d"), "conf.d"), (self.path_for("/etc/nginx/sites-enabled"), "sites-enabled")]
+        out = []
+        for d, _ in files:
+            for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+                with open(os.path.join(d, f)) as fh:
+                    text = fh.read()
+                for block in re.split(r"(?m)^server \{", text)[1:]:
+                    listens = [l.split()[0] for l in re.findall(r"listen ([^;]+);", block)]
+                    names = " ".join(re.findall(r"server_name ([^;]+);", block)).split()
+                    out.append(("/etc/nginx/%s/%s" % (os.path.basename(d), f), listens, names, block))
+        return out
+
+    def http_get(self, ip, port, host, path, tls):
+        """Answer like nginx: servers bound to exactly ip:port win over wildcard listens, then server_name decides."""
         if not self._load().get("nginx_active", True):
-            return 0, "[Errno 111] Connection refused"
-        conf = self._nginx_conf()
-        for block in re.split(r"\nserver \{", conf)[1:]:
-            names = re.search(r"server_name ([^;]+);", block)
-            if not names or host not in names.group(1).split() or ("listen 443" in block) != tls:
-                continue
-            ret = re.search(r"return 301 (\S+);", block)
-            if ret:
-                return 301, "301 Moved Permanently -> " + ret.group(1).replace("$host", host).replace("$request_uri", "/")
-            m = re.search(r"proxy_pass https?://([\d.]+):(\d+);", block)
-            res, _ = self.tcp_probe(m.group(1), int(m.group(2)))
-            return (200, "200 OK") if res == "ok" else (502, "502 Bad Gateway")
-        return 404, "404 Not Found - no server block for this host, nginx's default site answered"
+            return 0, {}, b"[Errno 111] Connection refused"
+        def binds(l):
+            a, _, p = l.rpartition(":") if ":" in l else ("", "", l)
+            return int(p) == port, a in ("", "[::]", "0.0.0.0") or a == ip
+        blocks = [b for b in self._server_blocks() if any(all(binds(l)) for l in b[1])]
+        exact = [b for b in blocks if any(binds(l)[0] and l.rpartition(":")[0] == ip for l in b[1])]
+        cands = exact or blocks
+        if not cands:
+            return 0, {}, b"[Errno 111] Connection refused"
+        block = next((b for b in cands if host in b[2]), None) or \
+            next((b for b in cands if any("default_server" in x for x in re.findall(r"listen ([^;]+);", b[3]))), cands[0])
+        body = block[3]
+        srv = {"server": "nginx/1.26.3"}
+        acme = re.search(r"location \^~ /\.well-known/acme-challenge/ \{\s*root (\S+);", body)
+        if acme and path.startswith("/.well-known/acme-challenge/"):
+            f = os.path.join(self.path_for(acme.group(1)), path.lstrip("/"))
+            if os.path.isfile(f):
+                with open(f, "rb") as fh:
+                    return 200, srv, fh.read()
+            return 404, srv, b"<html>404 Not Found</html>"
+        ret = re.search(r"return 301 (\S+);", body)
+        if ret:
+            return 301, dict(srv, location=ret.group(1).replace("$host", host).replace("$request_uri", path)), b""
+        if re.search(r"return 403;", body):
+            return 403, srv, b"<html>403 Forbidden</html>"
+        m = re.search(r"proxy_pass https?://([\d.]+):(\d+);", body)
+        if not m:
+            return 404, srv, b"<html>404 Not Found</html>"
+        res, _ = self.tcp_probe(m.group(1), int(m.group(2)))
+        return (200, srv, b"guest says hello") if res == "ok" else (502, srv, b"<html>502 Bad Gateway</html>")
 
     def _nginx_conf(self):
         d = self.path_for("/etc/nginx/conf.d")
@@ -263,6 +310,10 @@ class Mock:
             raise ValueError("unknown scenario '%s' (available: %s)" % (name, ", ".join(SCENARIOS)))
         with self.lock:
             st = default_state() if name == "reset" else self._load()
+            if name == "reset":
+                foreign = os.path.join(self.path_for("/etc/nginx/sites-enabled"), "other-panel")
+                if os.path.exists(foreign):
+                    os.remove(foreign)
             nat, flt = st["tables"]["nat"]["chains"], st["tables"]["filter"]["chains"]
             if name == "unhook":
                 for chains in (nat, flt):
@@ -283,6 +334,11 @@ class Mock:
                 st["nginx_active"] = False
             elif name == "nginx-test-fails":
                 st["nginx_test_fail"] = True
+            elif name == "foreign-site":
+                d = self.path_for("/etc/nginx/sites-enabled")
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "other-panel"), "w") as f:
+                    f.write(self.FOREIGN_SITE % {"ip": HOST_IP})
             elif name == "cert-expiring":
                 for c in st["issued"].values():
                     c["expires"] = time.time() + 5 * 86400 + 3600
@@ -515,6 +571,16 @@ class Mock:
     def c_nginx(self, st, a, data):
         if a == ["-v"]:
             return 0, "nginx version: nginx/1.22.1", False
+        if a == ["-T"]:
+            out = ["nginx: the configuration file /etc/nginx/nginx.conf syntax is ok",
+                   "# configuration file /etc/nginx/nginx.conf:",
+                   "http {\n    include /etc/nginx/conf.d/*.conf;\n    include /etc/nginx/sites-enabled/*;\n}"]
+            for d in ("conf.d", "sites-enabled"):
+                p = self.path_for("/etc/nginx/" + d)
+                for f in sorted(os.listdir(p)) if os.path.isdir(p) else []:
+                    with open(os.path.join(p, f)) as fh:
+                        out += ["# configuration file /etc/nginx/%s/%s:" % (d, f), fh.read()]
+            return 0, "\n".join(out), False
         if a == ["-t"]:
             conf = self._nginx_conf()
             if st.get("nginx_test_fail"):

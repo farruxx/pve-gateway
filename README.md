@@ -271,7 +271,7 @@ Here's an example for a domain on Cloudflare DNS. It uses a DNS-01 challenge, so
 pvenode acme account register default you@example.com --directory https://acme-v02.api.letsencrypt.org/directory
 printf 'CF_Token=<token>\n' > /root/cf.env
 pvenode acme plugin add dns cloudflare --api cf --data /root/cf.env && rm /root/cf.env
-pvenode config set --acmedomain0 proxm.example.com,plugin=cloudflare
+pvenode config set --acmedomain0 pve.example.com,plugin=cloudflare
 pvenode acme cert order
 ```
 

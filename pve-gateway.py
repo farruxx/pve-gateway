@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.1"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.2.2"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -501,12 +501,19 @@ def ip_forward_on():
 
 def watchdog():
     """Re-hook our chains if something (iptables -F, network restart) removed them."""
+    tick = 0
     while True:
         time.sleep(10 if MOCK else 30)
+        tick += 1
         try:
             if not DRY_RUN and not hooks_active():
                 log("hooks missing (iptables flushed?), re-applying rules", "warn")
                 apply_rules()
+            # every ~5 min: another nginx site bound to a specific IP (installed later) would hide our domains
+            if tick % 10 == 0 and any(d["enabled"] for d in STATE["cfg"]["domains"]) and \
+                    explicit_listens(nginx_sites(STATE["cfg"])) != NGINX.get("extra"):
+                log("another nginx site changed its listen addresses, re-applying domains", "warn")
+                apply_nginx()
         except Exception as e:
             log("watchdog: %s" % e, "error")
 
@@ -990,8 +997,12 @@ def build_nginx(cfg):
     ssl_listen = "ssl" if new_h2 else "ssl http2"
     acme = ["    location ^~ /.well-known/acme-challenge/ {", "        root %s;" % cfg["acme_webroot"],
             "        default_type text/plain;", "    }"]
-    listen80 = ["    listen 80;"] + (["    listen [::]:80;"] if v6 else [])
+    extra = explicit_listens(nginx_sites(cfg))  # other sites bound to a specific IP would otherwise win
+    NGINX["extra"] = extra
+    listen80 = ["    listen 80;"] + (["    listen [::]:80;"] if v6 else []) + \
+        ["    listen %s:80;  # another site listens on this address" % a for a, p in extra if p == 80]
     listen443 = ["    listen 443 %s;" % ssl_listen] + (["    listen [::]:443 %s;" % ssl_listen] if v6 else []) + \
+        ["    listen %s:443 %s;  # another site listens on this address" % (a, ssl_listen) for a, p in extra if p == 443] + \
         (["    http2 on;"] if new_h2 else [])
     for d in cfg["domains"]:
         if not d["enabled"]:
@@ -1091,7 +1102,7 @@ def apply_nginx(cfg=None):
         return None
 
 
-def run_certbot(key, cert_name, names, auth, plugin=None, package=None):
+def run_certbot(key, cert_name, names, auth, plugin=None, package=None, preflight=False):
     """certbot certonly in the background; progress in CERT_JOBS[key]. auth = authenticator arguments."""
     if CERT_JOBS.get(key, {}).get("state") == "pending":
         return
@@ -1107,6 +1118,14 @@ def run_certbot(key, cert_name, names, auth, plugin=None, package=None):
             return fail("certbot is not installed - run: apt install certbot")
         if plugin and not re.search(r"\* %s\b" % re.escape(plugin), sh(["certbot", "plugins"], timeout=60)[1]):
             return fail("certbot plugin %s is missing - run: apt install %s" % (plugin, package))
+        if preflight:  # don't spend Let's Encrypt's failure limit (5/hour) on a request that can't succeed
+            err = apply_nginx()  # picks up other sites installed since the last save
+            if err:
+                return fail(err)
+            problems = acme_preflight(cfg, names)
+            if problems:
+                return fail("not asking Let's Encrypt, its check would fail: " + "; ".join(problems[:3]) +
+                            other_sites_hint(cfg, names))
         cmd = ["certbot", "certonly"] + auth + [
             "--non-interactive", "--agree-tos", "--keep-until-expiring", "--expand",
             "--cert-name", cert_name, "--deploy-hook", "systemctl reload nginx"]
@@ -1139,7 +1158,7 @@ def issue_cert(did, force=False):
         if w and (force or not cert_info(cfg, wc_cert_name(w))["exists"]):
             issue_wildcard(w["id"])
     elif d["tls"] == "letsencrypt":
-        run_certbot(did, d["domain"], _names(d), ["--webroot", "-w", cfg["acme_webroot"]])
+        run_certbot(did, d["domain"], _names(d), ["--webroot", "-w", cfg["acme_webroot"]], preflight=True)
 
 
 def issue_wildcard(wid):
@@ -1183,21 +1202,141 @@ def resolve(name):
         return []
 
 
-def http_check(host, tls):
-    """Request http(s)://127.0.0.1/ with Host: <host> through nginx. Returns (status, text)."""
+def check_ips():
+    """Addresses to test domains through, like visitors do: public IPv4s, else the WAN address, else loopback.
+    nginx picks server blocks per address, so 127.0.0.1 can hide another site bound to the public IP."""
+    nets = host_networks()
+    return [n["ip"] for n in nets if n["public"]] or [n["ip"] for n in nets if n["wan"]] or ["127.0.0.1"]
+
+
+def http_get(ip, port, host, path="/", tls=False, timeout=8):
+    """GET path from ip:port with Host/SNI = host. Returns (status, {header: value}, body bytes)."""
     if MOCK:
-        return MOCK.http_check(host, tls)
+        return MOCK.http_get(ip, port, host, path, tls)
     import http.client
     try:
+        conn = http.client.HTTPConnection(ip, port, timeout=timeout)
         if tls:
-            conn = http.client.HTTPSConnection("127.0.0.1", 443, timeout=8, context=ssl._create_unverified_context())
-        else:
-            conn = http.client.HTTPConnection("127.0.0.1", 80, timeout=8)
-        conn.request("GET", "/", headers={"Host": host, "User-Agent": "pve-gateway-test"})
+            sock = socket.create_connection((ip, port), timeout)
+            conn.sock = ssl._create_unverified_context().wrap_socket(sock, server_hostname=host)
+        conn.request("GET", path, headers={"Host": host, "User-Agent": "pve-gateway-check"})
         r = conn.getresponse()
-        return r.status, "%d %s%s" % (r.status, r.reason, (" -> " + r.getheader("Location")) if r.getheader("Location") else "")
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read(4096)
     except (OSError, http.client.HTTPException) as e:
-        return 0, str(e)
+        return 0, {}, str(e).encode()
+
+
+def describe_response(status, headers, body):
+    if not status:
+        return body.decode("utf-8", "replace")[:200]
+    loc = headers.get("location")
+    return "%d%s%s" % (status, " -> " + loc if loc else "", " (%s)" % headers["server"] if headers.get("server") else "")
+
+
+def http_check(host, tls):
+    """Request / for host through nginx the way visitors reach it. Returns (status, text)."""
+    ip = check_ips()[0]
+    status, headers, body = http_get(ip, 443 if tls else 80, host, "/", tls)
+    if not status:
+        return 0, describe_response(status, headers, body)
+    text = "%d via %s" % (status, ip)
+    return status, text + (" -> " + headers["location"] if headers.get("location") else "")
+
+
+def acme_preflight(cfg, names):
+    """Do what Let's Encrypt's HTTP-01 check does, from this host: serve a token from the ACME webroot and fetch it
+    for every name through the visitor-facing address. Returns a list of problems (empty = certbot can succeed)."""
+    webroot = MOCK.path_for(cfg["acme_webroot"]) if MOCK else cfg["acme_webroot"]
+    d = os.path.join(webroot, ".well-known", "acme-challenge")
+    token, body = "pvegw-" + secrets.token_urlsafe(18), secrets.token_hex(16)
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, token), "w") as f:
+            f.write(body)
+        os.chmod(os.path.join(d, token), 0o644)
+    except OSError as e:
+        return ["cannot write the challenge file in %s: %s" % (d, e)]
+    problems = []
+    try:
+        for n in names:
+            for ip in check_ips():
+                st, hdr, got = http_get(ip, 80, n, "/.well-known/acme-challenge/" + token)
+                if st != 200 or got.strip() != body.encode():
+                    problems.append("%s via %s:80 answered %s instead of the challenge" % (n, ip, describe_response(st, hdr, got)))
+    finally:
+        try:
+            os.remove(os.path.join(d, token))
+        except OSError:
+            pass
+    return problems
+
+
+def nginx_sites(cfg):
+    """Other nginx server blocks (from `nginx -T`, excluding ours): [{"file", "listen", "names", "default"}] and
+    whether nginx loads our file at all. None if nginx -T fails."""
+    rc, out = sh(["nginx", "-T"], timeout=20)
+    if rc != 0:
+        return None
+    parts = re.split(r"^# configuration file (.+?):\s*$", out, flags=re.M)
+    loaded, sites = False, []
+    for name, text in zip(parts[1::2], parts[2::2]):
+        if name.strip() == cfg["nginx_conf"]:
+            loaded = True
+            continue
+        text = re.sub(r"#[^\n]*", "", text)
+        for m in re.finditer(r"(?<![\w-])server\s*\{", text):
+            depth, i = 1, m.end()
+            while i < len(text) and depth:
+                depth += {"{": 1, "}": -1}.get(text[i], 0)
+                i += 1
+            body = text[m.end():i - 1]
+            top = re.sub(r"\{[^{}]*\}", "", body)
+            while re.search(r"\{[^{}]*\}", top):
+                top = re.sub(r"\{[^{}]*\}", "", top)
+            listens = [x.strip() for x in re.findall(r"(?:^|;|\n)\s*listen\s+([^;]+);", top)]
+            names = " ".join(re.findall(r"(?:^|;|\n)\s*server_name\s+([^;]+);", top)).split()
+            sites.append({"file": name.strip(), "listen": listens, "names": names,
+                          "default": any("default_server" in x for x in listens)})
+    return {"loaded": loaded, "sites": sites}
+
+
+def explicit_listens(sites):
+    """'ip:port' (80/443) that other sites bind to explicitly. nginx only considers servers listening on exactly that
+    address for such connections, so our blocks must listen there too or they never see those requests."""
+    res = set()
+    for site in (sites or {}).get("sites", []):
+        for l in site["listen"]:
+            addr = l.split()[0]
+            m = re.match(r"^(\[[0-9a-fA-F:]+\]|\d+\.\d+\.\d+\.\d+):(80|443)$", addr)
+            if m and m.group(1) not in ("0.0.0.0", "[::]"):
+                res.add((m.group(1), int(m.group(2))))
+    return sorted(res)
+
+
+def other_sites_hint(cfg, names):
+    """Which other nginx sites could be answering instead of ours (for error messages)."""
+    sites = nginx_sites(cfg)
+    conflicts = name_conflicts(sites, names)
+    if conflicts:
+        return " - other nginx sites also define %s: %s; remove the name there" % (
+            ", ".join(sorted(conflicts)), ", ".join(sorted({f for fs in conflicts.values() for f in fs})))
+    on80 = sorted({x["file"] for x in (sites or {}).get("sites", []) if any(re.match(r"^(\S*:)?80\b", l) for l in x["listen"])})
+    if on80:
+        return " - other nginx sites on port 80: %s (one of them answers instead of pve-gateway)" % ", ".join(on80)
+    if sites is not None and not sites["loaded"]:
+        return " - nginx does not load %s at all (nginx.conf needs include /etc/nginx/conf.d/*.conf)" % cfg["nginx_conf"]
+    return " - check port 80 isn't blocked or forwarded elsewhere"
+
+
+def name_conflicts(sites, names):
+    """{name: [file, ...]} for our names that another server block also claims."""
+    res = {}
+    for site in (sites or {}).get("sites", []):
+        for n in names:
+            if any(x == n or (x.startswith("*.") and n.endswith(x[1:])) or (x.startswith(".") and (n == x[1:] or n.endswith(x)))
+                   for x in site["names"]):
+                res.setdefault(n, []).append(site["file"])
+    return res
 
 
 def name_covered(names, host):
@@ -1299,6 +1438,13 @@ def test_domain(d):
         check_dns(d, n, add)
     rc, out = sh(["systemctl", "is-active", "nginx"])
     add("nginx running", _st(out.strip() == "active"), out.strip() if out else "")
+    sites = nginx_sites(cfg)
+    if sites is not None and not sites["loaded"]:
+        add("nginx loads pve-gateway", "fail", "%s is not included by nginx.conf - nginx ignores all domains; make sure "
+            "nginx.conf has: include /etc/nginx/conf.d/*.conf;" % cfg["nginx_conf"])
+    for n, files in sorted(name_conflicts(sites, _names(d)).items()):
+        add("other site claims %s" % n, "warn", "also defined in %s - nginx uses whichever it loads first; remove the "
+            "name there" % ", ".join(sorted(set(files))))
     try:
         with open(nginx_conf_path(cfg)) as f:
             main = d["domain"] if d.get("alias_redirect") and d["aliases"] else " ".join(_names(d))
@@ -1306,6 +1452,10 @@ def test_domain(d):
     except OSError:
         present = False
     add("in nginx config", _st(present or not d["enabled"]), cfg["nginx_conf"])
+    if d["enabled"] and out.strip() == "active":
+        problems = acme_preflight(cfg, _names(d))
+        add("reachable like Let's Encrypt", _st(not problems), "; ".join(problems) + other_sites_hint(cfg, _names(d)) if problems else
+            "challenge file served for %s via %s:80" % (", ".join(_names(d)), check_ips()[0]))
     res, ms = tcp_probe(d["ip"], d["port"])
     add("upstream %s:%d" % (d["ip"], d["port"]), _st(res == "ok"),
         "connected in %dms" % ms if res == "ok" else res + (" - nothing listens on that port" if res == "refused" else ""))
@@ -1515,6 +1665,15 @@ def checks():
         add("nginx installed", _st(rc == 0), out if rc == 0 else "apt install nginx")
         rc, out = sh(["systemctl", "is-active", "nginx"])
         add("nginx running", _st(out.strip() == "active"), out.strip())
+        sites = nginx_sites(cfg)
+        if sites is not None:
+            add("nginx loads pve-gateway.conf", _st(sites["loaded"] or not cfg["domains"]),
+                "yes" if sites["loaded"] else "no - nginx.conf must include /etc/nginx/conf.d/*.conf")
+            for a, p in explicit_listens(sites):
+                add("other site on %s:%d" % (a, p), "info", "another nginx site binds this address explicitly - pve-gateway's "
+                    "domains listen there too, so nginx still picks them by name")
+            for n, files in sorted(name_conflicts(sites, [x for dm in cfg["domains"] if dm["enabled"] for x in _names(dm)]).items()):
+                add("name conflict %s" % n, "warn", "also defined in %s" % ", ".join(sorted(set(files))))
         add("nginx last apply", _st(not NGINX["last_error"]), NGINX["last_error"] or (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NGINX["last_apply"])) if NGINX["last_apply"] else "never"))
         rc, out = sh(["ss", "-Hlntp"])
@@ -2854,7 +3013,15 @@ function certChip(cert, job, label) {
   return el('span', {class: 'chip bad', textContent: 'no certificate'});
 }
 
-function tlsCell(d) {
+function clickable(chip, d) {
+  if (!/bad/.test(chip.className)) return chip;
+  chip.style.cursor = 'pointer'; chip.title = (chip.title ? chip.title + '\n\n' : '') + 'Click to run the test and see why';
+  chip.onclick = () => runTestUrl('Test: ' + d.domain + ' → ' + d.ip + ':' + d.port, '/api/domains/' + d.id + '/test');
+  return chip;
+}
+
+function tlsCell(d) { return clickable(tlsCell0(d), d); }
+function tlsCell0(d) {
   const st = (S.domain_status || {})[d.id] || {}, job = st.job, cert = st.cert;
   if (d.tls === 'none') return el('span', {class: 'tag', textContent: 'http only'});
   if (d.tls === 'wildcard') {
