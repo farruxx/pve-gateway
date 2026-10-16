@@ -56,7 +56,16 @@ curl -fsSL https://raw.githubusercontent.com/farruxx/pve-gateway/master/install.
 
 Run the same command again to **update**. Your rules, domains and certificates are kept.
 
-- **No subscription?** `apt-get update` fails with `401 Unauthorized` on `enterprise.proxmox.com`. The installer warns and continues, because nginx and certbot come from the Debian repositories. To fix the error itself, go to **Node → Updates → Repositories** in the Proxmox UI, disable the *enterprise* repositories (pve and ceph), and add *No-Subscription*.
+- **No Proxmox subscription?** That's the normal case and it's handled for you. Without a subscription, the Proxmox *enterprise* repositories answer `401 Unauthorized`. When the installer sees that, it switches apt to the free **no-subscription** repositories:
+  - the enterprise entries (pve and ceph) are disabled, not deleted;
+  - the matching no-subscription entries are added, for the same Debian release;
+  - a backup of the old files goes to `/var/lib/pve-gateway/apt-backup/`.
+
+  Works on PVE 8 (`.list`) and PVE 9 (`.sources`). It's safe while VMs are running; nothing is upgraded or restarted. Hosts with a working subscription are left alone. Use `--keep-repos` to skip the switch, or run only the switch:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/farruxx/pve-gateway/master/install.sh | sh -s -- fix-repos
+  ```
 - **Prefer to read before you run?** Clone the repo and run the script from it; it then uses the local files instead of downloading:
 
   ```bash
