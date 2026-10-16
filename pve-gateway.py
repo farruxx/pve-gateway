@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.8.3"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.9.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -120,6 +120,18 @@ def conf_file():
     return os.path.join(CONF_DIR, "config.json")
 
 
+def _loose_group(item, what):
+    """A bad group name in a hand-edited config only affects the listing - keep the item, put it in "default"."""
+    if not isinstance(item, dict):
+        return item
+    try:
+        clean_group(item.get("group"))
+        return item
+    except ApiError as e:
+        log("%s %r: %s - using the default group" % (what, item.get("name") or item.get("domain") or item.get("id"), e), "warn")
+        return dict(item, group=DEFAULT_GROUP)
+
+
 def load_config():
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
@@ -140,7 +152,7 @@ def load_config():
     rules = []
     for r in cfg.get("rules", []):
         try:
-            rules.append(validate_rule(r, [], cfg, r.get("id")))
+            rules.append(validate_rule(_loose_group(r, "rule"), [], cfg, r.get("id")))
         except (ApiError, ValueError) as e:
             log("skipping invalid rule %r: %s" % (r.get("name") or r.get("id"), e), "warn")
     cfg["rules"] = rules
@@ -189,7 +201,7 @@ def load_config():
     domains = []
     for d in cfg.get("domains", []):
         try:
-            domains.append(validate_domain(d, domains, cfg, d.get("id"), check_rules=False))
+            domains.append(validate_domain(_loose_group(d, "domain"), domains, cfg, d.get("id"), check_rules=False))
         except (ApiError, ValueError) as e:
             log("skipping invalid domain %r: %s" % (d.get("domain") or d.get("id"), e), "warn")
     cfg["domains"] = domains
@@ -321,6 +333,20 @@ def protos(p):
     return ["tcp", "udp"] if p == "both" else [p]
 
 
+GROUP_RE = re.compile(r"^[A-Za-z0-9 _.:/@+-]{1,30}$")
+DEFAULT_GROUP = "default"
+
+
+def clean_group(v):
+    """Rules and domains are shown in groups; anything without one (older configs too) is in "default"."""
+    g = re.sub(r"\s+", " ", str(v or "").strip())
+    if not g or g.lower() == DEFAULT_GROUP:
+        return DEFAULT_GROUP
+    if not GROUP_RE.match(g):
+        raise ApiError("group: up to 30 chars, letters/digits/space/_.:/@+- only")
+    return g
+
+
 def validate_rule(data, others, cfg, rid=None):
     if not isinstance(data, dict):
         raise ApiError("rule must be an object")
@@ -331,6 +357,7 @@ def validate_rule(data, others, cfg, rid=None):
     r["name"] = str(data.get("name", "")).strip()
     if not NAME_RE.match(r["name"]):
         raise ApiError("name: max 40 chars, letters/digits/space/_.:/@+- only")
+    r["group"] = clean_group(data.get("group"))
 
     r["enabled"] = bool(data.get("enabled", True))
     r["proto"] = str(data.get("proto", "tcp")).lower()
@@ -821,6 +848,7 @@ def validate_domain(data, others, cfg, did=None, check_rules=True):
     d["domain"] = str(data.get("domain", "")).strip().lower().rstrip(".")
     if not DOMAIN_RE.match(d["domain"]):
         raise ApiError("invalid domain name '%s' (e.g. cloud.example.com)" % d["domain"])
+    d["group"] = clean_group(data.get("group"))
     aliases = data.get("aliases", [])
     if isinstance(aliases, str):
         aliases = re.split(r"[\s,]+", aliases)
@@ -4210,6 +4238,8 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/domains(?:/([0-9a-f]{1,16}))?$", path)
         if m:
             return self.domains_api(method, m.group(1), cfg, user)
+        if path == "/api/groups" and method == "POST":
+            return self.groups_api(self.body(), user)
         m = re.match(r"^/api/rules/([0-9a-f]{1,16})/test$", path)
         if m and method == "POST":
             rule = next((r for r in cfg["rules"] if r["id"] == m.group(1)), None)
@@ -4246,6 +4276,27 @@ class Handler(BaseHTTPRequestHandler):
             log("%s %s %s" % (user, method, rid or "new rule"))
         return self.send(200, {"ok": True, "rules": new["rules"]})
 
+
+    def groups_api(self, body, user):
+        """Rename a group of rules or domains; renaming to "default" (or empty) ungroups them. Display only:
+        nothing is re-applied."""
+        kind = body.get("kind")
+        if kind not in ("rules", "domains"):
+            raise ApiError("kind must be rules or domains")
+        old, new_name = clean_group(body.get("from")), clean_group(body.get("to"))
+        with LOCK:
+            cfg = STATE["cfg"]
+            items = [dict(x) for x in cfg[kind]]
+            hit = [x for x in items if x.get("group", DEFAULT_GROUP) == old]
+            if not hit:
+                raise ApiError("group %s not found" % old, 404)
+            for x in hit:
+                x["group"] = new_name
+            new = dict(cfg, **{kind: items})
+            save_config(new)
+            STATE["cfg"] = new
+        log("%s moved %d %s from group %s to %s" % (user, len(hit), kind, old, new_name))
+        return self.send(200, {"ok": True, "moved": len(hit)})
 
     def domains_api(self, method, did, cfg, user):
         with LOCK:
@@ -4866,6 +4917,8 @@ INDEX_HTML = r"""<!doctype html>
       <label class="wide">Domain<input name="domain" required placeholder="cloud.example.com" autocapitalize="off" spellcheck="false"></label>
       <label class="wide">Aliases<input name="aliases" placeholder="www.example.com (optional, space separated)" autocapitalize="off" spellcheck="false"></label>
       <label class="check wide"><input type="checkbox" name="alias_redirect"> Aliases redirect (301) to the main domain instead of showing the same site</label>
+      <label class="wide">Group<input name="group" maxlength="30" list="domGroups" placeholder="default" autocomplete="off"></label>
+      <datalist id="domGroups"></datalist>
       <label class="wide">Guest<select name="guest"><option value="">— pick a guest to fill its IP —</option></select></label>
       <label>Upstream IP<input name="ip" required placeholder="type it or pick a guest" spellcheck="false"></label>
       <label>Upstream port<input name="port" required value="80" inputmode="numeric"></label>
@@ -5069,7 +5122,9 @@ INDEX_HTML = r"""<!doctype html>
   <form id="ruleForm" class="form">
     <h2 id="dlgTitle">Add rule</h2>
     <div class="grid">
-      <label class="wide">Name<input name="name" maxlength="40" placeholder="e.g. web server"></label>
+      <label>Name<input name="name" maxlength="40" placeholder="e.g. web server"></label>
+      <label>Group<input name="group" maxlength="30" list="ruleGroups" placeholder="default" autocomplete="off"></label>
+      <datalist id="ruleGroups"></datalist>
       <label>Protocol<select name="proto"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP + UDP</option></select></label>
       <label>Host port<input name="ext_port" required placeholder="8080 or 8000-8010"></label>
       <label class="wide">Guest<select name="guest"><option value="">— pick a guest to fill its IP —</option></select></label>
@@ -5117,6 +5172,9 @@ button.link{background:none;border:1px solid transparent;color:var(--link);paddi
 button.link:hover:not(:disabled){background:var(--btn);border-color:var(--btn-line)}
 button.link.del{color:var(--bad)}button.link.del:hover:not(:disabled){background:var(--bad-bg);border-color:transparent}
 button.link:disabled{color:var(--muted)}
+tr.group-row td{background:var(--bg);padding:5px 12px}.grp-head{display:flex;align-items:center;gap:8px;position:sticky;left:12px;width:max-content}.grp-head .link{font-size:12px;padding:1px 6px}
+tr.group-row:not(:first-child) td{border-top:1px solid var(--line)}
+button.grp-toggle{background:none;border:none;color:var(--fg);padding:2px 0;font-weight:700}
 button.danger{background:var(--bad);border-color:var(--bad);color:var(--accent-fg)}
 dialog.ask{max-width:440px}dialog.ask h2{font-size:16px;margin:0 0 8px}dialog.ask p{margin:0 0 4px;white-space:pre-wrap}
 table{width:100%;border-collapse:collapse;white-space:nowrap}
@@ -5324,9 +5382,54 @@ function render() {
 
   const tb = $('#rules'); tb.replaceChildren();
   $('#empty').hidden = S.rules.length > 0;
-  for (const r of S.rules) {
+  renderGrouped(tb, 'rules', S.rules, 10, 'rule', ruleRow);
+}
+
+// ---- groups: rules and domains are shown per group; "default" first, headers only once a second group exists
+let groupsClosed = {};
+try { groupsClosed = JSON.parse(localStorage.getItem('pvegw.closedGroups') || '{}'); } catch (e) { groupsClosed = {}; }
+function grouped(items) {
+  const m = {};
+  for (const x of items) (m[x.group || 'default'] = m[x.group || 'default'] || []).push(x);
+  return Object.keys(m).sort((a, b) => (a !== 'default') - (b !== 'default') || a.localeCompare(b)).map(g => [g, m[g]]);
+}
+function groupNames(items) { return [...new Set(['default', ...items.map(x => x.group || 'default')])]; }
+function renderGrouped(tb, kind, items, cols, noun, rowFn) {
+  const gs = grouped(items);
+  if (gs.length === 1 && gs[0][0] === 'default') { for (const x of items) tb.append(rowFn(x)); return; }
+  for (const [g, xs] of gs) {
+    const key = kind + ':' + g, closed = !!groupsClosed[key], on = xs.filter(x => x.enabled).length;
+    tb.append(el('tr', {class: 'group-row'}, el('td', {colSpan: cols}, el('div', {class: 'grp-head'},
+      el('button', {class: 'grp-toggle', textContent: (closed ? '▸ ' : '▾ ') + g, 'aria-expanded': String(!closed), onclick: () => {
+        if (closed) delete groupsClosed[key]; else groupsClosed[key] = 1;
+        try { localStorage.setItem('pvegw.closedGroups', JSON.stringify(groupsClosed)); } catch (e) { /* private mode */ }
+        kind === 'rules' ? render() : renderDomains(); }}),
+      el('span', {class: 'muted small', textContent: xs.length + ' ' + noun + (xs.length === 1 ? '' : 's') + (on < xs.length ? ' · ' + (xs.length - on) + ' off' : '')}),
+      el('button', {class: 'link', textContent: '+ Add', title: 'add a ' + noun + ' to this group', onclick: () => kind === 'rules' ? openDlg(null, g) : openDomDlg(null, g)}),
+      g === 'default' ? null : el('button', {class: 'link', textContent: 'Rename', onclick: () => renameGroup(kind, g)}),
+      g === 'default' ? null : el('button', {class: 'link', textContent: 'Ungroup', title: 'move these ' + noun + 's to the default group', onclick: () => renameGroup(kind, g, 'default')})))));
+    if (!closed) for (const x of xs) tb.append(rowFn(x));
+  }
+}
+async function renameGroup(kind, from, to) {
+  if (to === undefined) {
+    to = prompt('New name for group "' + from + '" (empty = default)', from);
+    if (to === null || to.trim() === from) return;
+  }
+  to = to.trim() || 'default';
+  const n = (kind === 'rules' ? S.rules : S.domains).filter(x => (x.group || 'default') === from).length;
+  if (!await ask(to === 'default' ? 'Ungroup "' + from + '"?' : 'Rename group "' + from + '" to "' + to + '"?',
+    'Moves ' + n + ' ' + (kind === 'rules' ? 'rule' : 'domain') + (n === 1 ? '' : 's') + (to === 'default' ? ' to the default group' : '') +
+    '. Only how they are listed changes - nothing is re-applied.', to === 'default' ? 'Ungroup' : 'Rename')) return;
+  const flashFn = kind === 'rules' ? flash : domFlash;
+  try { await api('POST', '/api/groups', {kind, from, to}); flashFn('Group saved'); } catch (e) { flashFn(e.message, true); }
+  load().catch(() => {});
+}
+function fillGroups(list, items) { $(list).replaceChildren(...groupNames(items).map(g => el('option', {value: g}))); }
+
+function ruleRow(r) {
     const c = S.counters[r.id];
-    tb.append(el('tr', {class: r.enabled ? '' : 'off'},
+    return el('tr', {class: r.enabled ? '' : 'off'},
       el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: r.enabled, title: r.enabled ? 'Disable' : 'Enable',
         onchange: async e => { if (await askToggle(e, 'rule "' + (r.name || r.ext_port) + '"')) save(r.id, Object.assign({}, r, {enabled: e.target.checked})).catch(() => {}); }})),
       el('td', {textContent: r.name || '—'}),
@@ -5340,8 +5443,7 @@ function render() {
       el('td', {class: 'num'},
         el('button', {class: 'link', textContent: 'Test', onclick: () => runTest(r)}),
         el('button', {class: 'link', textContent: 'Edit', onclick: () => openDlg(r)}),
-        el('button', {class: 'link del', textContent: 'Delete', onclick: () => del(r)}))));
-  }
+        el('button', {class: 'link del', textContent: 'Delete', onclick: () => del(r)})));
 }
 
 async function save(id, data) {
@@ -5371,7 +5473,7 @@ async function fillGuests(sel = $('#ruleForm').guest) {
   }
 }
 
-function openDlg(r) {
+function openDlg(r, group) {
   editing = r ? r.id : null;
   const f = $('#ruleForm');
   $('#dlgTitle').textContent = r ? 'Edit rule' : 'Add rule';
@@ -5381,6 +5483,7 @@ function openDlg(r) {
   for (const i of S.ifaces) iface.append(el('option', {value: i, textContent: netLabel(i)}));
   r = r || {proto: 'tcp', enabled: true};
   for (const k of ['name', 'proto', 'ext_port', 'ip', 'int_port', 'source', 'iface']) f[k].value = r[k] || '';
+  fillGroups('#ruleGroups', S.rules); f.group.value = r.id ? (r.group === 'default' ? '' : r.group || '') : group && group !== 'default' ? group : '';
   if (r.iface && !S.ifaces.includes(r.iface)) iface.append(el('option', {value: r.iface, textContent: r.iface, selected: true}));
   f.masq.checked = !!r.masq; f.enabled.checked = r.enabled !== false;
   $('#dlg').showModal();
@@ -5406,11 +5509,11 @@ $('#ruleForm').guest.addEventListener('change', () => pickGuest($('#ruleForm'), 
 $('#ruleForm').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, d = {};
-  for (const k of ['name', 'proto', 'ext_port', 'ip', 'int_port', 'source', 'iface']) d[k] = f[k].value.trim();
+  for (const k of ['name', 'proto', 'ext_port', 'ip', 'int_port', 'source', 'iface', 'group']) d[k] = f[k].value.trim();
   d.masq = f.masq.checked; d.enabled = f.enabled.checked;
   if (!await ask((editing ? 'Save changes to rule ' : 'Create rule ') + '"' + (d.name || d.ext_port) + '"?',
     (d.proto === 'both' ? 'TCP+UDP' : d.proto.toUpperCase()) + ' ' + d.ext_port + ' → ' + d.ip + (d.int_port ? ':' + d.int_port : '') +
-    (d.enabled ? '. iptables is updated right away.' : ' (disabled).'), editing ? 'Save' : 'Create')) return;
+    (d.enabled ? '. iptables is updated right away.' : ' (disabled).') + ' Group: ' + (d.group || 'default') + '.', editing ? 'Save' : 'Create')) return;
   try {
     await api(editing ? 'PUT' : 'POST', editing ? '/api/rules/' + editing : '/api/rules', d);
     $('#dlg').close(); flash('Saved and applied'); load();
@@ -5512,8 +5615,11 @@ function renderDomains() {
   tb.replaceChildren();
   $('#domEmpty').hidden = ds.length > 0;
   const ne = $('#nginxErr'); ne.hidden = !(S.nginx && S.nginx.last_error); ne.textContent = ne.hidden ? '' : S.nginx.last_error;
-  for (const d of ds) {
-    tb.append(el('tr', {class: d.enabled ? '' : 'off'},
+  renderGrouped(tb, 'domains', ds, 7, 'domain', domainRow);
+}
+
+function domainRow(d) {
+    return el('tr', {class: d.enabled ? '' : 'off'},
       el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: d.enabled, title: d.enabled ? 'Disable' : 'Enable',
         onchange: async e => { if (await askToggle(e, 'domain ' + d.domain)) saveDomain(d.id, Object.assign({}, d, {enabled: e.target.checked})); }})),
       el('td', {class: 'names'}, el('a', {href: (d.tls !== 'none' ? 'https://' : 'http://') + d.domain, target: '_blank', rel: 'noopener', textContent: d.domain}),
@@ -5529,8 +5635,7 @@ function renderDomains() {
         el('button', {class: 'link', textContent: 'Test', onclick: () => runTestUrl('Test: ' + d.domain + ' → ' + d.ip + ':' + d.port, '/api/domains/' + d.id + '/test')}),
         d.tls !== 'none' ? el('button', {class: 'link', textContent: 'Cert', title: 'Request / renew certificate now', onclick: () => cert(d)}) : null,
         el('button', {class: 'link', textContent: 'Edit', onclick: () => openDomDlg(d)}),
-        el('button', {class: 'link del', textContent: 'Delete', onclick: () => delDomain(d)}))));
-  }
+        el('button', {class: 'link del', textContent: 'Delete', onclick: () => delDomain(d)})));
 }
 
 function domFlash(t, isErr) {
@@ -5557,7 +5662,7 @@ async function cert(d) {
 }
 
 let editingDom = null;
-function openDomDlg(d) {
+function openDomDlg(d, group) {
   editingDom = d ? d.id : null;
   const f = $('#domForm');
   $('#domTitle').textContent = d ? 'Edit domain' : 'Add domain';
@@ -5565,6 +5670,7 @@ function openDomDlg(d) {
   d = d || {tls: 'letsencrypt', force_https: true, headers: true, enabled: true, port: 80, max_body: '100m', aliases: [], source: []};
   for (const k of ['alias_redirect', 'hsts', 'headers', 'cloudflare']) f[k].checked = !!d[k];
   f.domain.value = d.domain || ''; f.aliases.value = (d.aliases || []).join(' ');
+  fillGroups('#domGroups', S.domains || []); f.group.value = d.id ? (d.group === 'default' ? '' : d.group || '') : group && group !== 'default' ? group : '';
   f.ip.value = d.ip || ''; f.port.value = d.port || 80; f.upstream_https.checked = !!d.upstream_https;
   f.tls.value = d.tls; f.force_https.checked = d.force_https !== false; f.max_body.value = d.max_body || '100m';
   f.source.value = (d.source || []).join(' '); f.enabled.checked = d.enabled !== false;
@@ -5598,7 +5704,7 @@ $('#domForm').guest.addEventListener('change', () => pickGuest($('#domForm'), fa
 $('#domForm').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, d = {};
-  for (const k of ['domain', 'aliases', 'ip', 'port', 'tls', 'max_body', 'source', 'acme_email']) d[k] = f[k].value.trim();
+  for (const k of ['domain', 'aliases', 'ip', 'port', 'tls', 'max_body', 'source', 'acme_email', 'group']) d[k] = f[k].value.trim();
   d.upstream_https = f.upstream_https.checked; d.force_https = f.force_https.checked; d.enabled = f.enabled.checked;
   for (const k of ['alias_redirect', 'hsts', 'headers', 'cloudflare']) d[k] = f[k].checked;
   if (!await ask((editingDom ? 'Save changes to ' : 'Add domain ') + d.domain + '?', d.domain + ' → ' + (d.upstream_https ? 'https://' : 'http://') +
@@ -6566,7 +6672,8 @@ local development (macOS etc.):
                 tls = ("%s: expires in %s days" % (kind, ci.get("days", "?")) if ci["exists"]
                        else "%s: no certificate yet" % kind if name else "wildcard: none covers it")
             print(fmt % (d["id"], "yes" if d["enabled"] else "no", " ".join(_names(d)),
-                         "%s://%s:%d" % ("https" if d["upstream_https"] else "http", d["ip"], d["port"]), tls))
+                         "%s://%s:%d" % ("https" if d["upstream_https"] else "http", d["ip"], d["port"]), tls)
+                  + ("   [%s]" % d["group"] if d["group"] != DEFAULT_GROUP else ""))
         if cfg["wildcards"]:
             print("\nWILDCARD CERTIFICATES")
             for w in cfg["wildcards"]:
@@ -6606,7 +6713,8 @@ local development (macOS etc.):
                 print(fmt % (r["id"], "yes" if r["enabled"] else "no", r["proto"], r["ext_port"],
                              "%s:%s%s" % (r["ip"], r["int_port"] or r["ext_port"], " (masq)" if r["masq"] else ""),
                              r["source"] or "any", r["iface"] or "any",
-                             "%d pkts / %d B" % tuple(c) if c else "-") + ("   " + r["name"] if r["name"] else ""))
+                             "%d pkts / %d B" % tuple(c) if c else "-") + ("   " + r["name"] if r["name"] else "")
+                      + ("   [%s]" % r["group"] if r["group"] != DEFAULT_GROUP else ""))
     elif a.cmd == "test":
         sel = [r for r in cfg["rules"] if (r["id"] in a.rules or r["name"] in a.rules or r["ext_port"] in a.rules)
                or (not a.rules and r["enabled"])]

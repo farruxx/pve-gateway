@@ -4,6 +4,13 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.9.0 - 2026-10-16
+- Groups for port rules and domains: a Group field in the add / edit dialogs (with existing groups suggested) and
+  collapsible group sections in the tables with a count, "+ Add" (pre-fills the group), Rename and Ungroup.
+  New items and everything from older configs stay in the "default" group; with only "default" the tables look as
+  before. Groups only change the listing, nothing is re-applied. Collapsed groups are remembered in the browser.
+- CLI: `status` and `domains` show the group.
+
 ## 1.8.3 - 2026-10-16
 - Every create, edit, delete, enable/disable, apply and install action now asks for confirmation first, in a dialog
   that says what will change (port rules, domains, wildcards, checks, alerts, WireGuard, firewall, fail2ban, SDN,
