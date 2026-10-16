@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.5.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -86,6 +86,9 @@ DEFAULTS = {
     # Monitoring: health checks of guests/domains and where to send alerts (secrets masked in the API/debug)
     "monitors": [],
     "alerts": {"email": "", "webhook": "", "telegram_token": "", "telegram_chat": "", "fail_after": 2, "cert_days": 14},
+    # fail2ban: pve-gateway writes /etc/fail2ban/jail.d/pve-gateway.local only after "managed" is switched on
+    "fail2ban": {"managed": False, "bantime": "1h", "findtime": "10m", "maxretry": 5, "ignoreip": [],
+                 "jails": {"sshd": True, "proxmox": True, "pve-gateway": True, "nginx-botsearch": True, "recidive": True}},
 }
 
 LOCK = threading.RLock()
@@ -152,6 +155,14 @@ def load_config():
             log("skipping invalid check %r: %s" % (m.get("name") or m.get("id"), e), "warn")
     cfg["monitors"] = mons
     cfg["alerts"] = dict(DEFAULTS["alerts"], **(cfg.get("alerts") or {}))
+    f2b = json.loads(json.dumps(DEFAULTS["fail2ban"]))
+    f2b.update({k: v for k, v in (cfg.get("fail2ban") or {}).items() if k != "jails"})
+    f2b["jails"].update((cfg.get("fail2ban") or {}).get("jails") or {})
+    try:
+        cfg["fail2ban"] = validate_f2b(f2b, json.loads(json.dumps(DEFAULTS["fail2ban"])))
+    except ApiError as e:
+        log("ignoring invalid fail2ban settings: %s" % e, "warn")
+        cfg["fail2ban"] = json.loads(json.dumps(DEFAULTS["fail2ban"]))
     domains = []
     for d in cfg.get("domains", []):
         try:
@@ -1840,6 +1851,10 @@ def checks():
             add("apt repositories", "warn", "Proxmox enterprise repos are enabled (%s) but there is no subscription, so "
                 "apt update fails with 401 - switch to no-subscription: curl -fsSL %s/master/install.sh | sh -s -- fix-repos"
                 % (", ".join(repos), REPO_RAW))
+    if f2b_installed():
+        rc, out = sh(["fail2ban-client", "status"])
+        add("fail2ban", _st(rc == 0, warn=True), (re.search(r"Jail list:\s*(.*)", out).group(1) or "no jails")
+            if rc == 0 and "Jail list" in out else "installed but not running - systemctl start fail2ban")
     down = [m["name"] or m["target"] for m in cfg.get("monitors", []) if MON.get(m["id"], {}).get("status") == "down"]
     if cfg.get("monitors"):
         add("health checks", "fail" if down else "ok", ("down: " + ", ".join(down)) if down else
@@ -2412,6 +2427,156 @@ def start_scan(target, ports):
     return SCANS[sid]
 
 
+# --------------------------------------------------------------------------- fail2ban
+
+F2B_JAILS = {  # jail -> (description, extra settings); filters prefixed pvegw- are written by pve-gateway
+    "sshd": ("SSH logins", ["backend = systemd"]),
+    "proxmox": ("Proxmox web UI logins (port 8006)", ["port = https,http,8006", "filter = pvegw-proxmox", "backend = systemd",
+                                                      "journalmatch = _SYSTEMD_UNIT=pvedaemon.service"]),
+    "pve-gateway": ("pve-gateway logins", ["filter = pvegw-login", "backend = systemd",
+                                           "journalmatch = _SYSTEMD_UNIT=pve-gateway.service"]),
+    "nginx-botsearch": ("bots probing nginx for missing pages (Let's Encrypt challenges are never counted)",
+                        ["port = http,https", "logpath = /var/log/nginx/error.log",
+                         "ignoreregex = .*/\\.well-known/acme-challenge/.*"]),
+    "recidive": ("repeat offenders: banned again within a day -> banned for a week",
+                 ["logpath = /var/log/fail2ban.log", "bantime = 1w", "findtime = 1d", "maxretry = 3"]),
+}
+F2B_FILTERS = {
+    "pvegw-proxmox": ("[Definition]\nfailregex = authentication failure; rhost=(?:::ffff:)?<HOST> user=\\S+ msg=.*\n"
+                      "ignoreregex =\njournalmatch = _SYSTEMD_UNIT=pvedaemon.service\n"),
+    "pvegw-login": "[Definition]\nfailregex = login failed from (?:::ffff:)?<HOST>\\b\nignoreregex =\n",
+}
+F2B_JAIL_FILE = "/etc/fail2ban/jail.d/pve-gateway.local"
+F2B_JOB = {"state": None, "msg": ""}
+TIME_RE = re.compile(r"^(-1|\d{1,6}[smhdw]?)$")
+
+
+def f2b_path(p):
+    return MOCK.path_for(p) if MOCK else p
+
+
+def validate_f2b(data, old):
+    f = json.loads(json.dumps(old))
+    for k in ("bantime", "findtime"):
+        if k in data:
+            v = str(data[k]).strip().lower()
+            if not TIME_RE.match(v):
+                raise ApiError("%s: a duration like 10m, 1h, 1d (or -1 = forever for the ban time)" % k)
+            if k == "findtime" and v == "-1":
+                raise ApiError("findtime can't be -1")
+            f[k] = v
+    if "maxretry" in data:
+        try:
+            f["maxretry"] = int(data["maxretry"])
+        except (TypeError, ValueError):
+            raise ApiError("maxretry must be a number")
+        if not 1 <= f["maxretry"] <= 100:
+            raise ApiError("maxretry: 1-100")
+    if "ignoreip" in data:
+        f["ignoreip"] = parse_networks(data["ignoreip"])
+    if "jails" in data:
+        jails = data["jails"] if isinstance(data["jails"], dict) else {}
+        f["jails"] = {j: bool(jails.get(j, f["jails"].get(j, False))) for j in F2B_JAILS}
+    if "managed" in data:
+        f["managed"] = bool(data["managed"])
+    return f
+
+
+def build_f2b(cfg):
+    f = cfg["fail2ban"]
+    ignore = ["127.0.0.1/8", "::1"] + f["ignoreip"]
+    out = ["# Generated by pve-gateway %s - managed in the web UI (Security tab); changes here are overwritten." % VERSION,
+           "# jail.d/*.local is read last, so these settings win over jail.local.", "",
+           "[DEFAULT]", "bantime = %s" % f["bantime"], "findtime = %s" % f["findtime"], "maxretry = %d" % f["maxretry"],
+           "ignoreip = %s" % " ".join(ignore)]
+    for jail, (desc, extra) in F2B_JAILS.items():
+        out += ["", "# %s" % desc, "[%s]" % jail, "enabled = %s" % ("true" if f["jails"].get(jail) else "false")]
+        if jail == "pve-gateway":
+            extra = ["port = %d" % int(cfg.get("port", 8099))] + extra
+        out += extra
+    return "\n".join(out) + "\n"
+
+
+def f2b_installed():
+    return sh(["fail2ban-client", "--version"])[0] == 0
+
+
+def apply_f2b(cfg):
+    """Write jail.d/pve-gateway.local + filters, test the config (restore on failure), reload. Returns error or None."""
+    if not cfg["fail2ban"]["managed"]:
+        path = f2b_path(F2B_JAIL_FILE)
+        if os.path.exists(path):  # handing control back: remove our file
+            os.remove(path)
+            run(["fail2ban-client", "reload"])
+        return None
+    if not f2b_installed():
+        return "fail2ban is not installed - click Install or run: apt install fail2ban"
+    files = {F2B_JAIL_FILE: build_f2b(cfg)}
+    files.update({"/etc/fail2ban/filter.d/%s.conf" % n: t for n, t in F2B_FILTERS.items()})
+    if DRY_RUN:
+        log("[dry-run] would write %s" % ", ".join(files))
+        return None
+    old = {p: _read(f2b_path(p)) for p in files}
+    for p, text in files.items():
+        os.makedirs(os.path.dirname(f2b_path(p)), exist_ok=True)
+        with open(f2b_path(p), "w") as fh:
+            fh.write(text)
+    rc, out = run(["fail2ban-client", "-t"])
+    if rc != 0:
+        for p, text in old.items():
+            if text is None:
+                os.remove(f2b_path(p))
+            else:
+                with open(f2b_path(p), "w") as fh:
+                    fh.write(text)
+        return "fail2ban rejected the configuration (previous files restored): %s" % out[-400:]
+    if sh(["fail2ban-client", "ping"])[0] != 0:
+        rc, out = run(["systemctl", "enable", "--now", "fail2ban"])
+    else:
+        rc, out = run(["fail2ban-client", "reload"])
+    if rc != 0:
+        return "fail2ban reload failed: %s" % out[-300:]
+    log("fail2ban: applied (%s)" % ", ".join(j for j, on in cfg["fail2ban"]["jails"].items() if on))
+    return None
+
+
+def f2b_status():
+    res = {"installed": f2b_installed(), "running": False, "version": "", "jails": [], "job": F2B_JOB}
+    if not res["installed"]:
+        return res
+    res["version"] = sh(["fail2ban-client", "--version"])[1].splitlines()[0]
+    rc, out = sh(["fail2ban-client", "status"])
+    if rc != 0:
+        return res
+    res["running"] = True
+    m = re.search(r"Jail list:\s*(.*)", out)
+    for jail in [j.strip() for j in (m.group(1) if m else "").split(",") if j.strip()]:
+        rc, js = sh(["fail2ban-client", "status", jail])
+        num = lambda k: int((re.search(r"%s:\s*(\d+)" % k, js) or [0, 0])[1])
+        banned = re.search(r"Banned IP list:\s*(.*)", js)
+        res["jails"].append({"name": jail, "failed": num("Currently failed"), "failed_total": num("Total failed"),
+                             "banned": num("Currently banned"), "banned_total": num("Total banned"),
+                             "ips": (banned.group(1).split() if banned else [])[:200]})
+    return res
+
+
+def f2b_install():
+    if F2B_JOB.get("state") == "pending":
+        return
+    F2B_JOB.update(state="pending", msg="installing fail2ban ...")
+
+    def job():
+        rc, out = run(["apt-get", "install", "-y", "-q", "fail2ban"], timeout=600)
+        if rc != 0:
+            F2B_JOB.update(state="error", msg="apt-get install failed: %s - if apt reports 401 from enterprise.proxmox.com, "
+                           "run: curl -fsSL %s/master/install.sh | sh -s -- fix-repos" % (out[-300:], REPO_RAW))
+            return
+        err = apply_f2b(STATE["cfg"])
+        F2B_JOB.update(state="error" if err else "ok", msg=err or "fail2ban installed")
+
+    threading.Thread(target=job, daemon=True).start()
+
+
 # --------------------------------------------------------------------------- updates
 
 UPDATE = {"latest": None, "changes": [], "checked": None, "error": None, "running": False, "started": None}
@@ -2721,6 +2886,7 @@ class Handler(BaseHTTPRequestHandler):
                 LOGIN_INFLIGHT.discard(ip)
         if not user:
             time.sleep(1)
+            log("login failed from %s" % ip, "warn")  # fail2ban jail "pve-gateway" matches this line
             raise ApiError("invalid credentials or user not allowed", 401)
         with LOGIN_LOCK:
             FAILS.pop(ip, None)
@@ -2752,6 +2918,38 @@ class Handler(BaseHTTPRequestHandler):
                 "wildcards": cfg["wildcards"], "wildcard_status": wildcard_status(cfg), "dns_providers": DNS_PROVIDERS,
                 "nginx": {"last_apply": NGINX["last_apply"], "last_error": NGINX["last_error"]},
             })
+        if path == "/api/fail2ban" and method == "GET":
+            return self.send(200, dict(f2b_status(), settings=cfg["fail2ban"], jail_info={j: d for j, (d, _) in F2B_JAILS.items()},
+                                       file=F2B_JAIL_FILE, client_ip=self.client_ip()))
+        if path == "/api/fail2ban/install" and method == "POST":
+            f2b_install()
+            return self.send(200, {"ok": True})
+        if path == "/api/fail2ban" and method == "PUT":
+            with LOCK:
+                new = dict(STATE["cfg"], fail2ban=validate_f2b(self.body(), STATE["cfg"]["fail2ban"]))
+                err = apply_f2b(new)
+                if err:
+                    raise ApiError(err, 500)
+                save_config(new)
+                STATE["cfg"] = new
+            log("%s changed fail2ban settings" % user)
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/fail2ban/(ban|unban|unban-all)$", path)
+        if m and method == "POST":
+            d = self.body()
+            ip, jail = str(d.get("ip", "")).strip(), str(d.get("jail", "")).strip()
+            if m.group(1) == "unban-all":
+                rc, out = run(["fail2ban-client", "unban", "--all"])
+            else:
+                if not _is_ip(ip) or not re.match(r"^[\w.-]{1,40}$", jail):
+                    raise ApiError("give a jail and an IP address")
+                if m.group(1) == "ban" and (ip == self.client_ip() or ipaddress.ip_address(ip).is_loopback):
+                    raise ApiError("refusing to ban your own address or localhost")
+                rc, out = run(["fail2ban-client", "set", jail, "%sip" % m.group(1), ip])
+            if rc != 0:
+                raise ApiError("fail2ban-client: %s" % out[-200:], 500)
+            log("%s fail2ban %s %s %s" % (user, m.group(1), jail, ip))
+            return self.send(200, {"ok": True})
         if path == "/api/monitors" and method == "GET":
             return self.send(200, {"monitors": cfg.get("monitors", []), "status": monitor_status(),
                                    "alerts": masked_alerts(cfg.get("alerts", {})),
@@ -3150,7 +3348,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="app" hidden>
   <header>
     <h1 class="brand"><img src="/favicon.svg" alt="" width="26" height="26">PVE Gateway</h1>
-    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#monitor" data-view="monitor">Monitor</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
+    <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#monitor" data-view="monitor">Monitor</a><a href="#security" data-view="security">Security</a><a href="#settings" data-view="settings">Settings</a><a href="#debug" data-view="debug">Debug</a></nav>
     <div id="status" class="chips"></div>
     <span class="spacer"></span>
     <span id="who" class="muted"></span>
@@ -3239,6 +3437,35 @@ INDEX_HTML = r"""<!doctype html>
       <p id="scanErr" class="err"></p>
       <div class="actions"><span id="scanMsg" class="muted small"></span><button type="button" id="scanBtn">Scan</button></div>
       <div class="scroll"><table id="scanTable" hidden><thead><tr><th class="num">Port</th><th>Service</th><th>Risk</th></tr></thead><tbody id="scanRows"></tbody></table></div>
+    </div>
+  </main>
+  <main id="view-security" hidden>
+    <div class="sub-head" style="margin-top:0"><h2>Fail2ban</h2><span id="f2bState"></span><span class="spacer"></span>
+      <button type="button" id="f2bInstall" hidden>Install fail2ban</button>
+      <button type="button" class="ghost" id="f2bUnbanAll" hidden>Unban all</button></div>
+    <p id="f2bMsg" class="muted small"></p>
+    <div class="card scroll" id="f2bJailsCard" hidden>
+      <table><thead><tr><th>Jail</th><th class="num">Failed now / total</th><th class="num">Banned now / total</th><th>Banned IPs</th></tr></thead>
+        <tbody id="f2bJails"></tbody></table>
+    </div>
+    <div class="bar" id="f2bBanBar" hidden style="margin-top:12px">
+      <input id="f2bBanIp" placeholder="IP to ban" spellcheck="false" style="width:180px"><select id="f2bBanJail"></select>
+      <button type="button" class="ghost" id="f2bBan">Ban</button><span id="f2bActErr" class="err"></span>
+    </div>
+    <div class="card form-card" id="f2bSettings" hidden style="margin-top:14px">
+      <h2>Fail2ban settings</h2>
+      <label class="check"><input type="checkbox" id="f2bManaged"> Let pve-gateway manage fail2ban</label>
+      <p class="hint">Writes <code id="f2bFile"></code> (read last, so it overrides jail.local) and its own <code>pvegw-*</code> filters; unticking removes it.</p>
+      <div class="grid" id="f2bFields">
+        <label>Ban time<input id="f2bBantime" placeholder="1h (10m, 1d, -1 = forever)"></label>
+        <label>Count failures within<input id="f2bFindtime" placeholder="10m"></label>
+        <label>Failures before a ban<input id="f2bMaxretry" inputmode="numeric"></label>
+        <label class="wide">Never ban (IPs / networks)<textarea id="f2bIgnore" rows="2" spellcheck="false" placeholder="203.0.113.7&#10;10.20.0.0/24"></textarea></label>
+        <p class="hint wide">Your IP: <b id="f2bMyIp" class="mono"></b> <button type="button" class="link" id="f2bAddMe">+ add it</button> - localhost is always excluded.</p>
+        <div class="wide" id="f2bJailToggles"></div>
+      </div>
+      <p id="f2bErr" class="err"></p>
+      <div class="actions"><span id="f2bSaved" class="muted small"></span><button type="button" id="f2bSave">Save &amp; apply</button></div>
     </div>
   </main>
   <main id="view-settings" hidden>
@@ -3538,6 +3765,7 @@ async function load() {
   if (!timer) timer = setInterval(() => {
     if (!document.hidden && view !== 'debug' && view !== 'settings' && ![...document.querySelectorAll('dialog')].some(x => x.open)) load().catch(() => {});
     if (!document.hidden && view === 'monitor' && !$('#monDlg').open) loadMonitor();
+    if (!document.hidden && view === 'security') loadSecurity();
   }, 5000);
 }
 
@@ -4104,6 +4332,59 @@ $('#scanBtn').onclick = async () => {
   b.disabled = false;
 };
 
+// ---- security: fail2ban
+let F2B = null;
+async function loadSecurity() {
+  try { F2B = await api('GET', '/api/fail2ban'); renderF2b(); } catch (e) { $('#f2bMsg').textContent = e.message; }
+}
+function renderF2b() {
+  const f = F2B, st = $('#f2bState');
+  st.replaceChildren(el('span', {class: 'chip ' + (f.running ? 'ok' : f.installed ? 'warn' : 'bad'),
+    textContent: f.running ? 'running · ' + f.version : f.installed ? 'installed, not running' : 'not installed'}));
+  const job = f.job || {};
+  $('#f2bInstall').hidden = f.installed; $('#f2bInstall').disabled = job.state === 'pending';
+  $('#f2bMsg').textContent = job.state === 'pending' ? job.msg : job.state === 'error' ? job.msg : f.installed ? '' :
+    'fail2ban bans IPs that keep failing to log in (SSH, Proxmox, pve-gateway) or probe for files.';
+  $('#f2bMsg').style.color = job.state === 'error' ? 'var(--bad)' : '';
+  for (const id of ['#f2bJailsCard', '#f2bBanBar', '#f2bSettings']) $(id).hidden = !f.installed;
+  $('#f2bUnbanAll').hidden = !f.jails.some(j => j.ips.length);
+  $('#f2bJails').replaceChildren(...f.jails.map(j => el('tr', {},
+    el('td', {class: 'names'}, el('b', {textContent: j.name}), el('span', {class: 'alias', textContent: f.jail_info[j.name] || ''})),
+    el('td', {class: 'num', textContent: j.failed + ' / ' + j.failed_total}),
+    el('td', {class: 'num', textContent: j.banned + ' / ' + j.banned_total}),
+    el('td', {}, ...(j.ips.length ? j.ips.map(ip => el('span', {class: 'tag mono', style: 'margin:2px 4px 2px 0;text-transform:none'}, ip + ' ',
+      el('button', {class: 'link', textContent: '×', title: 'Unban ' + ip, onclick: () => f2bAct('unban', {jail: j.name, ip})}))) : ['—'])))));
+  $('#f2bBanJail').replaceChildren(...f.jails.map(j => el('option', {value: j.name, textContent: j.name})));
+  if (document.activeElement && document.activeElement.closest('#f2bSettings')) return;  // don't overwrite while typing
+  const c = f.settings;
+  $('#f2bManaged').checked = c.managed; $('#f2bFile').textContent = f.file;
+  $('#f2bBantime').value = c.bantime; $('#f2bFindtime').value = c.findtime; $('#f2bMaxretry').value = c.maxretry;
+  $('#f2bIgnore').value = c.ignoreip.join('\n'); $('#f2bMyIp').textContent = f.client_ip;
+  $('#f2bJailToggles').replaceChildren(...Object.entries(f.jail_info).map(([j, d]) => el('label', {class: 'check'},
+    el('input', {type: 'checkbox', name: 'jail', value: j, checked: !!c.jails[j]}), el('span', {}, el('b', {textContent: j}), ' - ' + d))));
+  for (const x of $('#f2bFields').querySelectorAll('input,textarea,button')) x.disabled = !c.managed;
+}
+async function f2bAct(what, body) {
+  $('#f2bActErr').textContent = '';
+  try { await api('POST', '/api/fail2ban/' + what, body || {}); } catch (e) { $('#f2bActErr').textContent = e.message; }
+  loadSecurity();
+}
+$('#f2bManaged').onchange = e => { for (const x of $('#f2bFields').querySelectorAll('input,textarea,button')) x.disabled = !e.target.checked; };
+$('#f2bAddMe').onclick = () => { const t = $('#f2bIgnore'), ip = $('#f2bMyIp').textContent;
+  if (!t.value.split(/[\s,]+/).includes(ip)) t.value = (t.value.trim() ? t.value.trim() + '\n' : '') + ip; };
+$('#f2bSave').onclick = async () => {
+  $('#f2bErr').textContent = '';
+  const jails = {}; for (const c of document.querySelectorAll('#f2bJailToggles input')) jails[c.value] = c.checked;
+  try {
+    await api('PUT', '/api/fail2ban', {managed: $('#f2bManaged').checked, bantime: $('#f2bBantime').value, findtime: $('#f2bFindtime').value,
+      maxretry: $('#f2bMaxretry').value, ignoreip: $('#f2bIgnore').value, jails});
+    $('#f2bSaved').textContent = 'Applied'; setTimeout(() => $('#f2bSaved').textContent = '', 3000); document.activeElement.blur(); loadSecurity();
+  } catch (e) { $('#f2bErr').textContent = e.message; }
+};
+$('#f2bInstall').onclick = () => f2bAct('install');
+$('#f2bUnbanAll').onclick = () => confirm('Unban every banned IP in all jails?') && f2bAct('unban-all');
+$('#f2bBan').onclick = () => f2bAct('ban', {jail: $('#f2bBanJail').value, ip: $('#f2bBanIp').value.trim()});
+
 // ---- updates
 const ago = t => { const m = Math.round((Date.now() / 1000 - t) / 60); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.round(m / 60) + ' h ago'; };
 function renderUpdate(u) {
@@ -4180,9 +4461,10 @@ $('#saveSettings').onclick = async () => {
 };
 
 function setView() {
-  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings', '#monitor': 'monitor'}[location.hash] || 'rules';
+  view = {'#debug': 'debug', '#domains': 'domains', '#settings': 'settings', '#monitor': 'monitor', '#security': 'security'}[location.hash] || 'rules';
   for (const a of document.querySelectorAll('.tabs a')) a.classList.toggle('on', a.dataset.view === view);
-  for (const v of ['rules', 'domains', 'monitor', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
+  for (const v of ['rules', 'domains', 'monitor', 'security', 'settings', 'debug']) $('#view-' + v).hidden = view !== v;
+  if (view === 'security' && !$('#app').hidden) loadSecurity();
   if (view === 'monitor' && !$('#app').hidden) { loadMonitor(); fillScanTargets(); }
   if (view === 'settings' && !$('#app').hidden) loadSettings();
   if ($('#app').hidden) return;
