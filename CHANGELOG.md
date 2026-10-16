@@ -4,6 +4,15 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.2.3 - 2026-10-16
+- Fix: when certbot failed, the reason (Domain / Type / Detail) was dropped - only stderr was kept, certbot prints
+  the details on stdout. Failed commands now keep both; if certbot's output still has no reason, it is read from the
+  ACME error in `/var/log/letsencrypt/letsencrypt.log`.
+- Debug: new "Let's Encrypt log" section with the relevant lines of the latest certbot run (emails and signed
+  payloads filtered out).
+- When the local challenge check passes but Let's Encrypt can't connect, the error says the block is between the
+  internet and the host (provider firewall, Proxmox firewall, router).
+
 ## 1.2.2 - 2026-10-16
 - Fix: Let's Encrypt failed when another nginx site on the host (e.g. another panel) binds the public IP explicitly
   (`listen <ip>:80`) - nginx then never used pve-gateway's blocks for that address. pve-gateway now detects such sites

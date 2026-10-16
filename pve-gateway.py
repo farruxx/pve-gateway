@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.2"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.2.3"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -365,7 +365,8 @@ def run(cmd, data=None, check_only=False, timeout=30):
         try:
             p = subprocess.run(cmd, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                universal_newlines=True, timeout=timeout)
-            rc, out = p.returncode, (p.stdout if p.returncode == 0 else (p.stderr or p.stdout)).strip()
+            rc = p.returncode
+            out = (p.stdout if rc == 0 else "\n".join(x for x in (p.stderr.strip(), p.stdout.strip()) if x)).strip()
         except (OSError, subprocess.TimeoutExpired) as e:
             rc, out = 1, str(e)
     if rc != 0 and not check_only:
@@ -1102,6 +1103,35 @@ def apply_nginx(cfg=None):
         return None
 
 
+LE_LOG = "/var/log/letsencrypt/letsencrypt.log"
+LE_LOG_KEEP = re.compile(r'Domain:|Type:|Detail:|"detail"|"type": "urn:|urn:ietf:params:acme:error|Error|error:|Attempting|'
+                         r'Requesting|Performing the following challenges|http-01|dns-01|Waiting \d+ seconds|'
+                         r'Cleaning up|Exiting abnormally|AuthorizationError|Some challenges have failed')
+LE_LOG_DROP = re.compile(r'mailto:|"payload"|"protected"|"signature"|BEGIN|Bearer|_token|secret', re.I)
+
+
+def le_log_lines(limit=80):
+    """Relevant, privacy-safe lines from the latest certbot run (letsencrypt.log is rotated per run)."""
+    text = _read(MOCK.path_for(LE_LOG) if MOCK else LE_LOG) or ""
+    lines = [l.rstrip() for l in text.splitlines() if LE_LOG_KEEP.search(l) and not LE_LOG_DROP.search(l)]
+    return lines[-limit:]
+
+
+def le_failure_reason(out):
+    """Why certbot failed: its own Domain/Type/Detail lines, else the ACME error details from letsencrypt.log."""
+    lines = [l.strip() for l in out.splitlines() if re.match(r"\s*(Domain|Type|Detail):", l)]
+    if not lines:
+        text = _read(MOCK.path_for(LE_LOG) if MOCK else LE_LOG) or ""
+        details = re.findall(r'"detail":\s*"((?:[^"\\]|\\.)*)"', text)
+        kinds = re.findall(r'"type":\s*"urn:ietf:params:acme:error:(\w+)"', text)
+        lines = ["Detail: " + d.encode().decode("unicode_escape") for d in dict.fromkeys(details)][-3:]
+        if kinds:
+            lines.insert(0, "Type: " + kinds[-1])
+    if not lines:
+        lines = [l.strip() for l in out.splitlines() if re.search(r"error|problem|Unable|Invalid|failed", l, re.I)][:4]
+    return "\n".join(lines[:6]) or out[-500:]
+
+
 def run_certbot(key, cert_name, names, auth, plugin=None, package=None, preflight=False):
     """certbot certonly in the background; progress in CERT_JOBS[key]. auth = authenticator arguments."""
     if CERT_JOBS.get(key, {}).get("state") == "pending":
@@ -1126,6 +1156,7 @@ def run_certbot(key, cert_name, names, auth, plugin=None, package=None, prefligh
             if problems:
                 return fail("not asking Let's Encrypt, its check would fail: " + "; ".join(problems[:3]) +
                             other_sites_hint(cfg, names))
+            log("certbot: local challenge check ok for %s via %s:80" % (", ".join(names), check_ips()[0]))
         cmd = ["certbot", "certonly"] + auth + [
             "--non-interactive", "--agree-tos", "--keep-until-expiring", "--expand",
             "--cert-name", cert_name, "--deploy-hook", "systemctl reload nginx"]
@@ -1135,9 +1166,11 @@ def run_certbot(key, cert_name, names, auth, plugin=None, package=None, prefligh
         log("certbot: requesting %s for %s" % (cert_name, ", ".join(names)))
         rc, out = run(cmd, timeout=900)
         if rc != 0:
-            detail = [line.strip() for line in out.splitlines()
-                      if re.search(r"Detail:|Domain:|Type:|error|Error|problem|Unable|Invalid", line)][:6]
-            return fail("\n".join(detail) or out[-500:])
+            reason = le_failure_reason(out)
+            if preflight and re.search(r"connection|Timeout|firewall", reason, re.I):
+                reason += ("\n(the same check worked from this host, so something between the internet and this host "
+                           "blocks Let's Encrypt: your hosting provider's firewall, the Proxmox firewall, or a router)")
+            return fail(reason)
         cert_info(cfg, cert_name, fresh=True)
         err = apply_nginx()
         msg = "certificate is valid, not due for renewal yet" if "no action taken" in out else "certificate installed"
@@ -1755,6 +1788,7 @@ def sections():
         {"title": "nginx config " + cfg["nginx_conf"], "text": _read(nginx_conf_path(cfg)) or "(not written yet)"},
         {"title": "nginx -t", "text": sh(["nginx", "-t"])[1]},
         {"title": "certbot certificates", "text": sh(["certbot", "certificates"], timeout=30)[1]},
+        {"title": "Let's Encrypt log (latest run, %s)" % LE_LOG, "text": "\n".join(le_log_lines()) or "(empty - no certbot run yet)"},
     ] if cfg["domains"] or os.path.exists(nginx_conf_path(cfg)) else [])
 
 
