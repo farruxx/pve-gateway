@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.4"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.3.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -391,9 +391,23 @@ def sh(cmd, timeout=10):
         return 124, "(timed out after %ss)" % timeout
 
 
+def view_wants_ports(handler):
+    """port_checks() runs several commands - only when the Domains tab asks for it (?ports=1)."""
+    return "ports=1" in (urllib.parse.urlsplit(handler.path).query or "")
+
+
+def owns_web_ports(cfg):
+    return any(d["enabled"] for d in cfg.get("domains", []))
+
+
 def build_ruleset(cfg):
     nat = ["*nat", ":%s - [0:0]" % CH_PRE, ":%s - [0:0]" % CH_POST]
     flt = ["*filter", ":%s - [0:0]" % CH_FWD]
+    if owns_web_ports(cfg):
+        # Domains: 80/443 to this host belong to nginx here. ACCEPT in nat PREROUTING ends NAT processing, so a DNAT
+        # rule from another tool further down can't forward these ports to a guest. (Our hook is kept at #1.)
+        nat.append('-A %s -p tcp -m addrtype --dst-type LOCAL -m multiport --dports 80,443 '
+                   '-m comment --comment "gw:domains" -j ACCEPT' % CH_PRE)
     for r in cfg["rules"]:
         if not r["enabled"]:
             continue
@@ -453,6 +467,11 @@ def apply_rules(cfg=None):
                     STATE["last_error"] = "cannot hook %s/%s: %s" % (table, chain, out)
                     log(STATE["last_error"], "error")
                     return STATE["last_error"]
+        if owns_web_ports(cfg) and not DRY_RUN and hook_position("nat", "PREROUTING", CH_PRE) not in (None, 1):
+            # a DNAT above our hook would still forward 80/443 away from nginx
+            log("moving pve-gateway's nat hook to the top of PREROUTING (ports 80/443 belong to nginx here)", "warn")
+            run(["iptables", "-t", "nat", "-D", "PREROUTING", "-j", CH_PRE])
+            run(["iptables", "-t", "nat", "-I", "PREROUTING", "1", "-j", CH_PRE])
         try:
             ensure_ip_forward()
         except OSError as e:
@@ -482,7 +501,7 @@ def counters():
     if rc != 0:
         return res
     for line in out.splitlines():
-        m = re.match(r"^\[(\d+):(\d+)\] -A %s .*gw:([0-9a-f]+)" % CH_PRE, line)
+        m = re.match(r"^\[(\d+):(\d+)\] -A %s .*gw:([0-9a-f]+)(?![0-9a-z])" % CH_PRE, line)
         if m:
             c = res.setdefault(m.group(3), [0, 0])
             c[0] += int(m.group(1))
@@ -510,6 +529,12 @@ def watchdog():
             if not DRY_RUN and not hooks_active():
                 log("hooks missing (iptables flushed?), re-applying rules", "warn")
                 apply_rules()
+            elif not DRY_RUN and owns_web_ports(STATE["cfg"]) and hook_position("nat", "PREROUTING", CH_PRE) not in (None, 1):
+                # another tool inserted rules above ours; they could DNAT 80/443 away from nginx
+                log("moving pve-gateway's nat hook back to the top of PREROUTING", "warn")
+                with LOCK:
+                    run(["iptables", "-t", "nat", "-D", "PREROUTING", "-j", CH_PRE])
+                    run(["iptables", "-t", "nat", "-I", "PREROUTING", "1", "-j", CH_PRE])
             # every ~5 min: another nginx site bound to a specific IP (installed later) would hide our domains
             if tick % 10 == 0 and any(d["enabled"] for d in STATE["cfg"]["domains"]) and \
                     explicit_listens(nginx_sites(STATE["cfg"])) != NGINX.get("extra"):
@@ -1152,7 +1177,11 @@ def run_certbot(key, cert_name, names, auth, plugin=None, package=None, prefligh
             err = apply_nginx()  # picks up other sites installed since the last save
             if err:
                 return fail(err)
-            problems = acme_preflight(cfg, names)
+            if owns_web_ports(cfg):
+                apply_rules(cfg)  # make sure 80/443 are kept on this host before Let's Encrypt connects
+            # the local fetch can't see rules that only match traffic from outside (e.g. DNAT -i vmbr0)
+            problems = [d for n, st, d in port_checks(cfg) if st == "fail" and "forwarded away" in n]
+            problems += acme_preflight(cfg, names)
             if problems:
                 return fail("not asking Let's Encrypt, its check would fail: " + "; ".join(problems[:3]) +
                             other_sites_hint(cfg, names))
@@ -1392,9 +1421,17 @@ def port_checks(cfg, ports=(80, 443)):
         to = re.search(r"--to-destination (\S+)", l)
         if l.startswith("-A ") and "-j DNAT" in l and m and set(ports) & _ports_in(m.group(1)) and "-p udp" not in l \
                 and not l.split()[1].startswith("PVEGW_"):
-            res.append(("port %s forwarded away" % "/".join(str(p) for p in sorted(set(ports) & _ports_in(m.group(1)))), "fail",
-                        "an iptables rule outside pve-gateway forwards it to %s, so requests never reach nginx on this host "
-                        "(%s) - remove it: iptables -t nat -D %s" % (to.group(1) if to else "another address", l[:140], l[3:])))
+            which = "/".join(str(p) for p in sorted(set(ports) & _ports_in(m.group(1))))
+            guarded = owns_web_ports(cfg) and l.split()[1] == "PREROUTING" and \
+                hook_position("nat", "PREROUTING", CH_PRE) == 1 and "gw:domains" in nat
+            if guarded:
+                res.append(("port %s kept on this host" % which, "info", "a rule from another tool would forward it to %s, "
+                            "but pve-gateway's rule runs first and keeps it for nginx here; remove the old rule when you "
+                            "can: iptables -t nat -D %s" % (to.group(1) if to else "another address", l[3:])))
+            else:
+                res.append(("port %s forwarded away" % which, "fail",
+                            "an iptables rule outside pve-gateway forwards it to %s, so requests never reach nginx on this host "
+                            "(%s) - remove it: iptables -t nat -D %s" % (to.group(1) if to else "another address", l[:140], l[3:])))
     rc, nft = sh(["nft", "list", "ruleset"])
     if rc == 0:
         table = ""
@@ -1681,7 +1718,7 @@ def loaded_rule_ids():
     rc, out = sh(["iptables-save", "-t", "nat"])
     ids = {}
     if rc == 0:
-        for m in re.finditer(r"^-A %s .*gw:([0-9a-f]+)" % CH_PRE, out, re.M):
+        for m in re.finditer(r"^-A %s .*gw:([0-9a-f]+)(?![0-9a-z])" % CH_PRE, out, re.M):
             ids[m.group(1)] = ids.get(m.group(1), 0) + 1
     return ids
 
@@ -2351,6 +2388,8 @@ class Handler(BaseHTTPRequestHandler):
                 "user": user, "version": VERSION, "rules": cfg["rules"], "counters": counters(),
                 "ui_open": not cfg.get("ui_allow"),
                 "update": {"available": update_info()["available"], "latest": UPDATE["latest"]},
+                "web_ports": [{"name": n, "status": st, "detail": dt} for n, st, dt in port_checks(cfg)]
+                if cfg["domains"] and view_wants_ports(self) else None,
                 "ifaces": list_ifaces(), "networks": host_networks(), "dry_run": DRY_RUN, "mock": bool(MOCK),
                 "status": {"ip_forward": ip_forward_on(), "active": DRY_RUN or hooks_active(),
                            "last_apply": STATE["last_apply"], "last_error": STATE["last_error"]},
@@ -2516,6 +2555,11 @@ class Handler(BaseHTTPRequestHandler):
             err = apply_nginx(new)  # validated with nginx -t, old config restored on failure
             if err:
                 raise ApiError(err, 500)
+            if owns_web_ports(new) != owns_web_ports(cfg):
+                err = apply_rules(new)  # take / release ports 80/443
+                if err:
+                    apply_nginx(cfg)
+                    raise ApiError(err, 500)
             save_config(new)
             STATE["cfg"] = new
             log("%s %s domain %s" % (user, method, dom["domain"] if dom else did))
@@ -2715,6 +2759,7 @@ INDEX_HTML = r"""<!doctype html>
       <span id="domMsg"></span>
     </div>
     <div id="netDomains" class="card netbar" hidden></div>
+    <div id="webPorts" class="card netbar" hidden></div>
     <div id="nginxErr" class="card banner" hidden></div>
     <div class="card scroll">
       <table>
@@ -2954,6 +2999,7 @@ form > .hint{margin:12px 0 0}
 APP_JS = r"""
 'use strict';
 const $ = s => document.querySelector(s);
+load.n = 0;
 let S = {rules: [], counters: {}, ifaces: []}, guests = null, editing = null, timer = null, view = 'rules', testing = null;
 
 async function api(method, path, body) {
@@ -3000,7 +3046,9 @@ function showLogin() {
 }
 
 async function load() {
-  S = await api('GET', '/api/state');
+  const prev = S.web_ports;
+  S = await api('GET', '/api/state' + (view === 'domains' && !(load.n++ % 6) ? '?ports=1' : ''));  // ports check every ~30s
+  if (S.web_ports === null && prev) S.web_ports = prev;
   $('#login').hidden = true; $('#app').hidden = false;
   render();
   if (!load.started) { load.started = true; setView(); }
@@ -3214,8 +3262,20 @@ function renderWildcards() {
   }
 }
 
+function renderWebPorts() {
+  const box = $('#webPorts'), ps = S.web_ports;
+  if (!ps) { if (!(S.domains || []).length) box.hidden = true; return; }
+  const bad = ps.filter(p => p.status === 'fail' || p.status === 'warn');
+  box.hidden = false;
+  box.replaceChildren(el('span', {class: 'muted small', textContent: 'Ports 80/443'}),
+    el('span', {class: 'chip ' + (bad.length ? 'bad' : 'ok'), textContent: bad.length ? bad.length + ' problem' + (bad.length > 1 ? 's' : '')
+      : 'handled by nginx on this host → proxied to guests'}),
+    ...bad.map(p => el('p', {class: 'hint bad', textContent: p.name + ': ' + p.detail})));
+}
+
 function renderDomains() {
   renderWildcards();
+  renderWebPorts();
   const tb = $('#domains'), ds = S.domains || [];
   tb.replaceChildren();
   $('#domEmpty').hidden = ds.length > 0;
