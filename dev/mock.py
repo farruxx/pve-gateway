@@ -52,7 +52,19 @@ SCENARIOS = {
     "cert-expiring": "make all certificates expire in 5 days",
     "foreign-site": "install another panel's nginx site bound to the host IP that redirects everything to HTTPS",
     "le-blocked": "Let's Encrypt can't reach port 80 (provider firewall) although it works from the host itself",
+    "f2b-ban": "fail2ban banned Let's Encrypt's validation servers on ports 80/443 (after failed challenges)",
+    "pvefw-no-http": "Proxmox firewall enabled without a rule accepting HTTP/HTTPS",
 }
+
+PVEFW_OK = """[OPTIONS]
+enable: 1
+
+[RULES]
+IN ACCEPT -p tcp -dport 22 -log nolog # ssh
+IN ACCEPT -p tcp -dport 8006 -log nolog # web UI
+IN HTTP(ACCEPT) -log nolog
+IN HTTPS(ACCEPT) -log nolog
+"""
 
 # rules seeded into a fresh ./.dev config, chosen to show every test outcome
 SAMPLE_RULES = [
@@ -139,6 +151,11 @@ class Mock:
     def __init__(self, conf_dir, node):
         self.path = os.path.join(conf_dir, "mock-state.json")
         self.root = os.path.join(conf_dir, "mock-fs")
+        fw = os.path.join(self.root, "etc/pve/firewall/cluster.fw")
+        if not os.path.exists(fw):
+            os.makedirs(os.path.dirname(fw))
+            with open(fw, "w") as f:
+                f.write(PVEFW_OK)
         apt = os.path.join(self.root, "etc/apt/sources.list.d")
         if not os.path.isdir(apt):  # fresh PVE without subscription: enterprise repo still enabled
             os.makedirs(apt)
@@ -315,6 +332,8 @@ server {
                 foreign = os.path.join(self.path_for("/etc/nginx/sites-enabled"), "other-panel")
                 if os.path.exists(foreign):
                     os.remove(foreign)
+                with open(self.path_for("/etc/pve/firewall/cluster.fw"), "w") as f:
+                    f.write(PVEFW_OK)
             nat, flt = st["tables"]["nat"]["chains"], st["tables"]["filter"]["chains"]
             if name == "unhook":
                 for chains in (nat, flt):
@@ -342,6 +361,15 @@ server {
                     f.write(self.FOREIGN_SITE % {"ip": HOST_IP})
             elif name == "le-blocked":
                 st["le_blocked"] = True
+            elif name == "f2b-ban":
+                st["le_blocked"] = True
+                flt["f2b-nginx-botsearch"] = ["-s 66.133.109.36/32 -j REJECT --reject-with icmp-port-unreachable",
+                                              "-s 64.78.149.164/32 -j REJECT --reject-with icmp-port-unreachable",
+                                              "-j RETURN"]
+                flt["INPUT"].insert(0, "-p tcp -m multiport --dports 80,443 -j f2b-nginx-botsearch")
+            elif name == "pvefw-no-http":
+                with open(self.path_for("/etc/pve/firewall/cluster.fw"), "w") as f:
+                    f.write(PVEFW_OK.replace("IN HTTP(ACCEPT) -log nolog\n", "").replace("IN HTTPS(ACCEPT) -log nolog\n", ""))
             elif name == "cert-expiring":
                 for c in st["issued"].values():
                     c["expires"] = time.time() + 5 * 86400 + 3600
@@ -726,8 +754,10 @@ server {
         name = a[a.index("--cert-name") + 1]
         if st.get("le_blocked") and "--webroot" in a:
             time.sleep(1)
-            self._le_log(names[0], "connection", "%s: Fetching http://%s/.well-known/acme-challenge/kQ9r2x: "
-                         "Timeout during connect (likely firewall problem)" % (PUBLIC_IP, names[0]))
+            why = "Connection refused" if "f2b-nginx-botsearch" in st["tables"]["filter"]["chains"] else \
+                "Timeout during connect (likely firewall problem)"
+            self._le_log(names[0], "connection", "%s: Fetching http://%s/.well-known/acme-challenge/kQ9r2x: %s"
+                         % (PUBLIC_IP, names[0], why))
             # like certbot 4: the short summary only, the details are in letsencrypt.log
             return 1, ("Saving debug log to /var/log/letsencrypt/letsencrypt.log\nSome challenges have failed.\n"
                        "Ask for help or search for solutions at https://community.letsencrypt.org. See the logfile "

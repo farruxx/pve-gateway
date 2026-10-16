@@ -4,6 +4,12 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.2.4 - 2026-10-16
+- Port 80/443 check (Debug, domain test, and in the error when Let's Encrypt can't connect): what listens there
+  (must be nginx), iptables rules that drop/reject the port, fail2ban jails on 80/443 with banned addresses (Let's
+  Encrypt's validation servers get "Connection refused" once banned after failed challenges), and whether the
+  Proxmox firewall, when enabled, accepts 80/443 (HTTP/HTTPS macros or dport rules).
+
 ## 1.2.3 - 2026-10-16
 - Fix: when certbot failed, the reason (Domain / Type / Detail) was dropped - only stderr was kept, certbot prints
   the details on stdout. Failed commands now keep both; if certbot's output still has no reason, it is read from the
