@@ -25,6 +25,7 @@ import calendar
 import getpass
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import os
@@ -34,6 +35,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import traceback
@@ -44,7 +46,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.11.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.12.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -83,6 +85,7 @@ DEFAULTS = {
     "update_ref": "master",
     "update_check": True,
     "auto_update": False,  # install new versions automatically after the daily check
+    "backup_daily": True,  # keep a daily local backup in <config dir>/backups (last 7)
     # Monitoring: health checks of guests/domains and where to send alerts (secrets masked in the API/debug)
     "monitors": [],
     "alerts": {"email": "", "webhook": "", "telegram_token": "", "telegram_chat": "", "fail_after": 2, "cert_days": 14},
@@ -133,12 +136,20 @@ def _loose_group(item, what):
 
 
 def load_config():
-    cfg = json.loads(json.dumps(DEFAULTS))
+    raw = {}
     try:
         with open(conf_file()) as f:
-            cfg.update(json.load(f))
+            raw = json.load(f)
     except FileNotFoundError:
         pass
+    return normalize_config(raw)
+
+
+def normalize_config(raw):
+    """Defaults + saved values, every entry re-validated (invalid ones dropped with a warning). Used for the
+    config file and for configs coming from a backup."""
+    cfg = json.loads(json.dumps(DEFAULTS))
+    cfg.update(raw if isinstance(raw, dict) else {})
     try:
         cfg["ui_allow"] = parse_networks(cfg.get("ui_allow", []))
     except ApiError as e:
@@ -1995,6 +2006,14 @@ def checks():
             add("WireGuard %s" % t["name"], _st(stt["up"]), "up, %d/%d peers online, UDP %d" % (online, len(t["peers"]), t["port"])
                 if stt["up"] else "down - try: wg-quick up %s; journalctl -u wg-quick@%s" % (t["name"], t["name"]))
     sdn_checks(add)
+    bks = list_backups()
+    if bks:
+        age = (time.time() - bks[0]["created"]) / 86400
+        add("backups", "warn" if age > 2 and cfg.get("backup_daily", True) else "ok" if age <= 2 else "info",
+            "%d local backup(s), newest %s ago (%s)" % (len(bks), "%.0f h" % (age * 24) if age < 2 else "%d days" % age, bks[0]["name"])
+            + ("" if cfg.get("backup_daily", True) else " - daily backups are off (Settings > Backups)"))
+    else:
+        add("backups", "info", "no backup yet - Settings > Backups > Create backup (daily backups start within a few minutes)")
     fw = cfg["firewall"]
     if fw["enabled"]:
         add("firewall", "ok", "%s backend, policy %s, %d rule(s)%s" % (
@@ -3795,6 +3814,386 @@ def update_checker():
         time.sleep(86400)
 
 
+# --------------------------------------------------------------------------- backup
+# A backup is a .tar.gz: manifest.json, config.json, and optionally the secrets pve-gateway keeps outside config.json
+# (dns/<id>.ini, wireguard/<id>.key|.psk) and the Let's Encrypt certificates of its domains / wildcards.
+# Local copies live in <config dir>/backups (0700 dir, 0600 files): manual ones, daily ones and a safety copy taken
+# before every restore, so a restore can be undone.
+
+BACKUP_NAME_RE = re.compile(r"^pve-gateway-\d{8}-\d{6}(?:-[a-z0-9-]{1,24})?\.tar\.gz$")
+BACKUP_MAX = 30 * 1024 * 1024  # uploaded / unpacked size limit
+BACKUP_KEEP = {"daily": 7, "manual": 20, "pre-restore": 10, "upload": 10}
+# which config keys each restorable part covers; host-specific keys (listen, port, cert, key, nginx_conf,
+# acme_webroot, letsencrypt_dir, protected_ports) are never taken from a backup
+BACKUP_PARTS = {
+    "rules": ("Port rules", ["rules", "forward_accept"]),
+    "domains": ("Domains and wildcard certificates", ["domains", "wildcards", "acme_email", "nginx_ipv6"]),
+    "monitoring": ("Health checks and alerts", ["monitors", "alerts"]),
+    "firewall": ("Firewall", ["firewall"]),
+    "fail2ban": ("Fail2ban", ["fail2ban"]),
+    "vpn": ("WireGuard VPN", ["wireguard"]),
+    "access": ("Web UI access and login", ["ui_allow", "allowed_hosts", "allowed_users", "local_user", "pass_hash"]),
+    "updates": ("Update settings", ["update_ref", "update_check", "auto_update", "backup_daily"]),
+}
+MEMBER_RE = re.compile(r"^(manifest\.json|config\.json|dns/[0-9a-f]{1,16}\.ini|wireguard/[0-9a-f]{1,16}\.(?:key|psk)|"
+                       r"letsencrypt/(?:live|archive)/[A-Za-z0-9._-]{1,253}/[A-Za-z0-9._-]{1,64}|"
+                       r"letsencrypt/renewal/[A-Za-z0-9._-]{1,253}\.conf)$")
+
+
+def backup_dir():
+    return os.path.join(CONF_DIR, "backups")
+
+
+def le_root(cfg):
+    """/etc/letsencrypt (the parent of the configured live dir)."""
+    live = cfg.get("letsencrypt_dir", "/etc/letsencrypt/live")
+    return os.path.dirname(MOCK.path_for(live) if MOCK else live)
+
+
+def backup_cert_names(cfg):
+    names = {d["domain"] for d in cfg["domains"] if d["tls"] == "letsencrypt"}
+    return sorted(names | {wc_cert_name(w) for w in cfg["wildcards"]})
+
+
+def _add_bytes(tar, name, data, mode=0o600):
+    info = tarfile.TarInfo(name)
+    info.size, info.mode, info.mtime = len(data), mode, int(time.time())
+    tar.addfile(info, io.BytesIO(data))
+
+
+def make_backup(cfg, secrets=True, certs=False, reason="manual"):
+    """-> (tar.gz bytes, manifest)"""
+    files = []
+    if secrets:
+        for sub in ("dns", "wireguard"):
+            d = os.path.join(CONF_DIR, sub)
+            for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+                if MEMBER_RE.match("%s/%s" % (sub, f)):
+                    files.append(("%s/%s" % (sub, f), os.path.join(d, f)))
+    cert_names = []
+    root = le_root(cfg)
+    if certs:
+        for name in backup_cert_names(cfg):
+            if os.path.isdir(os.path.join(root, "live", name)):
+                cert_names.append(name)
+    if not secrets:  # config.json holds a few secrets too
+        cfg = dict(cfg, pass_hash="", alerts=dict(cfg["alerts"], telegram_token="", webhook=""))
+    manifest = {"app": "pve-gateway", "format": 1, "version": VERSION, "created": int(time.time()), "host": node_name(),
+                "reason": reason, "secrets": bool(secrets), "certs": cert_names,
+                "counts": backup_counts(cfg)}
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        _add_bytes(tar, "manifest.json", json.dumps(manifest, indent=2).encode())
+        _add_bytes(tar, "config.json", json.dumps(cfg, indent=2).encode())
+        for arc, path in files:
+            with open(path, "rb") as f:
+                _add_bytes(tar, arc, f.read())
+        for name in cert_names:
+            for sub in ("live", "archive"):
+                d = os.path.join(root, sub, name)
+                for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+                    p, arc = os.path.join(d, f), "letsencrypt/%s/%s/%s" % (sub, name, f)
+                    if not MEMBER_RE.match(arc):
+                        continue
+                    if os.path.islink(p):  # live/<name>/x.pem -> ../../archive/<name>/xN.pem
+                        info = tarfile.TarInfo(arc)
+                        info.type, info.linkname, info.mtime = tarfile.SYMTYPE, os.readlink(p), int(time.time())
+                        tar.addfile(info)
+                    elif os.path.isfile(p):
+                        with open(p, "rb") as fh:
+                            _add_bytes(tar, arc, fh.read())
+            ren = os.path.join(root, "renewal", name + ".conf")
+            if os.path.isfile(ren):
+                with open(ren, "rb") as fh:
+                    _add_bytes(tar, "letsencrypt/renewal/%s.conf" % name, fh.read(), 0o644)
+    return buf.getvalue(), manifest
+
+
+def backup_counts(cfg):
+    return {"rules": len(cfg["rules"]), "domains": len(cfg["domains"]), "wildcards": len(cfg["wildcards"]),
+            "monitors": len(cfg["monitors"]), "firewall_rules": len(cfg["firewall"]["rules"]),
+            "tunnels": len(cfg["wireguard"]["tunnels"]),
+            "peers": sum(len(t["peers"]) for t in cfg["wireguard"]["tunnels"])}
+
+
+def store_backup(data, reason):
+    """Write a backup into the local backup dir (0600) and prune old ones of the same kind."""
+    d = backup_dir()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    name = "pve-gateway-%s-%s.tar.gz" % (time.strftime("%Y%m%d-%H%M%S"), reason)
+    while os.path.exists(os.path.join(d, name)):  # two in the same second
+        time.sleep(1)
+        name = "pve-gateway-%s-%s.tar.gz" % (time.strftime("%Y%m%d-%H%M%S"), reason)
+    fd = os.open(os.path.join(d, name + ".tmp"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.replace(os.path.join(d, name + ".tmp"), os.path.join(d, name))
+    same = sorted(f for f in os.listdir(d) if BACKUP_NAME_RE.match(f) and f.endswith("-%s.tar.gz" % reason))
+    for old in same[:-BACKUP_KEEP.get(reason, 10)]:
+        os.remove(os.path.join(d, old))
+    return name
+
+
+def backup_path(name):
+    if not BACKUP_NAME_RE.match(name or ""):
+        raise ApiError("invalid backup name", 400)
+    p = os.path.join(backup_dir(), name)
+    if not os.path.isfile(p):
+        raise ApiError("backup %s not found" % name, 404)
+    return p
+
+
+def read_backup(data):
+    """Validate an uploaded / stored backup -> (manifest, raw config, {member: bytes}, [(symlink, target)]).
+    Only known file names are accepted; symlinks only inside letsencrypt/live pointing at the same archive dir."""
+    if len(data) > BACKUP_MAX:
+        raise ApiError("backup too large (max %d MB)" % (BACKUP_MAX // 1048576), 413)
+    try:
+        tar = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
+        members = tar.getmembers()
+    except (tarfile.TarError, OSError, EOFError):
+        raise ApiError("not a pve-gateway backup (expected a .tar.gz made by pve-gateway)")
+    files, links, total = {}, [], 0
+    for m in members:
+        if m.isdir():
+            continue
+        if not MEMBER_RE.match(m.name):
+            raise ApiError("unexpected file in backup: %s" % m.name[:100])
+        if m.issym():
+            parts = m.name.split("/")
+            if parts[1] != "live" or not re.match(r"^\.\./\.\./archive/%s/[A-Za-z0-9._-]{1,64}$" % re.escape(parts[2]), m.linkname):
+                raise ApiError("unexpected link in backup: %s" % m.name[:100])
+            links.append((m.name, m.linkname))
+            continue
+        if not m.isfile():
+            raise ApiError("unexpected entry in backup: %s" % m.name[:100])
+        total += m.size
+        if total > BACKUP_MAX:
+            raise ApiError("backup too large when unpacked", 413)
+        files[m.name] = tar.extractfile(m).read()
+    try:
+        manifest = json.loads(files.get("manifest.json", b"{}"))
+        raw = json.loads(files["config.json"])
+    except (KeyError, ValueError):
+        raise ApiError("backup is missing manifest.json or config.json")
+    if manifest.get("app") != "pve-gateway" or not isinstance(raw, dict):
+        raise ApiError("not a pve-gateway backup")
+    return manifest, raw, files, links
+
+
+def backup_info(name):
+    """Manifest + what each part contains, for the restore preview."""
+    with open(backup_path(name), "rb") as f:
+        manifest, raw, files, links = read_backup(f.read())
+    cfg = normalize_config(raw)
+    parts = {}
+    for key, (label, _) in BACKUP_PARTS.items():
+        n = {"rules": len(cfg["rules"]), "domains": len(cfg["domains"]) + len(cfg["wildcards"]),
+             "monitoring": len(cfg["monitors"]), "firewall": len(cfg["firewall"]["rules"]),
+             "vpn": len(cfg["wireguard"]["tunnels"])}.get(key)
+        parts[key] = {"label": label, "count": n}
+    parts["firewall"]["enabled"] = cfg["firewall"]["enabled"]
+    parts["fail2ban"]["managed"] = cfg["fail2ban"]["managed"]
+    return {"name": name, "manifest": manifest, "parts": parts,
+            "has_secrets": any(k.startswith(("dns/", "wireguard/")) for k in files),
+            "certs": sorted({k.split("/")[2] for k in files if k.startswith("letsencrypt/live/")} |
+                            {l[0].split("/")[2] for l in links})}
+
+
+def list_backups():
+    d, out = backup_dir(), []
+    for f in sorted(os.listdir(d), reverse=True) if os.path.isdir(d) else []:
+        if not BACKUP_NAME_RE.match(f):
+            continue
+        p = os.path.join(d, f)
+        item = {"name": f, "size": os.path.getsize(p), "created": int(os.path.getmtime(p)),
+                "reason": f[len("pve-gateway-YYYYmmdd-HHMMSS-"):-len(".tar.gz")] or "manual"}
+        try:  # the manifest is the first member - cheap to read
+            with tarfile.open(p, "r:gz") as tar:
+                m = tar.next()
+                if m is not None and m.name == "manifest.json":
+                    man = json.loads(tar.extractfile(m).read())
+                    item.update(version=man.get("version"), secrets=man.get("secrets"), certs=len(man.get("certs") or []),
+                                host=man.get("host"), counts=man.get("counts"))
+        except (tarfile.TarError, OSError, ValueError, EOFError):
+            item["broken"] = True
+        out.append(item)
+    return out
+
+
+def _write_secret_file(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.replace(path + ".tmp", path)
+
+
+def restore_backup(name, parts, user, client_ip=None, host=None, fw_window=True):
+    """Restore the chosen parts of a stored backup. A safety backup of the current state is taken first; if
+    applying fails, the previous config and secret files come back. A restored, enabled firewall is applied with
+    the usual 60 s keep-or-revert window. -> result dict for the UI / CLI."""
+    parts = [p for p in parts if p in BACKUP_PARTS]
+    if not parts:
+        raise ApiError("choose what to restore")
+    with open(backup_path(name), "rb") as f:
+        manifest, raw, files, links = read_backup(f.read())
+    with LOCK:
+        old = STATE["cfg"]
+        src = normalize_config(raw)
+        new = json.loads(json.dumps(old))
+        for p in parts:
+            for k in BACKUP_PARTS[p][1]:
+                if k in src:
+                    new[k] = json.loads(json.dumps(src[k]))
+        if not manifest.get("secrets"):  # a backup without secrets must not wipe the login password or alert tokens
+            new["pass_hash"], new["local_user"] = old.get("pass_hash", ""), old.get("local_user", new.get("local_user"))
+            for k in ("telegram_token", "webhook"):
+                if not new["alerts"].get(k):
+                    new["alerts"][k] = old["alerts"].get(k, "")
+        if "firewall" in parts:  # applied separately (keep-or-revert); saved with the rest only when off
+            fw_new, new["firewall"] = new["firewall"], old["firewall"]
+        warnings = []
+        if "access" in parts and client_ip:  # same lock-out checks as the Settings page
+            hint = " - restore without \"Web UI access and login\", or change it in the backup's source first"
+            if not ui_client_allowed(client_ip, new):
+                raise ApiError("you would be locked out: the backup allows the web UI only from %s, not from your IP %s%s"
+                               % (", ".join(new["ui_allow"]), client_ip, hint))
+            if host and not host_allowed(host, new):
+                raise ApiError("you would be locked out: you opened the UI as %r, which the backup's allowed hostnames "
+                               "don't include%s" % (host, hint))
+            if not new.get("pass_hash") and user not in new.get("allowed_users", []):
+                raise ApiError("you would be locked out: %s is not among the backup's allowed users%s" % (user, hint))
+        if "vpn" in parts and new["wireguard"]["tunnels"] and not wg_installed():
+            raise ApiError("the backup has WireGuard tunnels but wireguard-tools is not installed - install it on the VPN "
+                           "tab first, or restore without \"WireGuard VPN\"")
+        if "fail2ban" in parts and new["fail2ban"]["managed"] and not f2b_installed():
+            raise ApiError("the backup manages fail2ban but it is not installed - install it on the Security tab first, "
+                           "or restore without \"Fail2ban\"")
+        # secret files the restored parts need
+        writes = {}
+        if "domains" in parts:
+            for w in new["wildcards"]:
+                data = files.get("dns/%s.ini" % w["id"])
+                if data is not None:
+                    writes[cred_path(w)] = data
+                elif not os.path.exists(cred_path(w)):
+                    warnings.append("no DNS credentials for *.%s in the backup - enter them in its Edit dialog" % w["zone"])
+        if "vpn" in parts:
+            for t in new["wireguard"]["tunnels"]:
+                for item in [t] + t["peers"]:
+                    for ext in ("key", "psk"):
+                        data = files.get("wireguard/%s.%s" % (item["id"], ext))
+                        path = os.path.join(CONF_DIR, "wireguard", "%s.%s" % (item["id"], ext))
+                        if data is not None:
+                            writes[path] = data
+                if not files.get("wireguard/%s.key" % t["id"]) and not wg_secret(t["id"] + ".key"):
+                    raise ApiError("the backup has no private key for tunnel %s (made without secrets) - restore it "
+                                   "without \"WireGuard VPN\", or use a backup that includes secrets" % t["name"])
+        safety_data, _ = make_backup(old, secrets=True, certs=False, reason="pre-restore")
+        safety = store_backup(safety_data, "pre-restore")
+        before = {p: (open(p, "rb").read() if os.path.exists(p) else None) for p in writes}
+        for p, data in writes.items():
+            _write_secret_file(p, data)
+
+        def rollback():
+            for p, data in before.items():
+                if data is None:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                else:
+                    _write_secret_file(p, data)
+            apply_rules(old)
+            apply_nginx(old)
+            apply_wg(old, new)
+            if old["fail2ban"]["managed"] or new["fail2ban"]["managed"]:
+                apply_f2b(old)
+        err = apply_rules(new) or apply_nginx(new) or apply_wg(new, old)
+        if not err and (old["fail2ban"] != new["fail2ban"]):
+            err = apply_f2b(new)
+        if err:
+            rollback()
+            raise ApiError("restore failed, nothing was changed: %s" % err, 500)
+        save_config(new)
+        STATE["cfg"] = new
+        restored_certs = []
+        if "domains" in parts:
+            restored_certs, skipped = restore_certs(new, files, links)
+            if restored_certs:
+                apply_nginx(new)
+            if skipped:
+                warnings.append("certificates already on this host were kept: " + ", ".join(skipped))
+        if "firewall" in parts and fw_window:
+            fw_change(dict(new, firewall=fw_new), user)
+        elif "firewall" in parts:  # CLI: no browser to confirm in - applied and saved directly
+            new = dict(new, firewall=fw_new)
+            err = apply_fw(new, old["firewall"])
+            if err:
+                warnings.append("firewall not restored: %s" % err)
+            else:
+                save_config(new)
+                STATE["cfg"] = new
+        missing = [d["domain"] for d in new["domains"] if "domains" in parts and d["enabled"] and d["tls"] == "letsencrypt"
+                   and not cert_info(new, d["domain"], fresh=True)["exists"]]
+        if missing:
+            warnings.append("no certificate yet for %s - click Cert on the Domains tab" % ", ".join(missing[:5]))
+    log("%s restored %s from %s (safety backup: %s)" % (user, ", ".join(parts), name, safety))
+    return {"ok": True, "safety": safety, "certs": restored_certs, "warnings": warnings,
+            "firewall_pending": bool(FW_PENDING.get("deadline"))}
+
+
+def restore_certs(cfg, files, links):
+    """Unpack certificates from the backup for names that don't exist on this host yet (moving to a new host).
+    Existing certificates are never overwritten. -> (restored, skipped)"""
+    root = le_root(cfg)
+    names = sorted({k.split("/")[2] for k in files if k.startswith(("letsencrypt/live/", "letsencrypt/archive/"))} |
+                   {l[0].split("/")[2] for l in links})
+    restored, skipped = [], []
+    for name in names:
+        if os.path.exists(os.path.join(root, "live", name)):
+            skipped.append(name)
+            continue
+        for arc, data in files.items():
+            parts = arc.split("/")
+            if len(parts) == 4 and parts[2] == name and parts[1] in ("live", "archive"):
+                _write_secret_file(os.path.join(root, parts[1], name, parts[3]), data)
+        for arc, target in links:
+            parts = arc.split("/")
+            if parts[2] == name:
+                p = os.path.join(root, "live", name, parts[3])
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                if os.path.lexists(p):
+                    os.remove(p)
+                os.symlink(target, p)
+        ren = files.get("letsencrypt/renewal/%s.conf" % name)
+        if ren is not None:
+            os.makedirs(os.path.join(root, "renewal"), exist_ok=True)
+            with open(os.path.join(root, "renewal", name + ".conf"), "wb") as f:
+                f.write(ren)
+        restored.append(name)
+    for name in restored:
+        CERT_CACHE.pop(name, None)
+    return restored, skipped
+
+
+def backup_loop():
+    """Daily local backup (with secrets, without certificates) while backup_daily is on."""
+    time.sleep(30 if MOCK else 300)
+    while True:
+        try:
+            if STATE["cfg"].get("backup_daily", True):
+                last = [b for b in list_backups() if b["reason"] == "daily"]
+                if not last or time.time() - last[0]["created"] > 86400 - 600:
+                    data, _ = make_backup(STATE["cfg"], secrets=True, certs=False, reason="daily")
+                    log("daily backup: %s" % store_backup(data, "daily"))
+        except Exception as e:  # never let the loop die
+            log("daily backup failed: %s" % e, "error")
+        time.sleep(3600)
+
+
 # --------------------------------------------------------------------------- auth
 
 def hash_password(pw, iters=200000):
@@ -3870,7 +4269,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(body)
         body = body.encode() if isinstance(body, str) else body
         self.send_response(code)
-        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Type", ctype if "charset" in ctype or not ctype.startswith(("text/", "application/j"))
+                         else ctype + "; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -3894,6 +4294,14 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(n) or b"{}")
         except ValueError:
             raise ApiError("invalid JSON")
+
+    def body_raw(self, limit):
+        raw = (self.headers.get("Content-Length") or "0").strip()
+        if not raw.isdigit():
+            raise ApiError("invalid Content-Length", 400)
+        if int(raw) > limit:
+            raise ApiError("upload too large (max %d MB)" % (limit // 1048576), 413)
+        return self.rfile.read(int(raw))
 
     def cookie(self, name):
         for part in self.headers.get("Cookie", "").split(";"):
@@ -4215,6 +4623,8 @@ class Handler(BaseHTTPRequestHandler):
                 user, ", ".join(new["ui_allow"]) or "anyone", ", ".join(new["allowed_hosts"]) or "-",
                 ", ".join(new.get("allowed_users", [])), "on" if new.get("auto_update") else "off"))
             return self.send(200, {"ok": True})
+        if path.startswith("/api/backups"):
+            return self.backups_api(method, path, user)
         if path == "/api/guests" and method == "GET":
             return self.send(200, {"guests": list_guests()})
         if path == "/api/apply" and method == "POST":
@@ -4311,6 +4721,50 @@ class Handler(BaseHTTPRequestHandler):
             log("%s %s %s" % (user, method, rid or "new rule"))
         return self.send(200, {"ok": True, "rules": new["rules"]})
 
+
+    def backups_api(self, method, path, user):
+        if path == "/api/backups" and method == "GET":
+            return self.send(200, {"backups": list_backups(), "daily": bool(STATE["cfg"].get("backup_daily", True)),
+                                   "dir": backup_dir(), "parts": {k: v[0] for k, v in BACKUP_PARTS.items()}})
+        if path == "/api/backups" and method == "POST":
+            d = self.body()
+            data, man = make_backup(STATE["cfg"], secrets=bool(d.get("secrets", True)), certs=bool(d.get("certs")))
+            name = store_backup(data, "manual")
+            log("%s created backup %s" % (user, name))
+            return self.send(200, {"ok": True, "name": name, "certs": man["certs"]})
+        if path == "/api/backups/upload" and method == "POST":
+            data = self.body_raw(BACKUP_MAX)
+            man = read_backup(data)[0]
+            name = store_backup(data, "upload")
+            log("%s uploaded backup %s (from %s, v%s)" % (user, name, man.get("host"), man.get("version")))
+            return self.send(200, {"ok": True, "name": name})
+        if path == "/api/backups/settings" and method == "PUT":
+            with LOCK:
+                new = dict(STATE["cfg"], backup_daily=bool(self.body().get("daily")))
+                save_config(new)
+                STATE["cfg"] = new
+            log("%s turned daily backups %s" % (user, "on" if new["backup_daily"] else "off"))
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/backups/([A-Za-z0-9._-]{1,80})(/download|/restore)?$", path)
+        if not m:
+            raise ApiError("not found", 404)
+        name, action = m.group(1), m.group(2)
+        p = backup_path(name)
+        if action == "/download" and method == "GET":
+            with open(p, "rb") as f:
+                data = f.read()
+            log("%s downloaded backup %s" % (user, name))
+            return self.send(200, data, "application/gzip", headers=[("Content-Disposition", 'attachment; filename="%s"' % name)])
+        if action == "/restore" and method == "POST":
+            parts = _as_list(self.body().get("parts", []))
+            return self.send(200, restore_backup(name, parts, user, self.client_ip(), self.headers.get("Host")))
+        if not action and method == "GET":
+            return self.send(200, backup_info(name))
+        if not action and method == "DELETE":
+            os.remove(p)
+            log("%s deleted backup %s" % (user, name))
+            return self.send(200, {"ok": True})
+        raise ApiError("method not allowed", 405)
 
     def lock_api(self, kind, oid, body, user):
         """Lock / unlock one rule or domain. Only the flag changes, so nothing is re-applied."""
@@ -4690,6 +5144,7 @@ def serve(cfg):
     threading.Thread(target=watchdog, daemon=True).start()
     threading.Thread(target=update_checker, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=backup_loop, daemon=True).start()
     try:
         httpd = Server((cfg["listen"], int(cfg["port"])), Handler)
     except OSError as e:
@@ -4718,6 +5173,7 @@ def serve(cfg):
 # to its [Russian, Uzbek (Latin)] translation. The browser translates text as it enters the page, so UI strings and
 # the server's messages share this one catalog; anything missing stays English. The CLI and the log stay English.
 I18N = {
+    " - restore without \"Web UI access and login\", or change it in the backup's source first": [" - восстановите без \"Доступ к веб-интерфейсу и вход\" или сначала измените это в исходной системе", " - \"Veb interfeysga kirish va login\" siz tiklang yoki avval buni manba tizimda oʻzgartiring"],
     "(and localhost)": ["(и localhost)", "(va localhost)"],
     "(command not found: {0})": ["(команда не найдена: {0})", "(buyruq topilmadi: {0})"],
     "(conntrack table not readable: apt install conntrack)": ["(таблица conntrack недоступна: apt install conntrack)", "(conntrack jadvalini oʻqib boʻlmadi: apt install conntrack)"],
@@ -4761,6 +5217,7 @@ I18N = {
     "- localhost is always excluded.": ["- localhost всегда исключён.", "- localhost har doim istisno qilinadi."],
     "- pve-gateway logins": ["- входы в pve-gateway", "- pve-gateway ga kirishlar"],
     "- repeat offenders: banned again within a day -> banned for a week": ["- повторные нарушители: забанен снова в течение суток -> бан на неделю", "- takroriy buzuvchilar: bir kun ichida yana bloklansa -> bir haftaga bloklanadi"],
+    ". Download one to keep it somewhere else - it is the way to move pve-gateway to a new host. Before every restore the current state is saved, so a restore can be undone.": [". Скачайте копию, чтобы хранить её в другом месте, - так же pve-gateway переносится на новый хост. Перед каждым восстановлением текущее состояние сохраняется, поэтому восстановление можно отменить.", ". Boshqa joyda saqlash uchun nusxani yuklab oling - pve-gateway ni yangi xostga koʻchirish ham shu yoʻl bilan amalga oshiriladi. Har bir tiklashdan oldin joriy holat saqlanadi, shuning uchun tiklashni bekor qilish mumkin."],
     ". One level only: a.example.com yes, a.b.example.com no.": [". Только один уровень: a.example.com - да, a.b.example.com - нет.", ". Faqat bitta daraja: a.example.com - ha, a.b.example.com - yoʻq."],
     "100m, 2g, 0 = unlimited": ["100m, 2g, 0 = без ограничений", "100m, 2g, 0 = cheklovsiz"],
     "123456 (or recovery:…)": ["123456 (или recovery:…)", "123456 (yoki recovery:…)"],
@@ -4769,8 +5226,10 @@ I18N = {
     "44 characters, ends with =": ["44 символа, заканчивается на =", "44 ta belgi, = bilan tugaydi"],
     "80,443 or 8000-8100": ["80,443 или 8000-8100", "80,443 yoki 8000-8100"],
     "8080 or 8000-8010": ["8080 или 8000-8010", "8080 yoki 8000-8010"],
+    "A backup holds the configuration (rules, domains, checks, firewall, fail2ban, VPN, settings) and, if you choose, the secrets kept outside it (DNS API credentials, WireGuard keys, alert tokens) and the Let's Encrypt certificates. Copies are kept on this host in": ["Резервная копия содержит конфигурацию (правила, домены, проверки, файрвол, fail2ban, VPN, настройки) и, по желанию, секреты, хранящиеся отдельно от неё (учётные данные DNS API, ключи WireGuard, токены оповещений), и сертификаты Let's Encrypt. Копии хранятся на этом хосте в", "Zaxira nusxada konfiguratsiya (qoidalar, domenlar, tekshiruvlar, fayrvol, fail2ban, VPN, sozlamalar) va xohlasangiz, undan tashqarida saqlanadigan maxfiy maʼlumotlar (DNS API kirish maʼlumotlari, WireGuard kalitlari, ogohlantirish tokenlari) hamda Let's Encrypt sertifikatlari boʻladi. Nusxalar ushbu xostda saqlanadi:"],
     "A certificate is requested through {0} DNS.": ["Сертификат запрашивается через DNS {0}.", "Sertifikat {0} DNS orqali soʻraladi."],
     "A guest that still uses it keeps it until its lease ends.": ["Гостевая система, которая ещё использует его, сохранит его до окончания аренды.", "Undan hali foydalanayotgan mehmon tizim uni ijara muddati tugaguncha saqlaydi."],
+    "A restored, enabled firewall must be confirmed within 60 s, like any firewall change.": ["Восстановленный включённый файрвол нужно подтвердить в течение 60 с, как любое изменение файрвола.", "Tiklangan va yoqilgan fayrvolni, fayrvoldagi har qanday oʻzgarish kabi, 60 s ichida tasdiqlash kerak."],
     "A {0} zone - VNets and subnets are shown here, but create them in the Proxmox UI (they need VLAN/VXLAN settings).": ["Зона {0} - VNet и подсети показаны здесь, но создавайте их в интерфейсе Proxmox (им нужны настройки VLAN/VXLAN).", "{0} zonasi - VNet va quyi tarmoqlar shu yerda koʻrsatiladi, lekin ularni Proxmox UI da yarating (ular uchun VLAN/VXLAN sozlamalari kerak)."],
     "AAAA record {0} {1} - IPv6 visitors will fail: fix or delete the AAAA record": ["AAAA-запись {0} {1} - посетители по IPv6 не смогут зайти: исправьте или удалите AAAA-запись", "AAAA yozuvi {0} {1} - IPv6 tashrifchilari kira olmaydi: AAAA yozuvini tuzating yoki oʻchiring"],
     "AAAA {0}": ["AAAA {0}", "AAAA {0}"],
@@ -4822,6 +5281,8 @@ I18N = {
     "Apply fail2ban settings?": ["Применить настройки fail2ban?", "fail2ban sozlamalari qoʻllansinmi?"],
     "Apply the firewall changes?": ["Применить изменения файрвола?", "Fayrvol oʻzgarishlari qoʻllansinmi?"],
     "Backend": ["Бэкенд", "Backend"],
+    "Backup created: {0}": ["Копия создана: {0}", "Nusxa yaratildi: {0}"],
+    "Backups": ["Резервные копии", "Zaxira nusxalar"],
     "Ban": ["Забанить", "Bloklash"],
     "Ban this IP?": ["Забанить этот IP?", "Bu IP bloklansinmi?"],
     "Ban time": ["Время бана", "Bloklash vaqti"],
@@ -4836,8 +5297,12 @@ I18N = {
     "Cancel": ["Отмена", "Bekor qilish"],
     "Cert": ["Серт.", "Sert."],
     "Certificate": ["Сертификат", "Sertifikat"],
+    "Certificates in it: {0} (only restored where this host has none).": ["Сертификаты в ней: {0} (восстанавливаются, только если на этом хосте их нет).", "Undagi sertifikatlar: {0} (faqat ushbu xostda yoʻq boʻlsa tiklanadi)."],
+    "Certificates restored: {0}.": ["Восстановлены сертификаты: {0}.", "Tiklangan sertifikatlar: {0}."],
     "Changes are saved in Proxmox but not active yet.": ["Изменения сохранены в Proxmox, но ещё не активны.", "Oʻzgarishlar Proxmox da saqlandi, lekin hali faol emas."],
     "Check now": ["Проверить сейчас", "Hozir tekshirish"],
+    "Choose what to restore.": ["Выберите, что восстановить.", "Nimani tiklashni tanlang."],
+    "Choose what to restore. Everything else stays as it is now. Host-specific settings (listen port, TLS certificate of this page, file paths) are never taken from a backup.": ["Выберите, что восстановить. Всё остальное останется как сейчас. Настройки, зависящие от хоста (порт, TLS-сертификат этой страницы, пути к файлам), из копии никогда не берутся.", "Nimani tiklashni tanlang. Qolgan hammasi hozirgidek qoladi. Xostga bogʻliq sozlamalar (port, ushbu sahifaning TLS sertifikati, fayl yoʻllari) hech qachon nusxadan olinmaydi."],
     "Click to run the test and see why": ["Нажмите, чтобы запустить проверку и узнать причину", "Tekshiruvni ishga tushirib, sababini bilish uchun bosing"],
     "Client configuration": ["Конфигурация клиента", "Mijoz konfiguratsiyasi"],
     "Client configuration - {0}": ["Конфигурация клиента - {0}", "Mijoz konfiguratsiyasi - {0}"],
@@ -4846,6 +5311,7 @@ I18N = {
     "Comment": ["Комментарий", "Izoh"],
     "Config": ["Конфигурация", "Konfiguratsiya"],
     "Consumer key": ["Consumer key", "Consumer key"],
+    "Contents": ["Содержимое", "Tarkibi"],
     "Copied": ["Скопировано", "Nusxalandi"],
     "Copied {0}": ["Скопировано: {0}", "{0} nusxalandi"],
     "Copy": ["Копировать", "Nusxalash"],
@@ -4857,6 +5323,8 @@ I18N = {
     "Covers": ["Охватывает", "Qamrab oladi"],
     "Create": ["Создать", "Yaratish"],
     "Create VNet {0} in zone {1}?": ["Создать VNet {0} в зоне {1}?", "{1} zonasida {0} VNet yaratilsinmi?"],
+    "Create a backup now?": ["Создать копию сейчас?", "Hozir nusxa yaratilsinmi?"],
+    "Create backup": ["Создать копию", "Nusxa yaratish"],
     "Create keys at https://api.ovh.com/createToken/ with GET/POST/PUT/DELETE on /domain/zone/*": ["Создайте ключи на https://api.ovh.com/createToken/ с GET/POST/PUT/DELETE на /domain/zone/*", "Kalitlarni https://api.ovh.com/createToken/ da /domain/zone/* uchun GET/POST/PUT/DELETE bilan yarating"],
     "Create rule": ["Создать правило", "Qoida yaratish"],
     "Create rule \"{0}\"?": ["Создать правило \"{0}\"?", "\"{0}\" qoidasi yaratilsinmi?"],
@@ -4866,6 +5334,7 @@ I18N = {
     "Create tunnel {0}?": ["Создать туннель {0}?", "{0} tunneli yaratilsinmi?"],
     "Create zone": ["Создать зону", "Zona yaratish"],
     "Create zone {0}?": ["Создать зону {0}?", "{0} zonasi yaratilsinmi?"],
+    "Created": ["Создана", "Yaratilgan"],
     "Credentials are stored on this host only (mode 0600) and are never shown again.": ["Учётные данные хранятся только на этом хосте (режим 0600) и больше никогда не показываются.", "Kirish maʼlumotlari faqat ushbu xostda saqlanadi (0600 rejimi) va boshqa hech qachon koʻrsatilmaydi."],
     "Currently banned": ["Сейчас заблокированы", "Hozir bloklangan"],
     "Currently failed": ["Сейчас с ошибками", "Hozir xatolar bilan"],
@@ -4899,10 +5368,12 @@ I18N = {
     "DOWN: {0}": ["НЕДОСТУПЕН: {0}", "ISHLAMAYAPTI: {0}"],
     "DROP - silently block": ["DROP - молча блокировать", "DROP - jimgina bloklash"],
     "DRY RUN": ["ПРОБНЫЙ ЗАПУСК", "SINOV REJIMI"],
+    "Daily automatic backup on this host (keeps the last 7)": ["Ежедневная автоматическая копия на этом хосте (хранятся последние 7)", "Ushbu xostda har kuni avtomatik nusxa (oxirgi 7 tasi saqlanadi)"],
     "Databases from private networks only": ["Базы данных только из частных сетей", "Maʼlumotlar bazalari faqat xususiy tarmoqlardan"],
     "Debug": ["Отладка", "Diagnostika"],
     "Delete": ["Удалить", "Oʻchirish"],
     "Delete VNet {0}?": ["Удалить VNet {0}?", "{0} VNet oʻchirilsinmi?"],
+    "Delete backup?": ["Удалить копию?", "Nusxani oʻchirasizmi?"],
     "Delete check \"{0}\"?": ["Удалить проверку \"{0}\"?", "\"{0}\" tekshiruvi oʻchirilsinmi?"],
     "Delete domain {0}?": ["Удалить домен {0}?", "{0} domeni oʻchirilsinmi?"],
     "Delete rule \"{0}\"?": ["Удалить правило \"{0}\"?", "\"{0}\" qoidasi oʻchirilsinmi?"],
@@ -4926,6 +5397,7 @@ I18N = {
     "Docker registry": ["Реестр Docker", "Docker registry"],
     "Domain": ["Домен", "Domen"],
     "Domains": ["Домены", "Domenlar"],
+    "Domains and wildcard certificates": ["Домены и wildcard-сертификаты", "Domenlar va wildcard sertifikatlar"],
     "Download": ["Скачать", "Yuklab olish"],
     "Download report": ["Скачать отчёт", "Hisobotni yuklab olish"],
     "Downloading…": ["Загрузка…", "Yuklab olinmoqda…"],
@@ -4984,6 +5456,7 @@ I18N = {
     "HTTP(S)": ["HTTP(S)", "HTTP(S)"],
     "HTTPS": ["HTTPS", "HTTPS"],
     "HTTPS alt": ["HTTPS alt", "HTTPS alt"],
+    "Health checks and alerts": ["Проверки и оповещения", "Tekshiruvlar va ogohlantirishlar"],
     "Hits": ["Обращения", "Murojaatlar"],
     "Host network": ["Сеть хоста", "Xost tarmogʻi"],
     "Host port": ["Порт хоста", "Xost porti"],
@@ -5005,6 +5478,8 @@ I18N = {
     "Import this into the WireGuard app on the device. It contains the device's private key - keep it private.": ["Импортируйте это в приложение WireGuard на устройстве. Здесь содержится закрытый ключ устройства - храните его в тайне.", "Buni qurilmadagi WireGuard ilovasiga import qiling. Unda qurilmaning shaxsiy kaliti bor - uni maxfiy saqlang."],
     "In all jails.": ["Во всех jail.", "Barcha jail larda."],
     "In jail {0}. It can no longer reach the services that jail protects.": ["В jail {0}. Он больше не сможет обращаться к сервисам, которые защищает этот jail.", "{0} jail da. U endi ushbu jail himoya qiladigan xizmatlarga kira olmaydi."],
+    "Include Let's Encrypt certificates": ["Включить сертификаты Let's Encrypt", "Let's Encrypt sertifikatlarini qoʻshish"],
+    "Include secrets (keep such a file private)": ["Включить секреты (храните такой файл в тайне)", "Maxfiy maʼlumotlarni qoʻshish (bunday faylni maxfiy saqlang)"],
     "Incoming interface": ["Входящий интерфейс", "Kiruvchi interfeys"],
     "Install": ["Установить", "Oʻrnatish"],
     "Install WireGuard": ["Установить WireGuard", "WireGuard ni oʻrnatish"],
@@ -5031,6 +5506,7 @@ I18N = {
     "It can connect with its own key.": ["Он сможет подключаться со своим ключом.", "U oʻz kaliti bilan ulana oladi."],
     "It can no longer be edited, switched off, deleted or moved to another group until you unlock it.": ["Его больше нельзя будет изменять, выключать, удалять или переносить в другую группу, пока вы его не открепите.", "Uni qulfdan chiqarmaguningizcha tahrirlash, oʻchirib qoʻyish, oʻchirish yoki boshqa guruhga koʻchirish mumkin boʻlmaydi."],
     "It can no longer connect, and its keys are deleted.": ["Он больше не сможет подключаться, а его ключи будут удалены.", "U endi ulana olmaydi va uning kalitlari oʻchiriladi."],
+    "It includes secrets (DNS credentials, WireGuard keys, alert tokens) - keep downloaded copies private.": ["Она включает секреты (учётные данные DNS, ключи WireGuard, токены оповещений) - храните скачанные копии в тайне.", "Unda maxfiy maʼlumotlar bor (DNS kirish maʼlumotlari, WireGuard kalitlari, ogohlantirish tokenlari) - yuklab olingan nusxalarni maxfiy saqlang."],
     "It is reverted in": ["Изменение будет отменено через", "Oʻzgarish bekor qilinadi:"],
     "Its endpoint": ["Его endpoint", "Uning endpoint i"],
     "Its history is removed too.": ["Его история тоже удаляется.", "Uning tarixi ham oʻchiriladi."],
@@ -5101,6 +5577,7 @@ I18N = {
     "New zone": ["Новая зона", "Yangi zona"],
     "New zones are \"simple\" zones: isolated bridges on this host, with no VLAN setup needed. The Proxmox IPAM keeps track of the addresses.": ["Новые зоны создаются как \"simple\": изолированные мосты на этом хосте, настройка VLAN не нужна. Proxmox IPAM ведёт учёт адресов.", "Yangi zonalar \"simple\" zonalar boʻladi: bu xostdagi izolyatsiyalangan koʻpriklar, VLAN sozlash shart emas. Manzillarni Proxmox IPAM hisobga oladi."],
     "No VNet yet - click + VNet.": ["VNet пока нет - нажмите + VNet.", "Hozircha VNet yoʻq - + VNet tugmasini bosing."],
+    "No backups yet.": ["Резервных копий пока нет.", "Hozircha zaxira nusxalar yoʻq."],
     "No banned IPs.": ["Заблокированных IP нет.", "Bloklangan IP yoʻq."],
     "No domains yet. Point a DNS A record at this host, then click": ["Доменов пока нет. Направьте DNS-запись A на этот хост, затем нажмите", "Hozircha domenlar yoʻq. DNS A yozuvini shu xostga yoʻnaltiring, soʻng bosing"],
     "No forwarding rules yet. Click": ["Правил проброса пока нет. Нажмите", "Hozircha yoʻnaltirish qoidalari yoʻq. Bosing"],
@@ -5130,6 +5607,7 @@ I18N = {
     "Point DNS A records at": ["Направьте DNS-записи A на", "DNS A yozuvlarini quyidagiga yoʻnaltiring:"],
     "Point DNS A records at {0}.": ["Направьте DNS-записи A на {0}.", "DNS A yozuvlarini {0} ga yoʻnaltiring."],
     "Port": ["Порт", "Port"],
+    "Port rules": ["Правила портов", "Port qoidalari"],
     "Port scanner": ["Сканер портов", "Port skaneri"],
     "Ports": ["Порты", "Portlar"],
     "Ports 80/443": ["Порты 80/443", "80/443 portlari"],
@@ -5179,6 +5657,10 @@ I18N = {
     "Reserve {0} for this MAC?": ["Зарезервировать {0} для этого MAC?", "{0} shu MAC uchun rezerv qilinsinmi?"],
     "Reserve {0} for {1}?": ["Зарезервировать {0} для {1}?", "{0} {1} uchun rezerv qilinsinmi?"],
     "Response": ["Ответ", "Javob"],
+    "Restore": ["Восстановить", "Tiklash"],
+    "Restore backup": ["Восстановление из копии", "Nusxadan tiklash"],
+    "Restore from this backup?": ["Восстановить из этой копии?", "Ushbu nusxadan tiklansinmi?"],
+    "Restored. To undo, restore \"{0}\".": ["Восстановлено. Чтобы отменить, восстановите \"{0}\".", "Tiklandi. Bekor qilish uchun \"{0}\" ni tiklang."],
     "Reverse DNS plugin": ["Плагин обратного DNS", "Teskari DNS plagini"],
     "Revert now": ["Откатить сейчас", "Hozir orqaga qaytarish"],
     "Risk": ["Риск", "Xavf"],
@@ -5246,6 +5728,7 @@ I18N = {
     "Sign out": ["Выйти", "Chiqish"],
     "Since": ["С", "Boshlab"],
     "Site / router - it has its own key": ["Площадка / роутер - со своим ключом", "Obyekt / router - oʻz kalitiga ega"],
+    "Size": ["Размер", "Hajmi"],
     "Slack / Discord / any URL (JSON POST)": ["Slack / Discord / любой URL (JSON POST)", "Slack / Discord / istalgan URL (JSON POST)"],
     "Source": ["Источник", "Manba"],
     "Status": ["Статус", "Holat"],
@@ -5282,6 +5765,7 @@ I18N = {
     "The tunnel is updated in place.": ["Туннель обновляется на месте.", "Tunnel joyida yangilanadi."],
     "The update did not finish within 3 minutes - on the host run: journalctl -u pve-gateway-update": ["Обновление не завершилось за 3 минуты - выполните на хосте: journalctl -u pve-gateway-update", "Yangilanish 3 daqiqada tugamadi - xostda bajaring: journalctl -u pve-gateway-update"],
     "They take effect now. Confirm within 60 s that you can still reach this page, or the previous firewall comes back.": ["Они уже действуют. Подтвердите в течение 60 с, что эта страница всё ещё доступна, иначе вернётся прежний файрвол.", "Ular hozir kuchga kirdi. 60 soniya ichida bu sahifa hali ochilishini tasdiqlang, aks holda oldingi fayrvol qaytariladi."],
+    "This backup has no secrets: DNS credentials and WireGuard keys already on this host are kept, missing ones must be entered again.": ["В этой копии нет секретов: учётные данные DNS и ключи WireGuard, уже имеющиеся на этом хосте, сохраняются, недостающие нужно ввести заново.", "Bu nusxada maxfiy maʼlumotlar yoʻq: ushbu xostda bor DNS kirish maʼlumotlari va WireGuard kalitlari saqlanadi, yetishmaganlarini qayta kiritish kerak."],
     "This host is behind NAT ({0} is private): forward the ports on your router to {1} and point DNS at the router's public IP.": ["Этот хост находится за NAT ({0} - частный адрес): пробросьте порты на роутере на {1} и направьте DNS на публичный IP роутера.", "Bu xost NAT ortida ({0} xususiy manzil): routeringizda portlarni {1} ga yoʻnaltiring va DNS ni routerning ochiq IP siga yoʻnaltiring."],
     "This host is behind NAT ({0} is private): forward the ports on your router to {1}.": ["Этот хост находится за NAT ({0} - частный адрес): пробросьте порты на роутере на {1}.", "Bu xost NAT ortida ({0} xususiy manzil): routeringizda portlarni {1} ga yoʻnaltiring."],
     "This host runs an older version. Zones and VNets work; DHCP ranges do not.": ["На этом хосте старая версия. Зоны и VNet работают, диапазоны DHCP - нет.", "Bu xostda eski versiya. Zonalar va VNet ishlaydi, DHCP diapazonlari ishlamaydi."],
@@ -5308,8 +5792,12 @@ I18N = {
     "Unlock {0}?": ["Открепить {0}?", "{0} qulfdan chiqarilsinmi?"],
     "Unlocked": ["Откреплено", "Qulfdan chiqarilgan"],
     "Update": ["Обновить", "Yangilash"],
+    "Update settings": ["Настройки обновлений", "Yangilanish sozlamalari"],
     "Update to v{0}": ["Обновить до v{0}", "v{0} ga yangilash"],
     "Updates": ["Обновления", "Yangilanishlar"],
+    "Upload backup…": ["Загрузить копию…", "Nusxani yuklash…"],
+    "Uploaded as {0}": ["Загружена как {0}", "{0} sifatida yuklandi"],
+    "Uploading {0}…": ["Загрузка {0}…", "{0} yuklanmoqda…"],
     "Upstream": ["Бэкенд (upstream)", "Upstream (backend)"],
     "Upstream IP": ["IP бэкенда", "Upstream IP"],
     "Upstream port": ["Порт бэкенда", "Upstream porti"],
@@ -5331,8 +5819,10 @@ I18N = {
     "VPN address": ["VPN-адрес", "VPN manzili"],
     "Verbose logging (every iptables command + request)": ["Подробный журнал (каждая команда iptables + запрос)", "Batafsil jurnal (har bir iptables buyrugʻi + soʻrov)"],
     "Verify the TLS certificate (and warn before it expires)": ["Проверять TLS-сертификат (и предупреждать до истечения срока)", "TLS sertifikatini tekshirish (va muddati tugashidan oldin ogohlantirish)"],
+    "Version": ["Версия", "Versiya"],
     "Warn when a certificate expires within (days)": ["Предупреждать, если сертификат истекает в течение (дней)", "Sertifikat muddati quyidagi ichida tugasa ogohlantirish (kun)"],
     "Web UI access": ["Доступ к веб-интерфейсу", "Veb-interfeysga kirish"],
+    "Web UI access and login": ["Доступ к веб-интерфейсу и вход", "Veb interfeysga kirish va login"],
     "Web server (HTTP/HTTPS)": ["Веб-сервер (HTTP/HTTPS)", "Veb-server (HTTP/HTTPS)"],
     "Webhook URL": ["URL вебхука", "Webhook URL"],
     "Wildcard": ["Wildcard", "Wildcard"],
@@ -5342,6 +5832,7 @@ I18N = {
     "WireGuard gives you secure access to this host and its guests from anywhere.": ["WireGuard даёт безопасный доступ к этому хосту и его гостевым системам откуда угодно.", "WireGuard istalgan joydan shu xost va uning mehmon tizimlariga xavfsiz kirish imkonini beradi."],
     "WireGuard {0}": ["WireGuard {0}", "WireGuard {0}"],
     "WireGuard {0}: {1}": ["WireGuard {0}: {1}", "WireGuard {0}: {1}"],
+    "Without secrets: after a restore, enter DNS credentials again; WireGuard tunnels need their keys from this host.": ["Без секретов: после восстановления введите учётные данные DNS заново; туннелям WireGuard нужны их ключи с этого хоста.", "Maxfiy maʼlumotlarsiz: tiklashdan keyin DNS kirish maʼlumotlarini qayta kiriting; WireGuard tunnellariga ushbu xostdagi kalitlari kerak."],
     "Writes": ["Записи", "Yozuvlar"],
     "Your IP:": ["Ваш IP:", "Sizning IP:"],
     "Zabbix agent": ["Агент Zabbix", "Zabbix agenti"],
@@ -5399,7 +5890,12 @@ I18N = {
     "at most {0} ports per scan": ["максимум портов за сканирование: {0}", "bir skanerlashda koʻpi bilan {0} ta port"],
     "automatic updates": ["автоматические обновления", "avtomatik yangilanishlar"],
     "backend must be custom or pve": ["backend должен быть custom или pve", "backend custom yoki pve boʻlishi kerak"],
+    "backup is missing manifest.json or config.json": ["в копии нет manifest.json или config.json", "nusxada manifest.json yoki config.json yoʻq"],
+    "backup too large (max {0} MB)": ["копия слишком большая (макс. {0} МБ)", "nusxa juda katta (maks. {0} MB)"],
+    "backup too large when unpacked": ["копия слишком большая после распаковки", "ochilganda nusxa juda katta"],
+    "backups": ["резервные копии", "zaxira nusxalar"],
     "bc:24:11:12:34:56": ["bc:24:11:12:34:56", "bc:24:11:12:34:56"],
+    "before restore": ["перед восстановлением", "tiklashdan oldin"],
     "both": ["оба", "ikkalasi"],
     "bots probing nginx for missing pages (Let's Encrypt challenges are never counted)": ["боты, ищущие в nginx несуществующие страницы (проверки Let's Encrypt никогда не учитываются)", "nginx da mavjud boʻlmagan sahifalarni qidiruvchi botlar (Let's Encrypt tekshiruvlari hech qachon hisoblanmaydi)"],
     "bridge has no address - Apply on the Network tab, or run: ifreload -a": ["у моста нет адреса - нажмите «Применить» на вкладке «Сеть» или выполните: ifreload -a", "koʻprikda manzil yoʻq - Tarmoq yorligʻida Qoʻllash tugmasini bosing yoki bajaring: ifreload -a"],
@@ -5430,6 +5926,8 @@ I18N = {
     "certificate installed": ["сертификат установлен", "sertifikat oʻrnatildi"],
     "certificate is valid, not due for renewal yet": ["сертификат действителен, продлевать пока рано", "sertifikat amal qiladi, yangilash muddati hali kelmagan"],
     "certificate {0}": ["сертификат {0}", "sertifikat {0}"],
+    "certificates": ["сертификаты", "sertifikatlar"],
+    "certificates already on this host were kept: {0}": ["сертификаты, уже имеющиеся на этом хосте, сохранены: {0}", "ushbu xostda bor sertifikatlar saqlab qolindi: {0}"],
     "challenge file served for {0} via {1}:80": ["файл проверки отдаётся для {0} через {1}:80", "tekshiruv fayli {0} uchun {1}:80 orqali berilmoqda"],
     "changed": ["изменено", "oʻzgartirildi"],
     "changed SDN VNet {0}": ["изменена SDN VNet {0}", "SDN VNet {0} oʻzgartirildi"],
@@ -5441,6 +5939,7 @@ I18N = {
     "check crashed: {0}": ["сбой проверки: {0}", "tekshiruv ishdan chiqdi: {0}"],
     "check must be an object": ["проверка должна быть объектом", "tekshiruv obyekt boʻlishi kerak"],
     "check not found": ["проверка не найдена", "tekshiruv topilmadi"],
+    "choose what to restore": ["выберите, что восстановить", "nimani tiklashni tanlang"],
     "cloud.example.com": ["cloud.example.com", "cloud.example.com"],
     "comment: max 50 chars, letters/digits/space and _.:/@+(),- only": ["комментарий: до 50 символов, только буквы/цифры/пробел и _.:/@+(),-", "izoh: koʻpi bilan 50 belgi, faqat harflar/raqamlar/boʻsh joy va _.:/@+(),-"],
     "connected": ["подключено", "ulandi"],
@@ -5456,6 +5955,8 @@ I18N = {
     "created WireGuard tunnel {0}": ["создан туннель WireGuard {0}", "WireGuard tunneli {0} yaratildi"],
     "credentials *.{0}": ["учётные данные *.{0}", "kirish maʼlumotlari *.{0}"],
     "custom…": ["своё…", "boshqa…"],
+    "daily": ["ежедневная", "kunlik"],
+    "daily automatic backups": ["ежедневные автоматические копии", "kunlik avtomatik nusxalar"],
     "default": ["по умолчанию", "standart"],
     "default-src 'self'; frame-ancestors 'none'": ["default-src 'self'; frame-ancestors 'none'", "default-src 'self'; frame-ancestors 'none'"],
     "default: {0} (with --mock: ./.dev)": ["по умолчанию: {0} (с --mock: ./.dev)", "standart: {0} (--mock bilan: ./.dev)"],
@@ -5522,6 +6023,7 @@ I18N = {
     "filters; unticking removes it.": ["фильтры; если снять отметку, он удаляется.", "filtrlar; belgini olib tashlash uni oʻchiradi."],
     "findtime can't be -1": ["findtime не может быть -1", "findtime -1 boʻlishi mumkin emas"],
     "firewall is on; can't verify port {0} (security groups or unreadable config) - make sure HTTP/HTTPS are accepted": ["файрвол включён; не удаётся проверить порт {0} (security groups или нечитаемая конфигурация) - убедитесь, что HTTP/HTTPS разрешены", "fayrvol yoqilgan; {0}-portni tekshirib boʻlmaydi (security groups yoki oʻqib boʻlmaydigan konfiguratsiya) - HTTP/HTTPS ruxsat etilganiga ishonch hosil qiling"],
+    "firewall not restored: {0}": ["файрвол не восстановлен: {0}", "fayrvol tiklanmadi: {0}"],
     "firewall port {0}": ["порт файрвола {0}", "fayrvol porti {0}"],
     "first address": ["первый адрес", "birinchi manzil"],
     "for a port range leave the destination port empty (ports are kept as-is)": ["для диапазона портов оставьте порт назначения пустым (порты сохраняются как есть)", "port diapazoni uchun manzil portini boʻsh qoldiring (portlar oʻzgarishsiz qoladi)"],
@@ -5601,6 +6103,8 @@ I18N = {
     "log every iptables command and HTTP request": ["записывать в журнал каждую команду iptables и HTTP-запрос", "har bir iptables buyrugʻi va HTTP soʻrovini jurnalga yozish"],
     "log iptables changes instead of running them": ["записывать изменения iptables в журнал вместо выполнения", "iptables oʻzgarishlarini bajarish oʻrniga jurnalga yozish"],
     "login required": ["требуется вход", "kirish talab qilinadi"],
+    "managed": ["управляется", "boshqariladi"],
+    "manual": ["вручную", "qoʻlda"],
     "masquerade on": ["masquerade включён", "masquerade yoqilgan"],
     "max 20 aliases": ["не более 20 псевдонимов", "koʻpi bilan 20 ta taxallus"],
     "max upload size: number with optional k/m/g, 0 = unlimited (e.g. 100m)": ["макс. размер загрузки: число с необязательным k/m/g, 0 = без ограничений (например, 100m)", "maksimal yuklash hajmi: ixtiyoriy k/m/g bilan son, 0 = cheklovsiz (masalan, 100m)"],
@@ -5642,11 +6146,14 @@ I18N = {
     "no": ["нет", "yoʻq"],
     "no - nginx.conf must include /etc/nginx/conf.d/*.conf": ["нет - nginx.conf должен включать /etc/nginx/conf.d/*.conf", "yoʻq - nginx.conf /etc/nginx/conf.d/*.conf ni oʻz ichiga olishi kerak"],
     "no DHCP": ["без DHCP", "DHCP yoʻq"],
+    "no DNS credentials for *.{0} in the backup - enter them in its Edit dialog": ["в копии нет учётных данных DNS для *.{0} - введите их в его окне «Изменить»", "nusxada *.{0} uchun DNS kirish maʼlumotlari yoʻq - ularni uning Tahrirlash oynasida kiriting"],
     "no IPAM entry for {0} on {1}": ["нет записи IPAM для {0} в {1}", "{1} da {0} uchun IPAM yozuvi yoʻq"],
     "no VERSION found in {0}/pve-gateway.py": ["в {0}/pve-gateway.py не найден VERSION", "{0}/pve-gateway.py da VERSION topilmadi"],
     "no action taken": ["действий не выполнено", "hech qanday amal bajarilmadi"],
+    "no backup yet - Settings > Backups > Create backup (daily backups start within a few minutes)": ["копий пока нет - Настройки > Резервные копии > Создать копию (ежедневные копии начнутся через несколько минут)", "hozircha nusxa yoʻq - Sozlamalar > Zaxira nusxalar > Nusxa yaratish (kunlik nusxalar bir necha daqiqada boshlanadi)"],
     "no certificate": ["нет сертификата", "sertifikat yoʻq"],
     "no certificate served": ["сертификат не отдаётся", "sertifikat berilmayapti"],
+    "no certificate yet for {0} - click Cert on the Domains tab": ["пока нет сертификата для {0} - нажмите «Сертификат» на вкладке «Домены»", "{0} uchun hali sertifikat yoʻq - Domenlar boʻlimida Sertifikat tugmasini bosing"],
     "no enabled wildcard certificate covers": ["ни один включённый wildcard-сертификат не покрывает", "hech bir yoqilgan wildcard sertifikat qamramaydi"],
     "no enabled wildcard certificate covers this domain": ["ни один включённый wildcard-сертификат не покрывает этот домен", "bu domenni hech bir yoqilgan wildcard sertifikat qamramaydi"],
     "no enabled wildcard certificate covers {0}": ["ни один включённый wildcard-сертификат не покрывает {0}", "{0} ni hech bir yoqilgan wildcard sertifikat qamramaydi"],
@@ -5665,6 +6172,8 @@ I18N = {
     "none": ["нет", "yoʻq"],
     "none (no DNS plugin in Proxmox)": ["нет (в Proxmox нет DNS-плагина)", "yoʻq (Proxmox da DNS plagini yoʻq)"],
     "none yet": ["пока нет", "hali yoʻq"],
+    "not a pve-gateway backup": ["это не резервная копия pve-gateway", "bu pve-gateway nusxasi emas"],
+    "not a pve-gateway backup (expected a .tar.gz made by pve-gateway)": ["это не резервная копия pve-gateway (ожидается .tar.gz, созданный pve-gateway)", "bu pve-gateway nusxasi emas (pve-gateway yaratgan .tar.gz kutilgan)"],
     "not applied yet - click Apply SDN changes": ["ещё не применено - нажмите «Применить изменения SDN»", "hali qoʻllanmagan - SDN oʻzgarishlarini qoʻllash tugmasini bosing"],
     "not asking Let's Encrypt, its check would fail:": ["запрос к Let's Encrypt не отправлен, его проверка не прошла бы:", "Let's Encrypt ga soʻrov yuborilmadi, uning tekshiruvi muvaffaqiyatsiz boʻlardi:"],
     "not asking Let's Encrypt, its check would fail: {0}": ["запрос к Let's Encrypt не отправлен, его проверка не прошла бы: {0}", "Let's Encrypt ga soʻrov yuborilmadi, uning tekshiruvi muvaffaqiyatsiz boʻlardi: {0}"],
@@ -5673,6 +6182,7 @@ I18N = {
     "not installed": ["не установлено", "oʻrnatilmagan"],
     "not issued": ["не выпущен", "berilmagan"],
     "not issued yet - click Cert": ["ещё не выпущен - нажмите Cert", "hali berilmagan - Cert tugmasini bosing"],
+    "not managed": ["не управляется", "boshqarilmaydi"],
     "not managed by pve-gateway, evaluated after its rules": ["не управляется pve-gateway, применяется после его правил", "pve-gateway tomonidan boshqarilmaydi, uning qoidalaridan keyin baholanadi"],
     "not running - journalctl -u dnsmasq@{0}": ["не запущен - journalctl -u dnsmasq@{0}", "ishlamayapti - journalctl -u dnsmasq@{0}"],
     "not used yet - nginx listens on 443 once a domain has a certificate": ["пока не используется - nginx начнёт слушать 443, когда у домена появится сертификат", "hali ishlatilmagan - domen sertifikatga ega boʻlgach, nginx 443-portni tinglaydi"],
@@ -5760,6 +6270,7 @@ I18N = {
     "resolves to {0} (this host)": ["указывает на {0} (этот хост)", "{0} ga yoʻnaltirilgan (shu xost)"],
     "resolves to {0} - this host has no public IPv4, so that must be your router forwarding ports 80/443 here": ["указывает на {0} - у этого хоста нет публичного IPv4, значит это должен быть ваш роутер, перенаправляющий сюда порты 80/443", "{0} ga yoʻnaltirilgan - bu xostda ommaviy IPv4 yoʻq, demak bu 80/443 portlarini shu yerga yoʻnaltiruvchi routeringiz boʻlishi kerak"],
     "resolves to {0}, but this host's public IP is {1} - fix the A record, unless a router or proxy in front forwards 80/443 here": ["указывает на {0}, но публичный IP этого хоста - {1} - исправьте A-запись, если только роутер или прокси перед ним не перенаправляет сюда 80/443", "{0} ga yoʻnaltirilgan, lekin bu xostning ommaviy IP manzili {1} - A yozuvini tuzating, agar oldidagi router yoki proksi 80/443 ni shu yerga yoʻnaltirmasa"],
+    "restore failed, nothing was changed: {0}": ["восстановление не удалось, ничего не изменено: {0}", "tiklash amalga oshmadi, hech narsa oʻzgarmadi: {0}"],
     "return path": ["обратный путь", "qaytish yoʻli"],
     "risky ports: LAN": ["опасные порты: LAN", "xavfli portlar: LAN"],
     "risky ports: not from internet": ["опасные порты: не из интернета", "xavfli portlar: internetdan emas"],
@@ -5792,6 +6303,7 @@ I18N = {
     "same certificate as IPv4": ["тот же сертификат, что и для IPv4", "IPv4 bilan bir xil sertifikat"],
     "saved - leave empty to keep": ["сохранено - оставьте пустым, чтобы не менять", "saqlangan - oʻzgartirmaslik uchun boʻsh qoldiring"],
     "scan not found": ["сканирование не найдено", "skanerlash topilmadi"],
+    "secrets": ["секреты", "maxfiy maʼlumotlar"],
     "served certificate": ["выдаваемый сертификат", "taqdim etilayotgan sertifikat"],
     "served certificate (IPv6)": ["выдаваемый сертификат (IPv6)", "taqdim etilayotgan sertifikat (IPv6)"],
     "server {": ["server {", "server {"],
@@ -5828,6 +6340,9 @@ I18N = {
     "the 'mock' command needs --mock": ["команде 'mock' нужен --mock", "'mock' buyrugʻi uchun --mock kerak"],
     "the Proxmox firewall is also enabled; pve-gateway's rules run first (INPUT #1)": ["файрвол Proxmox тоже включён; правила pve-gateway выполняются первыми (INPUT #1)", "Proxmox fayrvoli ham yoqilgan; pve-gateway qoidalari birinchi ishlaydi (INPUT #1)"],
     "the Proxmox firewall is on and has no rule accepting port {0} - add Datacenter > Firewall > Add: direction in, action ACCEPT, macro {1}": ["файрвол Proxmox включён, и в нём нет правила, разрешающего порт {0} - добавьте Datacenter > Firewall > Add: direction in, action ACCEPT, macro {1}", "Proxmox fayrvoli yoqilgan va unda {0}-portga ruxsat beruvchi qoida yoʻq - qoʻshing: Datacenter > Firewall > Add: direction in, action ACCEPT, macro {1}"],
+    "the backup has WireGuard tunnels but wireguard-tools is not installed - install it on the VPN tab first, or restore without \"WireGuard VPN\"": ["в копии есть туннели WireGuard, но wireguard-tools не установлен - сначала установите его на вкладке VPN или восстановите без \"WireGuard VPN\"", "nusxada WireGuard tunnellari bor, lekin wireguard-tools oʻrnatilmagan - avval uni VPN boʻlimida oʻrnating yoki \"WireGuard VPN\" siz tiklang"],
+    "the backup has no private key for tunnel {0} (made without secrets) - restore it without \"WireGuard VPN\", or use a backup that includes secrets": ["в копии нет закрытого ключа туннеля {0} (создана без секретов) - восстановите без \"WireGuard VPN\" или используйте копию с секретами", "nusxada {0} tunnelining shaxsiy kaliti yoʻq (maxfiy maʼlumotlarsiz yaratilgan) - \"WireGuard VPN\" siz tiklang yoki maxfiy maʼlumotli nusxadan foydalaning"],
+    "the backup manages fail2ban but it is not installed - install it on the Security tab first, or restore without \"Fail2ban\"": ["копия управляет fail2ban, но он не установлен - сначала установите его на вкладке «Безопасность» или восстановите без \"Fail2ban\"", "nusxa fail2ban ni boshqaradi, lekin u oʻrnatilmagan - avval uni Xavfsizlik boʻlimida oʻrnating yoki \"Fail2ban\" siz tiklang"],
     "the certificate nginx serves ({0}) doesn't cover {1} - browsers will warn": ["сертификат, который выдаёт nginx ({0}), не покрывает {1} - браузеры покажут предупреждение", "nginx taqdim etayotgan sertifikat ({0}) {1} ni qamrab olmaydi - brauzerlar ogohlantiradi"],
     "the certificate of {0} expires in {1} days": ["сертификат {0} истекает через {1} дн.", "{0} sertifikati {1} kundan keyin tugaydi"],
     "the gateway": ["шлюз", "shlyuz"],
@@ -5861,13 +6376,19 @@ I18N = {
     "uid {0}": ["uid {0}", "uid {0}"],
     "unexpected answer from pvesh": ["неожиданный ответ от pvesh", "pvesh dan kutilmagan javob"],
     "unexpected answer from pvesh get {0}": ["неожиданный ответ от pvesh get {0}", "pvesh get {0} dan kutilmagan javob"],
+    "unexpected entry in backup: {0}": ["неожиданная запись в копии: {0}", "nusxada kutilmagan yozuv: {0}"],
+    "unexpected file in backup: {0}": ["неожиданный файл в копии: {0}", "nusxada kutilmagan fayl: {0}"],
+    "unexpected link in backup: {0}": ["неожиданная ссылка в копии: {0}", "nusxada kutilmagan havola: {0}"],
     "unknown": ["неизвестно", "nomaʼlum"],
     "unknown DNS plugin {0} - add it in Proxmox: Datacenter > SDN > Options > DNS": ["неизвестный DNS-плагин {0} - добавьте его в Proxmox: Datacenter > SDN > Options > DNS", "nomaʼlum DNS plagini {0} - uni Proxmox da qoʻshing: Datacenter > SDN > Options > DNS"],
     "unknown DNS provider '{0}'": ["неизвестный DNS-провайдер '{0}'", "nomaʼlum DNS provayder '{0}'"],
     "unknown template": ["неизвестный шаблон", "nomaʼlum shablon"],
+    "unreadable": ["не читается", "oʻqib boʻlmaydi"],
     "unsaved changes": ["несохранённые изменения", "saqlanmagan oʻzgarishlar"],
     "up": ["работает", "ishlayapti"],
     "up, {0}/{1} peers online, UDP {2}": ["работает, узлов в сети: {0}/{1}, UDP {2}", "ishlayapti, {0}/{1} ta tugun onlayn, UDP {2}"],
+    "upload too large (max {0} MB)": ["файл слишком большой (макс. {0} МБ)", "fayl juda katta (maks. {0} MB)"],
+    "uploaded": ["загружена", "yuklangan"],
     "upstream {0}:{1}": ["бэкенд {0}:{1}", "upstream {0}:{1}"],
     "use a private range (10.x, 172.16-31.x, 192.168.x) - guests get it via DHCP/NAT": ["используйте частный диапазон (10.x, 172.16-31.x, 192.168.x) - гостевые системы получают его через DHCP/NAT", "xususiy diapazondan foydalaning (10.x, 172.16-31.x, 192.168.x) - mehmon tizimlar uni DHCP/NAT orqali oladi"],
     "use strict": ["use strict", "use strict"],
@@ -5893,6 +6414,9 @@ I18N = {
     "without Masquerade the guest's default gateway must be this host{0}": ["без Masquerade шлюзом по умолчанию у гостя должен быть этот хост{0}", "Masquerade boʻlmasa, mehmonning standart shlyuzi shu xost boʻlishi kerak{0}"],
     "www.example.com (optional, space separated)": ["www.example.com (необязательно, через пробел)", "www.example.com (ixtiyoriy, boʻsh joy bilan ajratilgan)"],
     "yes": ["да", "ha"],
+    "you would be locked out: the backup allows the web UI only from {0}, not from your IP {1}{2}": ["вы потеряете доступ: копия разрешает веб-интерфейс только с {0}, а не с вашего IP {1}{2}", "kirish yopilib qoladi: nusxa veb interfeysga faqat {0} dan ruxsat beradi, sizning IP {1} dan emas{2}"],
+    "you would be locked out: you opened the UI as {0}, which the backup's allowed hostnames don't include{1}": ["вы потеряете доступ: вы открыли интерфейс как {0}, а этого имени нет среди разрешённых в копии{1}", "kirish yopilib qoladi: interfeysni {0} sifatida ochdingiz, nusxadagi ruxsat etilgan nomlarda u yoʻq{1}"],
+    "you would be locked out: {0} is not among the backup's allowed users{1}": ["вы потеряете доступ: {0} нет среди разрешённых пользователей копии{1}", "kirish yopilib qoladi: {0} nusxadagi ruxsat etilgan foydalanuvchilar orasida yoʻq{1}"],
     "you@example.com (uses this host's mail system)": ["you@example.com (использует почтовую систему этого хоста)", "you@example.com (shu xostning pochta tizimidan foydalanadi)"],
     "your public IP": ["ваш публичный IP", "ommaviy IP manzilingiz"],
     "zone id: 2-8 lowercase letters/digits, starting with a letter (e.g. lab)": ["id зоны: 2-8 строчных букв/цифр, начинается с буквы (например lab)", "zona id: 2-8 ta kichik harf/raqam, harf bilan boshlanadi (masalan lab)"],
@@ -5932,6 +6456,7 @@ I18N = {
     "{0} checks, all up or pending": ["проверок: {0}, все работают или ожидают", "{0} ta tekshiruv, hammasi ishlayapti yoki kutilmoqda"],
     "{0} connection(s), {1} bytes matched since rules were loaded": ["соединений: {0}, байт: {1} совпало с момента загрузки правил", "qoidalar yuklanganidan beri {0} ta ulanish, {1} bayt mos keldi"],
     "{0} d": ["{0} д", "{0} kun"],
+    "{0} days": ["{0} дн.", "{0} kun"],
     "{0} domain": ["доменов: {0}", "{0} ta domen"],
     "{0} domain · {1} off": ["доменов: {0} · выключено: {1}", "{0} ta domen · {1} ta oʻchirilgan"],
     "{0} domains": ["доменов: {0}", "{0} ta domen"],
@@ -5956,6 +6481,8 @@ I18N = {
     "{0} is reachable again ({1}, {2} ms)": ["{0} снова доступен ({1}, {2} мс)", "{0} yana ishlayapti ({1}, {2} ms)"],
     "{0} is the gateway": ["{0} - это шлюз", "{0} - bu shlyuz"],
     "{0} listens on port {1}, not (only) nginx - stop it or move it": ["{0} слушает порт {1}, а не (только) nginx - остановите его или перенесите", "{1}-portni nginx emas (yoki nafaqat nginx), {0} tinglaydi - uni toʻxtating yoki koʻchiring"],
+    "{0} local backup(s), newest {1} ago ({2})": ["локальных копий: {0}, последняя {1} назад ({2})", "{0} ta mahalliy nusxa, eng yangisi {1} oldin ({2})"],
+    "{0} local backup(s), newest {1} ago ({2}) - daily backups are off (Settings > Backups)": ["локальных копий: {0}, последняя {1} назад ({2}) - ежедневные копии выключены (Настройки > Резервные копии)", "{0} ta mahalliy nusxa, eng yangisi {1} oldin ({2}) - kunlik nusxalar oʻchirilgan (Sozlamalar > Zaxira nusxalar)"],
     "{0} min": ["{0} мин", "{0} daq"],
     "{0} min ago": ["{0} мин назад", "{0} daq oldin"],
     "{0} must be a number": ["{0} должно быть числом", "{0} raqam boʻlishi kerak"],
@@ -5971,6 +6498,7 @@ I18N = {
     "{0} rule · {1} off": ["правил: {0} · выключено: {1}", "{0} ta qoida · {1} ta oʻchirilgan"],
     "{0} rules": ["правил: {0}", "{0} ta qoida"],
     "{0} rules · {1} off": ["правил: {0} · выключено: {1}", "{0} ta qoida · {1} ta oʻchirilgan"],
+    "{0} rules, {1} domains, {2} tunnels": ["правил: {0}, доменов: {1}, туннелей: {2}", "{0} ta qoida, {1} ta domen, {2} ta tunnel"],
     "{0} via {1}": ["{0} через {1}", "{0} {1} orqali"],
     "{0} via {1}:80 answered {2} instead of the challenge": ["{0} через {1}:80 ответил {2} вместо challenge", "{0} {1}:80 orqali challenge oʻrniga {2} javob berdi"],
     "{0} {1} (CT, {2})": ["{0} {1} (CT, {2})", "{0} {1} (CT, {2})"],
@@ -6006,6 +6534,7 @@ I18N = {
     "{0}, UDP {1} (disabled).": ["{0}, UDP {1} (выключено).", "{0}, UDP {1} (oʻchirilgan)."],
     "{0}, UDP {1}. The tunnel is (re)started; connected peers stay connected.": ["{0}, UDP {1}. Туннель (пере)запускается; подключённые узлы остаются на связи.", "{0}, UDP {1}. Tunnel (qayta) ishga tushiriladi; ulangan tugunlar ulanganicha qoladi."],
     "{0}. Needs: apt install {1}": ["{0}. Требуется: apt install {1}", "{0}. Kerak: apt install {1}"],
+    "{0}. The current state is saved first, so you can undo it.": ["{0}. Сначала сохраняется текущее состояние, поэтому это можно отменить.", "{0}. Avval joriy holat saqlanadi, shuning uchun buni bekor qilish mumkin."],
     "{0}: a duration like 10m, 1h, 1d (or -1 = forever for the ban time)": ["{0}: длительность вида 10m, 1h, 1d (или -1 = навсегда для времени бана)", "{0}: 10m, 1h, 1d kabi davomiylik (yoki bloklash vaqti uchun -1 = abadiy)"],
     "{0}: expires in {1} days": ["{0}: истекает через {1} дн.", "{0}: {1} kundan keyin tugaydi"],
     "{0}: invalid value": ["{0}: недопустимое значение", "{0}: notoʻgʻri qiymat"],
@@ -6279,6 +6808,25 @@ INDEX_HTML = r"""<!doctype html>
       <p id="setErr" class="err"></p>
       <div class="actions"><span id="setMsg" class="muted small"></span><button type="button" id="saveSettings">Save</button></div>
     </div>
+    <div class="card form-card wide-card">
+      <div class="sub-head card-head"><h2>Backups</h2><span class="spacer"></span>
+        <button type="button" class="ghost" id="bkUploadBtn">Upload backup…</button><input type="file" id="bkFile" accept=".gz,.tgz,application/gzip" hidden>
+        <button type="button" id="bkCreate">Create backup</button></div>
+      <p class="muted small">A backup holds the configuration (rules, domains, checks, firewall, fail2ban, VPN, settings) and, if you
+        choose, the secrets kept outside it (DNS API credentials, WireGuard keys, alert tokens) and the Let's Encrypt certificates.
+        Copies are kept on this host in <code id="bkDir"></code>. Download one to keep it somewhere else - it is the way to move
+        pve-gateway to a new host. Before every restore the current state is saved, so a restore can be undone.</p>
+      <div class="grid">
+        <label class="check"><input type="checkbox" id="bkSecrets" checked> Include secrets (keep such a file private)</label>
+        <label class="check"><input type="checkbox" id="bkCerts"> Include Let's Encrypt certificates</label>
+        <label class="check wide"><input type="checkbox" id="bkDaily"> Daily automatic backup on this host (keeps the last 7)</label>
+      </div>
+      <p id="bkErr" class="err"></p><p id="bkMsg" class="muted small"></p>
+      <div class="scroll"><table>
+        <thead><tr><th>Created</th><th>Type</th><th>Version</th><th>Contents</th><th class="num">Size</th><th></th></tr></thead>
+        <tbody id="bkRows"></tbody></table></div>
+      <p id="bkEmpty" class="muted pad" hidden>No backups yet.</p>
+    </div>
   </main>
   <main id="view-debug" hidden>
     <div class="bar">
@@ -6499,6 +7047,19 @@ INDEX_HTML = r"""<!doctype html>
   </form>
 </dialog>
 
+<dialog id="bkDlg">
+  <form id="bkForm" class="form">
+    <h2>Restore backup</h2>
+    <p id="bkInfo" class="muted small"></p>
+    <p class="muted small">Choose what to restore. Everything else stays as it is now. Host-specific settings (listen port, TLS
+      certificate of this page, file paths) are never taken from a backup.</p>
+    <div id="bkParts" class="grid"></div>
+    <p id="bkNote" class="hint"></p>
+    <p id="bkDErr" class="err"></p>
+    <div class="actions"><button type="button" class="ghost" data-close>Cancel</button><button type="submit" class="danger">Restore</button></div>
+  </form>
+</dialog>
+
 <dialog id="testDlg">
   <h2 id="testTitle">Test</h2>
   <ul id="testSteps" class="checks"></ul>
@@ -6568,6 +7129,9 @@ button.grp-toggle{background:none;border:none;color:var(--fg);padding:2px 0;font
 .lock-mark{font-size:12px}button.lock-btn{filter:grayscale(1);opacity:.55;padding:3px 5px}button.lock-btn.on,button.lock-btn:hover{filter:none;opacity:1}
 h1.brand select.lang-sel{width:auto;padding:4px 6px;font-size:12px;font-weight:400;margin-left:auto}
 select.lang-sel.wide-sel{max-width:260px}
+a.link-btn{color:var(--link);font-weight:600;padding:3px 7px;border-radius:6px;text-decoration:none;font-size:inherit}
+a.link-btn:hover{background:var(--btn)}
+#bkRows .chip{margin-left:6px}#bkErr:empty,#bkMsg:empty{display:none}.form-card.wide-card{max-width:none}.sub-head.card-head{margin:0}.part-state{margin-left:6px}
 button.danger{background:var(--bad);border-color:var(--bad);color:var(--accent-fg)}
 dialog.ask{max-width:440px}dialog.ask h2{font-size:16px;margin:0 0 8px}dialog.ask p{margin:0 0 4px;white-space:pre-wrap}
 table{width:100%;border-collapse:collapse;white-space:nowrap}
@@ -7715,6 +8279,93 @@ $('#sdnApply').onclick = () => sdnDo('POST', '/api/sdn/apply', null, 'Apply SDN 
 $('#sdnInstall').onclick = () => sdnDo('POST', '/api/sdn/install', null, 'Install dnsmasq?', 'Runs: apt-get install dnsmasq (the default dnsmasq service is turned off; Proxmox runs one per zone).', 'Install');
 for (const b of document.querySelectorAll('[data-close]')) b.onclick = () => b.closest('dialog').close();
 
+// ---- backups (Settings)
+let BK = null, bkName = null;
+const BK_TYPES = {manual: 'manual', daily: 'daily', 'pre-restore': 'before restore', upload: 'uploaded'};
+async function loadBackups() {
+  try { BK = await api('GET', '/api/backups'); renderBackups(); } catch (e) { $('#bkErr').textContent = e.message; }
+}
+function renderBackups() {
+  $('#bkDir').textContent = BK.dir; $('#bkDaily').checked = BK.daily; $('#bkEmpty').hidden = BK.backups.length > 0;
+  $('#bkRows').replaceChildren(...BK.backups.map(b => {
+    const c = b.counts || {};
+    return el('tr', {},
+      el('td', {class: 'small', textContent: new Date(b.created * 1000).toLocaleString()}),
+      el('td', {}, el('span', {class: 'tag', textContent: BK_TYPES[b.reason] || b.reason})),
+      el('td', {class: 'mono small', textContent: b.version ? 'v' + b.version : '—'}),
+      el('td', {class: 'small'}, b.broken ? el('span', {class: 'chip bad', textContent: 'unreadable'}) :
+        (c.rules || 0) + ' rules, ' + (c.domains || 0) + ' domains, ' + (c.tunnels || 0) + ' tunnels',
+        b.secrets ? el('span', {class: 'chip warn', textContent: 'secrets'}) : null,
+        b.certs ? el('span', {class: 'chip ok', textContent: 'certificates'}) : null),
+      el('td', {class: 'num small', textContent: fmtBytes(b.size)}),
+      el('td', {class: 'num'},
+        el('a', {class: 'link-btn', href: '/api/backups/' + encodeURIComponent(b.name) + '/download', download: b.name, textContent: 'Download'}),
+        b.broken ? null : el('button', {class: 'link', textContent: 'Restore', onclick: () => openRestore(b.name)}),
+        el('button', {class: 'link del', textContent: 'Delete', onclick: async () => {
+          if (!await ask('Delete backup?', b.name, 'Delete', true)) return;
+          try { await api('DELETE', '/api/backups/' + encodeURIComponent(b.name)); } catch (e) { $('#bkErr').textContent = e.message; }
+          loadBackups(); }})));
+  }));
+}
+$('#bkCreate').onclick = async () => {
+  const secrets = $('#bkSecrets').checked, certs = $('#bkCerts').checked;
+  if (!await ask('Create a backup now?', secrets ? 'It includes secrets (DNS credentials, WireGuard keys, alert tokens) - keep downloaded copies private.' :
+    'Without secrets: after a restore, enter DNS credentials again; WireGuard tunnels need their keys from this host.', 'Create')) return;
+  $('#bkErr').textContent = '';
+  try { const r = await api('POST', '/api/backups', {secrets, certs}); $('#bkMsg').textContent = 'Backup created: ' + r.name; }
+  catch (e) { $('#bkErr').textContent = e.message; }
+  loadBackups();
+};
+$('#bkDaily').onchange = async e => {
+  if (!await askToggle(e, 'daily automatic backups')) return;
+  try { await api('PUT', '/api/backups/settings', {daily: e.target.checked}); } catch (err) { e.target.checked = !e.target.checked; $('#bkErr').textContent = err.message; }
+};
+$('#bkUploadBtn').onclick = () => $('#bkFile').click();
+$('#bkFile').onchange = async e => {
+  const f = e.target.files[0]; e.target.value = '';
+  if (!f) return;
+  $('#bkErr').textContent = ''; $('#bkMsg').textContent = 'Uploading ' + f.name + '…';
+  try {
+    const r = await fetch('/api/backups/upload', {method: 'POST', credentials: 'same-origin', headers: {'X-PVEGW': '1', 'Content-Type': 'application/gzip'}, body: f});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    $('#bkMsg').textContent = 'Uploaded as ' + j.name; await loadBackups(); openRestore(j.name);
+  } catch (err) { $('#bkMsg').textContent = ''; $('#bkErr').textContent = err.message; }
+};
+async function openRestore(name) {
+  bkName = name; $('#bkDErr').textContent = '';
+  let info;
+  try { info = await api('GET', '/api/backups/' + encodeURIComponent(name)); } catch (e) { $('#bkErr').textContent = e.message; return; }
+  const m = info.manifest || {};
+  $('#bkInfo').textContent = name + ' · v' + (m.version || '?') + ' · ' + (m.host || '?') + ' · ' + new Date((m.created || 0) * 1000).toLocaleString();
+  const state = k => k === 'firewall' ? (info.parts[k].enabled ? 'on' : 'off') : k === 'fail2ban' ? (info.parts[k].managed ? 'managed' : 'not managed') : '';
+  $('#bkParts').replaceChildren(...Object.entries(info.parts).map(([k, p]) => el('label', {class: 'check'},
+    el('input', {type: 'checkbox', name: 'part', value: k, checked: k !== 'firewall' && k !== 'access'}),
+    el('span', {class: 'part-label', textContent: p.label}),
+    p.count != null ? el('span', {class: 'muted', textContent: ' · ' + p.count}) : null,
+    state(k) ? el('span', {class: 'tag part-state', textContent: state(k)}) : null)));
+  $('#bkNote').replaceChildren(  // one text node per sentence, so each is translated on its own
+    info.has_secrets ? '' : 'This backup has no secrets: DNS credentials and WireGuard keys already on this host are kept, missing ones must be entered again.',
+    info.certs.length ? ' ' : '', info.certs.length ? 'Certificates in it: ' + info.certs.join(', ') + ' (only restored where this host has none).' : '',
+    ' ', 'A restored, enabled firewall must be confirmed within 60 s, like any firewall change.');
+  $('#bkDlg').showModal();
+}
+$('#bkForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const parts = [...e.target.querySelectorAll('input[name=part]:checked')].map(x => x.value);
+  if (!parts.length) { $('#bkDErr').textContent = 'Choose what to restore.'; return; }
+  const labels = parts.map(p => e.target.querySelector('input[value="' + p + '"]').parentElement.querySelector('.part-label').textContent);
+  if (!await ask('Restore from this backup?', labels.join(', ') + '. The current state is saved first, so you can undo it.', 'Restore', true)) return;
+  try {
+    const r = await api('POST', '/api/backups/' + encodeURIComponent(bkName) + '/restore', {parts});
+    $('#bkDlg').close();
+    $('#bkMsg').replaceChildren('Restored. To undo, restore "' + r.safety + '".',
+      ...(r.certs.length ? [' ', 'Certificates restored: ' + r.certs.join(', ') + '.'] : []), ...r.warnings.flatMap(w => [' · ', w]));
+    loadBackups(); load().catch(() => {});
+    if (r.firewall_pending) location.hash = '#security';
+  } catch (err) { $('#bkDErr').textContent = err.message; }
+});
+
 // ---- security: firewall (edits go to a draft; Apply activates it with a 60 s keep/revert window)
 let FW = null, FWD = null, fwEditing = null, fwTick = null;
 async function loadFirewall(force) {
@@ -7937,6 +8588,7 @@ $('#updRun').onclick = async () => {
 // ---- settings
 async function loadSettings() {
   loadUpdate(false);
+  loadBackups();
   try {
     const d = await api('GET', '/api/settings');
     $('#uiAllow').value = d.ui_allow.join('\n'); $('#uiHosts').value = d.allowed_hosts.join('\n');
@@ -8027,14 +8679,19 @@ def main():
   ui-host [NAME..] hostnames the UI may be opened by besides IPs ("none" = clear); no args = show
   domains          list domains, wildcard certificates and expiry
   cert NAME        request / renew a certificate now (domain, or *.zone for a wildcard)
+  backup [FILE]    save a backup (config + secrets; --no-secrets, --certs) to FILE or the local backup dir
+  backup list      list local backups (<config dir>/backups)
+  restore NAME|FILE all|PART...
+                   restore from a local backup or a file; PART: %s
+                   (firewall only when named - it is applied without the keep-or-revert window)
   mock SCENARIO    (--mock only) break the simulated host: %s
 
 local development (macOS etc.):
   ./pve-gateway.py --mock         simulated Proxmox host, http://127.0.0.1:8099, login admin / admin""" % (
-            "reset, unhook, ip-forward-off, forward-drop, pvefw-first, foreign-dnat, traffic"))
+            ", ".join(BACKUP_PARTS), "reset, unhook, ip-forward-off, forward-drop, pvefw-first, foreign-dnat, traffic"))
     ap.add_argument("cmd", nargs="?", default="serve",
                     choices=["serve", "status", "test", "debug", "show", "apply", "flush", "passwd", "mock",
-                             "domains", "cert", "ui-allow", "ui-host", "update", "monitors", "scan"])
+                             "domains", "cert", "ui-allow", "ui-host", "update", "monitors", "scan", "backup", "restore"])
     ap.add_argument("rules", nargs="*", help=argparse.SUPPRESS)
     ap.add_argument("-v", "--verbose", action="store_true", help="log every iptables command and HTTP request")
     ap.add_argument("--version", action="version", version="pve-gateway " + VERSION)
@@ -8042,6 +8699,8 @@ local development (macOS etc.):
     ap.add_argument("--mock", action="store_true", help="simulate a Proxmox host (for local development, uses dev/mock.py)")
     ap.add_argument("--config-dir", help="default: %s (with --mock: ./.dev)" % CONF_DIR)
     ap.add_argument("--port", type=int, help="override listen port")
+    ap.add_argument("--no-secrets", action="store_true", help="backup: leave out DNS credentials, WireGuard keys, tokens")
+    ap.add_argument("--certs", action="store_true", help="backup: include the Let's Encrypt certificates of the domains")
     a = ap.parse_args()
     DRY_RUN, VERBOSE = a.dry_run and not a.mock, a.verbose
     here = os.path.dirname(os.path.abspath(__file__))
@@ -8113,6 +8772,48 @@ local development (macOS etc.):
         print("%s: %d open of %d scanned" % (sc["target"], len(sc["open"]), sc["total"]))
         for o in sc["open"]:
             print("  %5d/tcp  %-24s %s" % (o["port"], o["service"], o["risk"]))
+    elif a.cmd == "backup":
+        if a.rules[:1] == ["list"]:
+            for b in list_backups():
+                print("%-52s %7.1f KB  v%-7s %s%s" % (b["name"], b["size"] / 1024.0, b.get("version") or "?",
+                      "secrets" if b.get("secrets") else "no secrets", ", %d cert(s)" % b["certs"] if b.get("certs") else ""))
+            print("(in %s)" % backup_dir())
+            return
+        data, man = make_backup(cfg, secrets=not a.no_secrets, certs=a.certs)
+        if a.rules:
+            fd = os.open(a.rules[0], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            out = a.rules[0]
+        else:
+            out = os.path.join(backup_dir(), store_backup(data, "manual"))
+        print("backup written: %s (%d bytes%s%s)" % (out, len(data), "" if man["secrets"] else ", without secrets",
+                                                    ", certificates: " + ", ".join(man["certs"]) if man["certs"] else ""))
+        if man["secrets"]:
+            print("it contains secrets (DNS API credentials, WireGuard private keys) - keep it private")
+    elif a.cmd == "restore":
+        if len(a.rules) < 2:
+            sys.exit("usage: pve-gateway restore NAME|FILE all|PART... (parts: %s)" % ", ".join(BACKUP_PARTS))
+        src, parts = a.rules[0], a.rules[1:]
+        if parts == ["all"]:
+            parts = [p for p in BACKUP_PARTS if p != "firewall"]
+        bad = [p for p in parts if p not in BACKUP_PARTS]
+        if bad:
+            sys.exit("unknown part %s (parts: %s)" % (", ".join(bad), ", ".join(BACKUP_PARTS)))
+        try:
+            if not BACKUP_NAME_RE.match(os.path.basename(src)) or not os.path.isfile(os.path.join(backup_dir(), os.path.basename(src))):
+                with open(src, "rb") as f:
+                    data = f.read()
+                read_backup(data)
+                src = store_backup(data, "upload")
+            res = restore_backup(os.path.basename(src), parts, "cli", fw_window=False)
+        except (ApiError, OSError) as e:
+            sys.exit("restore failed: %s" % e)
+        print("restored: %s (undo: pve-gateway restore %s all)" % (", ".join(parts), res["safety"]))
+        for w in res["warnings"]:
+            print("note: " + w)
+        if not MOCK and not DRY_RUN and run(["systemctl", "try-restart", "pve-gateway"], check_only=True)[0] == 0:
+            print("pve-gateway restarted")
     elif a.cmd == "update":
         info = check_update()
         if info["error"]:

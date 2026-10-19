@@ -163,6 +163,9 @@ pve-gateway monitors        # run every health check once
 pve-gateway scan IP [PORTS] # TCP port scan from this host (common | 22,80,8000-8100)
 pve-gateway domains         # list domains, wildcard certificates and expiry
 pve-gateway cert NAME       # request / renew now: a domain, or '*.example.com' for a wildcard
+pve-gateway backup [FILE]   # backup (config + secrets; --no-secrets, --certs) to FILE or /etc/pve-gateway/backups
+pve-gateway backup list     # list local backups
+pve-gateway restore NAME|FILE all|PART...   # parts: rules domains monitoring firewall fail2ban vpn access updates
 pve-gateway debug           # full diagnostic report, paste it when asking for help
 pve-gateway show            # print the generated iptables-restore payload
 pve-gateway apply           # re-apply saved rules
@@ -358,6 +361,30 @@ pvenode acme plugin add dns cloudflare --api cf --data /root/cf.env && rm /root/
 pvenode config set --acmedomain0 pve.example.com,plugin=cloudflare
 pvenode acme cert order
 ```
+
+## Резервное копирование и восстановление
+
+**Настройки → Резервные копии** сохраняют всё, что знает pve-gateway, в один файл `.tar.gz`:
+- конфигурацию: правила, домены, wildcard-сертификаты, проверки и оповещения, файрвол, fail2ban, VPN и настройки;
+- по желанию секреты, хранящиеся отдельно от неё: учётные данные DNS API, ключи WireGuard, токены оповещений и хеш пароля. **Файл с секретами нужно хранить в тайне.**
+- по желанию сертификаты Let's Encrypt для доменов.
+
+Копии хранятся на хосте в `/etc/pve-gateway/backups` (папка 0700, файлы 0600):
+- ручные копии;
+- **ежедневная автоматическая копия** (последние 7);
+- **страховочная копия перед каждым восстановлением**, так что восстановление всегда можно отменить.
+
+Скачайте копию, чтобы хранить её в другом месте. Так же pve-gateway переносится на новый хост: установите его там, загрузите файл и восстановите.
+
+**Восстановление** показывает содержимое копии и позволяет выбрать части: правила портов, домены и wildcard-сертификаты, проверки и оповещения, файрвол, fail2ban, VPN, доступ к веб-интерфейсу, настройки обновлений. Всё остальное остаётся как есть.
+- **Никогда не восстанавливаются:** настройки, зависящие от хоста (порт, TLS-сертификат интерфейса, пути к файлам).
+- **Файрвол:** восстановленный включённый файрвол нужно подтвердить в течение 60 с, как любое изменение файрвола.
+- **Защита от потери доступа:** настройки доступа к веб-интерфейсу, из-за которых вы потеряете доступ, отклоняются.
+- **При ошибке:** если применение не удалось (например, `nginx -t`), возвращаются прежняя конфигурация и файлы секретов.
+- **Сертификаты:** восстанавливаются, только если на хосте их нет, поэтому существующие никогда не перезаписываются.
+- **Копии без секретов:** учётные данные DNS, ключи WireGuard и пароль, уже имеющиеся на хосте, сохраняются.
+
+Загружаемые файлы строго проверяются: только известные имена файлов, никаких путей за пределами копии, символические ссылки только между папками `live/` и `archive/` certbot.
 
 ## Удаление
 

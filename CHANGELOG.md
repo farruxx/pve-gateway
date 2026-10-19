@@ -4,6 +4,18 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.12.0 - 2026-10-19
+- Backup and restore (Settings > Backups, CLI `backup` / `restore`). A backup is one .tar.gz with the configuration
+  and, optionally, the secrets kept outside it (DNS API credentials, WireGuard keys, alert tokens, login hash) and the
+  Let's Encrypt certificates. Local copies in <config dir>/backups: manual, daily (last 7, on by default) and a
+  safety copy before every restore, so a restore can be undone. Download / upload to move to a new host.
+- Restore lets you pick parts (port rules, domains + wildcards, checks + alerts, firewall, fail2ban, VPN, web UI
+  access, update settings); host-specific settings are never restored. A restored firewall needs the usual 60 s
+  confirmation, access settings that would lock you out are refused, a failed apply rolls everything back,
+  certificates are only added where the host has none, backups without secrets keep the host's existing ones.
+- Uploads are validated strictly (known file names only, no path traversal, certbot symlinks only).
+- Debug: a "backups" check (age of the newest backup).
+
 ## 1.11.0 - 2026-10-19
 - The web UI speaks Russian and Uzbek (Latin) besides English: it follows the browser's language, and Settings → Language
   (or the menu on the login page) switches it (remembered per browser). Server messages - errors, health checks, test

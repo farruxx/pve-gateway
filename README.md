@@ -163,6 +163,9 @@ pve-gateway monitors        # run every health check once
 pve-gateway scan IP [PORTS] # TCP port scan from this host (common | 22,80,8000-8100)
 pve-gateway domains         # list domains, wildcard certificates and expiry
 pve-gateway cert NAME       # request / renew now: a domain, or '*.example.com' for a wildcard
+pve-gateway backup [FILE]   # backup (config + secrets; --no-secrets, --certs) to FILE or /etc/pve-gateway/backups
+pve-gateway backup list     # list local backups
+pve-gateway restore NAME|FILE all|PART...   # parts: rules domains monitoring firewall fail2ban vpn access updates
 pve-gateway debug           # full diagnostic report, paste it when asking for help
 pve-gateway show            # print the generated iptables-restore payload
 pve-gateway apply           # re-apply saved rules
@@ -344,6 +347,7 @@ Rules are stored here too. Restart the service after editing it by hand.
 - `listen`: set it to a LAN IP (e.g. `192.168.1.10`) to keep the UI off the public interface.
 - `group` (on each rule and domain): the group it's listed under; missing or invalid means `default`.
 - `locked` (on each rule and domain): `true` protects it against changes in the UI and API.
+- `backup_daily`: keep a daily backup in `/etc/pve-gateway/backups` (default `true`).
 
 ## Trusted HTTPS (Let's Encrypt)
 
@@ -358,6 +362,30 @@ pvenode acme plugin add dns cloudflare --api cf --data /root/cf.env && rm /root/
 pvenode config set --acmedomain0 pve.example.com,plugin=cloudflare
 pvenode acme cert order
 ```
+
+## Backup and restore
+
+**Settings → Backups** saves everything pve-gateway knows in one `.tar.gz` file:
+- the configuration: rules, domains, wildcards, health checks and alerts, firewall, fail2ban, VPN, and settings;
+- optionally the secrets kept outside it: DNS API credentials, WireGuard keys, alert tokens and the login password hash. **A file with secrets must be kept private.**
+- optionally the Let's Encrypt certificates of the domains.
+
+Copies are kept on the host in `/etc/pve-gateway/backups` (folder 0700, files 0600):
+- manual backups;
+- a **daily automatic backup** (the last 7);
+- a **safety copy taken before every restore**, so a restore can always be undone.
+
+Download a copy to keep it somewhere else. That's also how you move pve-gateway to a new host: install it there, upload the file, restore.
+
+**Restore** shows what the backup contains and lets you pick parts: port rules, domains and wildcards, checks and alerts, firewall, fail2ban, VPN, web UI access, update settings. Everything else stays as it is.
+- **Never restored:** host-specific settings (listen port, the UI's TLS certificate, file paths).
+- **Firewall:** a restored, enabled firewall must be confirmed within 60 s, like any firewall change.
+- **Lock-out guard:** web UI access settings that would lock you out are refused.
+- **On failure:** if applying fails (for example `nginx -t`), the previous config and secret files come back.
+- **Certificates:** only restored where the host has none, so existing ones are never overwritten.
+- **Backups without secrets:** the DNS credentials, WireGuard keys and password already on the host are kept.
+
+Uploads are checked strictly: only known file names, no paths outside the backup, and symlinks only between certbot's `live/` and `archive/` folders.
 
 ## Uninstall
 

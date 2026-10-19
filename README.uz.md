@@ -163,6 +163,9 @@ pve-gateway monitors        # run every health check once
 pve-gateway scan IP [PORTS] # TCP port scan from this host (common | 22,80,8000-8100)
 pve-gateway domains         # list domains, wildcard certificates and expiry
 pve-gateway cert NAME       # request / renew now: a domain, or '*.example.com' for a wildcard
+pve-gateway backup [FILE]   # backup (config + secrets; --no-secrets, --certs) to FILE or /etc/pve-gateway/backups
+pve-gateway backup list     # list local backups
+pve-gateway restore NAME|FILE all|PART...   # parts: rules domains monitoring firewall fail2ban vpn access updates
 pve-gateway debug           # full diagnostic report, paste it when asking for help
 pve-gateway show            # print the generated iptables-restore payload
 pve-gateway apply           # re-apply saved rules
@@ -358,6 +361,30 @@ pvenode acme plugin add dns cloudflare --api cf --data /root/cf.env && rm /root/
 pvenode config set --acmedomain0 pve.example.com,plugin=cloudflare
 pvenode acme cert order
 ```
+
+## Zaxira nusxa va tiklash
+
+**Sozlamalar → Zaxira nusxalar** pve-gateway biladigan hamma narsani bitta `.tar.gz` faylga saqlaydi:
+- konfiguratsiya: qoidalar, domenlar, wildcard sertifikatlar, tekshiruvlar va ogohlantirishlar, fayrvol, fail2ban, VPN va sozlamalar;
+- xohlasangiz undan tashqarida saqlanadigan maxfiy maʼlumotlar: DNS API kirish maʼlumotlari, WireGuard kalitlari, ogohlantirish tokenlari va parol xeshi. **Maxfiy maʼlumotli faylni maxfiy saqlang.**
+- xohlasangiz domenlarning Let's Encrypt sertifikatlari.
+
+Nusxalar xostda `/etc/pve-gateway/backups` da saqlanadi (papka 0700, fayllar 0600):
+- qoʻlda yaratilgan nusxalar;
+- **har kuni avtomatik nusxa** (oxirgi 7 tasi);
+- **har bir tiklashdan oldin olinadigan himoya nusxasi**, shuning uchun tiklashni har doim bekor qilish mumkin.
+
+Boshqa joyda saqlash uchun nusxani yuklab oling. pve-gateway ni yangi xostga koʻchirish ham shunday: u yerga oʻrnating, faylni yuklang va tiklang.
+
+**Tiklash** nusxa tarkibini koʻrsatadi va qismlarni tanlash imkonini beradi: port qoidalari, domenlar va wildcard sertifikatlar, tekshiruvlar va ogohlantirishlar, fayrvol, fail2ban, VPN, veb interfeysga kirish, yangilanish sozlamalari. Qolgan hammasi oʻzgarmaydi.
+- **Hech qachon tiklanmaydi:** xostga bogʻliq sozlamalar (port, interfeysning TLS sertifikati, fayl yoʻllari).
+- **Fayrvol:** tiklangan va yoqilgan fayrvolni, har qanday fayrvol oʻzgarishi kabi, 60 s ichida tasdiqlash kerak.
+- **Kirishdan mahrum boʻlishdan himoya:** kirishni yopib qoʻyadigan veb interfeys sozlamalari rad etiladi.
+- **Xato boʻlsa:** qoʻllash muvaffaqiyatsiz boʻlsa (masalan, `nginx -t`), avvalgi konfiguratsiya va maxfiy fayllar qaytariladi.
+- **Sertifikatlar:** faqat xostda yoʻq boʻlsa tiklanadi, shuning uchun mavjudlari hech qachon ustidan yozilmaydi.
+- **Maxfiy maʼlumotlarsiz nusxalar:** xostda bor DNS kirish maʼlumotlari, WireGuard kalitlari va parol saqlanadi.
+
+Yuklangan fayllar qatʼiy tekshiriladi: faqat maʼlum fayl nomlari, nusxadan tashqaridagi yoʻllar yoʻq, simvolik havolalar faqat certbot ning `live/` va `archive/` papkalari orasida.
 
 ## Oʻchirib tashlash
 
