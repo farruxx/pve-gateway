@@ -13,6 +13,7 @@ python3 pve-gateway.py --mock --config-dir "$TMP/state" apply >/dev/null 2>&1
 python3 pve-gateway.py --mock --config-dir "$TMP/state" mock traffic >/dev/null
 python3 pve-gateway.py --mock --config-dir "$TMP/state" mock traffic >/dev/null
 python3 pve-gateway.py --mock --config-dir "$TMP/state" ui-allow 203.0.113.0/24 10.10.10.0/24 >/dev/null
+python3 pve-gateway.py --mock --config-dir "$TMP/state" backup >/dev/null
 python3 pve-gateway.py --mock --config-dir "$TMP/state" --port 8101 >"$TMP/server.log" 2>&1 &
 PID=$!
 sleep 1.5

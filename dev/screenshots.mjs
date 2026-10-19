@@ -103,7 +103,8 @@ await shot("wildcard", { hash: "#domains", height: 820, setup: `
 await shot("settings", { hash: "#settings", fit: true, setup: `
   ${waitFor("document.querySelector('#myIp').textContent")}
   document.querySelector('#myIp').textContent = '203.0.113.7';
-  document.querySelector('#ownHosts').textContent = 'Always allowed: any IP address, localhost, pve, pve.example.com.';` });
+  document.querySelector('#ownHosts').textContent = 'Always allowed: any IP address, localhost, pve, pve.example.com.';
+  document.querySelector('#bkDir').textContent = '/etc/pve-gateway/backups';` });
 await shot("monitor", { hash: "#monitor", height: 760, wait: 7000, setup: `
   ${waitFor("document.querySelectorAll('#monitors tr').length > 3")}
   for (const c of document.querySelectorAll('#status .chip')) if (/available/.test(c.textContent)) c.remove();` });
