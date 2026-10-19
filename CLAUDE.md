@@ -22,7 +22,7 @@ Guidance for AI-assisted work on **pve-gateway**: a web UI that runs on a Proxmo
 | `README.md`, `wildcard.md` | User docs; keep them in sync with behavior changes |
 | `CHANGELOG.md` | Release notes, one `## X.Y.Z - date` section per version; shown in the UI's update card |
 
-`pve-gateway.py` is organised into sections marked `# ---- <name>`: config, validation, iptables, guests/interfaces, domains (nginx), diagnostics, monitoring, fail2ban, firewall, wireguard, sdn, updates, auth, HTTP, UI, main. Keep new code in the matching section.
+`pve-gateway.py` is organised into sections marked `# ---- <name>`: config, validation, iptables, guests/interfaces, domains (nginx), diagnostics, monitoring, fail2ban, firewall, wireguard, sdn, updates, auth, HTTP, i18n, UI, main. Keep new code in the matching section.
 
 ## Run and verify
 
@@ -69,6 +69,21 @@ Untested on real hardware means untested: say so rather than claiming it works o
   - The UI must work in light and dark mode and at phone width (tables scroll inside `.card.scroll`).
   - Colors are CSS variables in `:root`.
 - **Diagnostics:** new features should add health checks to `checks()`, raw output to `sections()`, and, where a user can act on it, steps to `test_rule` / `test_domain`. Each check has a status of `ok`, `warn`, `fail` or `info`, plus a detail that says how to fix it.
+
+## Translations (English, Russian, Uzbek)
+
+- English is the source language everywhere (code, messages, log, CLI). The web UI is translated in the browser: the
+  `I18N` dict (section `i18n`) maps an English text or template to `[Russian, Uzbek]` and is served as `/i18n.js`.
+  The UI translates text as it enters the page (initial HTML + a MutationObserver), so server messages need no code
+  changes: a template like `"port {0} is used by tunnel {1}"` matches the message built with `%`.
+- **When you add or change user-visible text** (HTML, JS strings, `ApiError` messages, check/test names and details),
+  add or update its `I18N` entry in both languages. `python3 dev/i18n_missing.py` lists texts without one
+  (`--unused` lists stale entries). Strings built with `+` or `%` become one template with `{0}`, `{1}`, ...
+- Keep `I18N` one entry per line: Python 3.9's tokenizer fails on very long lines with non-ASCII text.
+- Uzbek uses the Latin script with `ʻ` (U+02BB) in oʻ/gʻ and `ʼ` (U+02BC). Product names, commands, paths and anything
+  in backticks stay untranslated; plural forms are written number-neutral ("правил: {0}", "{0} ta qoida").
+- Data (rule names, domains, IPs, `<pre>`/`<code>`/`<textarea>`, elements with class `no-tr`) is never translated.
+- `README.ru.md` and `README.uz.md` mirror `README.md`; update them when the README changes.
 
 ## Versioning and updates
 
