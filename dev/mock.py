@@ -105,7 +105,8 @@ SAMPLE_RULES = [
     {"name": "game", "proto": "both", "ext_port": "27015-27020", "ip": "10.10.10.12", "group": "games"},                # guest stopped
     {"name": "nextcloud tls", "proto": "tcp", "ext_port": "8443", "ip": "10.10.10.13", "int_port": "443", "group": "web"},  # refused
     {"name": "rdp", "proto": "tcp", "ext_port": "3389", "ip": "10.10.10.14", "iface": "vmbr0"},    # no ping, tcp ok
-    {"name": "office", "proto": "tcp", "ext_port": "9443", "ip": "192.168.50.20", "int_port": "443", "masq": True},
+    {"name": "office", "proto": "tcp", "ext_port": "9443", "ip": "192.168.50.20", "int_port": "443", "masq": True,
+     "locked": True},
     {"name": "old test", "proto": "udp", "ext_port": "5000", "ip": "10.10.10.10", "enabled": False},
 ]
 
@@ -118,7 +119,7 @@ SAMPLE_DOMAINS = [
     {"domain": "broken.invalid", "ip": "10.10.10.11", "port": 8080, "tls": "letsencrypt"},  # no DNS, nothing on 8080
     {"domain": "status.example.com", "ip": "10.10.10.10", "port": 80, "tls": "wildcard", "group": "apps"},  # uses *.example.com
     {"domain": "shop.example.com", "ip": "10.10.10.10", "port": 443, "upstream_https": True, "tls": "wildcard",
-     "cloudflare": True, "headers": True, "hsts": True},       # behind the Cloudflare proxy
+     "cloudflare": True, "headers": True, "hsts": True, "locked": True},       # behind the Cloudflare proxy
 ]
 
 # wildcard certificates seeded into a fresh ./.dev config (token "bad" makes the mock DNS API reject it)
@@ -981,7 +982,10 @@ server {
         c = st["issued"].get(self._cert_name(path))
         if not c:
             return 1, "Could not open file or uri for loading certificate from %s" % path, False
-        return 0, "notAfter=" + time.strftime("%b %d %H:%M:%S %Y GMT", time.gmtime(c["expires"])), False
+        out = "notAfter=" + time.strftime("%b %d %H:%M:%S %Y GMT", time.gmtime(c["expires"]))
+        if "-ext" in a:
+            out += "\nX509v3 Subject Alternative Name: \n    " + ", ".join("DNS:" + n for n in c["names"])
+        return 0, out, False
 
     def c_certbot(self, st, a, data):
         if a == ["--version"]:

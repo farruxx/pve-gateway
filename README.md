@@ -34,6 +34,7 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 - **Host network at a glance.** The Ports and Domains tabs show the host's interfaces and IPs (public, WAN, guest bridges) with tips on where DNS and routers should point.
 - Supports TCP, UDP or both, port ranges, a source IP/CIDR allow-list, an incoming interface, optional masquerade, and shows per-rule hit counters.
 - **Groups.** Port rules and domains can be put into groups (e.g. *web*, *games*). Each group is a collapsible section with its own **+ Add**, **Rename** and **Ungroup**. Anything without a group, including everything saved by older versions, stays in **default**. While all items are in default, the tables look as before. Groups only change how items are listed; they don't affect iptables or nginx.
+- **Lock.** The 🔓 button locks a port rule or domain (🔒). A locked item can't be edited, switched off, deleted or moved to another group until you unlock it. This is enforced by the server too (HTTP 423), not just the UI. Test and Cert still work.
 - **Guard rails.** It refuses to forward 22, 8006, 3128, 111, 5405-5412 or its own port. Only traffic **addressed to the host** is forwarded (`-m addrtype --dst-type LOCAL`), so guests' outgoing traffic is never hijacked.
 - A watchdog re-hooks the chains if something flushes iptables, and rules are restored at boot.
 
@@ -339,6 +340,7 @@ Rules are stored here too. Restart the service after editing it by hand.
 - `forward_accept`: adds narrow `ACCEPT` rules in `FORWARD` for the forwarded flows. They're inserted before `PVEFW-FORWARD`, so if the Proxmox firewall is on for a guest, a forwarded port bypasses that guest's firewall. Use the rule's *Allowed source* field to restrict access.
 - `listen`: set it to a LAN IP (e.g. `192.168.1.10`) to keep the UI off the public interface.
 - `group` (on each rule and domain): the group it's listed under; missing or invalid means `default`.
+- `locked` (on each rule and domain): `true` protects it against changes in the UI and API.
 
 ## Trusted HTTPS (Let's Encrypt)
 

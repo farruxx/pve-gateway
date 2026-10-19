@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.9.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.10.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -347,6 +347,12 @@ def clean_group(v):
     return g
 
 
+def check_unlocked(item, what):
+    """Locked rules / domains can't be changed, switched or deleted until they are unlocked (POST .../lock)."""
+    if item and item.get("locked"):
+        raise ApiError("%s is locked - unlock it first" % what, 423)
+
+
 def validate_rule(data, others, cfg, rid=None):
     if not isinstance(data, dict):
         raise ApiError("rule must be an object")
@@ -358,6 +364,7 @@ def validate_rule(data, others, cfg, rid=None):
     if not NAME_RE.match(r["name"]):
         raise ApiError("name: max 40 chars, letters/digits/space/_.:/@+- only")
     r["group"] = clean_group(data.get("group"))
+    r["locked"] = bool(data.get("locked", False))
 
     r["enabled"] = bool(data.get("enabled", True))
     r["proto"] = str(data.get("proto", "tcp")).lower()
@@ -849,6 +856,7 @@ def validate_domain(data, others, cfg, did=None, check_rules=True):
     if not DOMAIN_RE.match(d["domain"]):
         raise ApiError("invalid domain name '%s' (e.g. cloud.example.com)" % d["domain"])
     d["group"] = clean_group(data.get("group"))
+    d["locked"] = bool(data.get("locked", False))
     aliases = data.get("aliases", [])
     if isinstance(aliases, str):
         aliases = re.split(r"[\s,]+", aliases)
@@ -1047,13 +1055,15 @@ def cert_paths(cfg, name):
 
 
 def cert_info(cfg, name, fresh=False):
-    """{"exists": bool, "expires": ts, "days": int} for a certbot certificate by name (cached 60s)."""
+    """{"exists": bool, "expires": ts, "days": int, "names": [...]} for a certbot certificate by name (cached 60s)."""
     if not name:
         return {"exists": False}
     hit = CERT_CACHE.get(name)
     if hit and not fresh and time.time() - hit[0] < 60:
         return hit[1]
-    rc, out = sh(["openssl", "x509", "-noout", "-enddate", "-in", cert_paths(cfg, name)[0]])
+    rc, out = sh(["openssl", "x509", "-noout", "-enddate", "-ext", "subjectAltName", "-in", cert_paths(cfg, name)[0]])
+    if rc != 0 and "-ext" in out:  # OpenSSL older than 1.1.1: no -ext, so no names
+        rc, out = sh(["openssl", "x509", "-noout", "-enddate", "-in", cert_paths(cfg, name)[0]])
     info = {"exists": False}
     m = re.search(r"notAfter=(.+)", out or "") if rc == 0 else None
     if m:
@@ -1062,6 +1072,7 @@ def cert_info(cfg, name, fresh=False):
             info = {"exists": True, "expires": exp, "days": int((exp - time.time()) // 86400)}
         except ValueError:
             info = {"exists": True}
+        info["names"] = [n.lower() for n in re.findall(r"DNS:([^,\s]+)", out)]
     CERT_CACHE[name] = (time.time(), info)
     return info
 
@@ -1307,6 +1318,25 @@ def run_certbot(key, cert_name, names, auth, plugin=None, package=None, prefligh
         log("certbot: %s - %s" % (cert_name, CERT_JOBS[key]["msg"]))
 
     threading.Thread(target=job, daemon=True).start()
+
+
+def cert_needed(cfg, d, old=None):
+    """Should saving domain d (previously old) request a certificate? Only when something the certificate depends
+    on changed (new domain, names, HTTPS type, switched on) and the current one doesn't already cover it - so editing
+    the upstream port, the group etc. never re-runs certbot, and a failed request isn't retried on every edit
+    (that would use up Let's Encrypt's limit of 5 failures per hour; the Cert button retries on purpose)."""
+    if not d["enabled"] or d["tls"] == "none":
+        return False
+    if old and old["enabled"] and old["tls"] == d["tls"] and _names(old) == _names(d):
+        return False
+    if d["tls"] == "wildcard":
+        w = wildcard_for(cfg, d)
+        return bool(w) and not cert_info(cfg, wc_cert_name(w))["exists"]
+    ci = cert_info(cfg, domain_cert(cfg, d)[0] or d["domain"], fresh=True)
+    if not ci["exists"] or ci.get("days", 99) < 30:
+        return True
+    have = ci.get("names")
+    return have is not None and not set(n.lower() for n in _names(d)) <= set(have)
 
 
 def issue_cert(did, force=False):
@@ -4247,6 +4277,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError("rule not found", 404)
             return self.send(200, {"steps": test_rule(rule)})
 
+        m = re.match(r"^/api/(rules|domains)/([0-9a-f]{1,16})/lock$", path)
+        if m and method == "POST":
+            return self.lock_api(m.group(1), m.group(2), self.body(), user)
         m = re.match(r"^/api/rules(?:/([0-9a-f]{1,16}))?$", path)
         if not m:
             raise ApiError("not found", 404)
@@ -4256,11 +4289,13 @@ class Handler(BaseHTTPRequestHandler):
             idx = next((i for i, r in enumerate(rules) if r["id"] == rid), None) if rid else None
             if rid and idx is None:
                 raise ApiError("rule not found", 404)
+            if rid:
+                check_unlocked(rules[idx], "rule %s" % (rules[idx]["name"] or rules[idx]["ext_port"]))
             if method == "POST" and not rid:
-                rule = validate_rule(self.body(), rules, cfg)
+                rule = dict(validate_rule(self.body(), rules, cfg), locked=False)  # locking is its own action
                 rules.append(rule)
             elif method == "PUT" and rid:
-                rule = validate_rule(self.body(), [r for r in rules if r["id"] != rid], cfg, rid)
+                rule = dict(validate_rule(self.body(), [r for r in rules if r["id"] != rid], cfg, rid), locked=False)
                 rules[idx] = rule
             elif method == "DELETE" and rid:
                 rules.pop(idx)
@@ -4277,6 +4312,22 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(200, {"ok": True, "rules": new["rules"]})
 
 
+    def lock_api(self, kind, oid, body, user):
+        """Lock / unlock one rule or domain. Only the flag changes, so nothing is re-applied."""
+        with LOCK:
+            cfg = STATE["cfg"]
+            items = [dict(x) for x in cfg[kind]]
+            item = next((x for x in items if x["id"] == oid), None)
+            if not item:
+                raise ApiError("%s not found" % kind[:-1], 404)
+            item["locked"] = bool(body.get("locked"))
+            new = dict(cfg, **{kind: items})
+            save_config(new)
+            STATE["cfg"] = new
+        log("%s %s %s %s" % (user, "locked" if item["locked"] else "unlocked", kind[:-1],
+                             item.get("domain") or item.get("name") or item.get("ext_port")))
+        return self.send(200, {"ok": True, "locked": item["locked"]})
+
     def groups_api(self, body, user):
         """Rename a group of rules or domains; renaming to "default" (or empty) ungroups them. Display only:
         nothing is re-applied."""
@@ -4290,6 +4341,9 @@ class Handler(BaseHTTPRequestHandler):
             hit = [x for x in items if x.get("group", DEFAULT_GROUP) == old]
             if not hit:
                 raise ApiError("group %s not found" % old, 404)
+            locked = [x.get("name") or x.get("domain") or x.get("ext_port") or x["id"] for x in hit if x.get("locked")]
+            if locked:
+                raise ApiError("locked: %s - unlock them first" % ", ".join(locked[:5]), 423)
             for x in hit:
                 x["group"] = new_name
             new = dict(cfg, **{kind: items})
@@ -4304,10 +4358,12 @@ class Handler(BaseHTTPRequestHandler):
             idx = next((i for i, d in enumerate(domains) if d["id"] == did), None) if did else None
             if did and idx is None:
                 raise ApiError("domain not found", 404)
+            old = domains[idx] if idx is not None else None
+            check_unlocked(old, "domain %s" % (old or {}).get("domain"))
             dom, body = None, {}
             if method in ("POST", "PUT") and (method == "POST") == (not did):
                 body = self.body()
-                dom = validate_domain(body, [d for d in domains if d["id"] != did], cfg, did)
+                dom = dict(validate_domain(body, [d for d in domains if d["id"] != did], cfg, did), locked=False)
                 if idx is None:
                     domains.append(dom)
                 else:
@@ -4333,9 +4389,10 @@ class Handler(BaseHTTPRequestHandler):
             save_config(new)
             STATE["cfg"] = new
             log("%s %s domain %s" % (user, method, dom["domain"] if dom else did))
-        if dom and dom["tls"] != "none" and dom["enabled"]:
-            issue_cert(dom["id"])  # no-op for certbot if the cert already covers these names
-        return self.send(200, {"ok": True})
+        want = bool(dom) and cert_needed(new, dom, old)
+        if want:
+            issue_cert(dom["id"])
+        return self.send(200, {"ok": True, "cert": want})
 
     def wireguard_api(self, method, path, tid, pid, config, user):
         cfg = STATE["cfg"]
@@ -5175,6 +5232,7 @@ button.link:disabled{color:var(--muted)}
 tr.group-row td{background:var(--bg);padding:5px 12px}.grp-head{display:flex;align-items:center;gap:8px;position:sticky;left:12px;width:max-content}.grp-head .link{font-size:12px;padding:1px 6px}
 tr.group-row:not(:first-child) td{border-top:1px solid var(--line)}
 button.grp-toggle{background:none;border:none;color:var(--fg);padding:2px 0;font-weight:700}
+.lock-mark{font-size:12px}button.lock-btn{filter:grayscale(1);opacity:.55;padding:3px 5px}button.lock-btn.on,button.lock-btn:hover{filter:none;opacity:1}
 button.danger{background:var(--bad);border-color:var(--bad);color:var(--accent-fg)}
 dialog.ask{max-width:440px}dialog.ask h2{font-size:16px;margin:0 0 8px}dialog.ask p{margin:0 0 4px;white-space:pre-wrap}
 table{width:100%;border-collapse:collapse;white-space:nowrap}
@@ -5430,9 +5488,9 @@ function fillGroups(list, items) { $(list).replaceChildren(...groupNames(items).
 function ruleRow(r) {
     const c = S.counters[r.id];
     return el('tr', {class: r.enabled ? '' : 'off'},
-      el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: r.enabled, title: r.enabled ? 'Disable' : 'Enable',
+      el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: r.enabled, disabled: r.locked, title: r.locked ? 'locked - unlock to change' : r.enabled ? 'Disable' : 'Enable',
         onchange: async e => { if (await askToggle(e, 'rule "' + (r.name || r.ext_port) + '"')) save(r.id, Object.assign({}, r, {enabled: e.target.checked})).catch(() => {}); }})),
-      el('td', {textContent: r.name || '—'}),
+      el('td', {}, r.name || '—', r.locked ? el('span', {class: 'lock-mark', textContent: ' 🔒', title: 'locked'}) : null),
       el('td', {}, el('span', {class: 'tag', textContent: r.proto === 'both' ? 'tcp+udp' : r.proto})),
       el('td', {class: 'mono', textContent: r.ext_port}),
       el('td', {class: 'arrow', textContent: '→'}),
@@ -5442,8 +5500,22 @@ function ruleRow(r) {
       el('td', {class: 'num', textContent: c ? c[0] + ' · ' + fmtBytes(c[1]) : '—', title: 'new connections · bytes'}),
       el('td', {class: 'num'},
         el('button', {class: 'link', textContent: 'Test', onclick: () => runTest(r)}),
-        el('button', {class: 'link', textContent: 'Edit', onclick: () => openDlg(r)}),
-        el('button', {class: 'link del', textContent: 'Delete', onclick: () => del(r)})));
+        lockBtn('rules', r, 'rule "' + (r.name || r.ext_port) + '"'),
+        el('button', {class: 'link', textContent: 'Edit', disabled: r.locked, title: r.locked ? 'locked - unlock to change' : '', onclick: () => openDlg(r)}),
+        el('button', {class: 'link del', textContent: 'Delete', disabled: r.locked, title: r.locked ? 'locked - unlock to change' : '', onclick: () => del(r)})));
+}
+
+// ---- lock: a locked rule / domain can't be edited, switched or deleted until it is unlocked (checked on the server too)
+function lockBtn(kind, x, what) {
+  return el('button', {class: 'link lock-btn' + (x.locked ? ' on' : ''), textContent: x.locked ? '🔒' : '🔓',
+    'aria-label': x.locked ? 'Unlock' : 'Lock',
+    title: x.locked ? 'Locked - click to unlock' : 'Lock: protect against edits, switching off and deleting', onclick: async () => {
+      if (!await ask((x.locked ? 'Unlock ' : 'Lock ') + what + '?', x.locked ? 'It can be edited, switched off and deleted again.' :
+        'It can no longer be edited, switched off, deleted or moved to another group until you unlock it.', x.locked ? 'Unlock' : 'Lock', x.locked)) return;
+      const f = kind === 'rules' ? flash : domFlash;
+      try { await api('POST', '/api/' + kind + '/' + x.id + '/lock', {locked: !x.locked}); f(x.locked ? 'Unlocked' : 'Locked'); } catch (e) { f(e.message, true); }
+      load().catch(() => {});
+    }});
 }
 
 async function save(id, data) {
@@ -5620,9 +5692,10 @@ function renderDomains() {
 
 function domainRow(d) {
     return el('tr', {class: d.enabled ? '' : 'off'},
-      el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: d.enabled, title: d.enabled ? 'Disable' : 'Enable',
+      el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: d.enabled, disabled: d.locked, title: d.locked ? 'locked - unlock to change' : d.enabled ? 'Disable' : 'Enable',
         onchange: async e => { if (await askToggle(e, 'domain ' + d.domain)) saveDomain(d.id, Object.assign({}, d, {enabled: e.target.checked})); }})),
       el('td', {class: 'names'}, el('a', {href: (d.tls !== 'none' ? 'https://' : 'http://') + d.domain, target: '_blank', rel: 'noopener', textContent: d.domain}),
+        d.locked ? el('span', {class: 'lock-mark', textContent: ' 🔒', title: 'locked'}) : null,
         ...d.aliases.map(a => el('span', {class: 'alias', textContent: d.alias_redirect ? '↳ ' + a + ' → 301' : a})),
         (d.cloudflare || d.hsts) ? el('span', {class: 'alias'},
           d.cloudflare ? el('span', {class: 'tag', textContent: 'cloudflare'}) : null, ' ',
@@ -5634,8 +5707,9 @@ function domainRow(d) {
       el('td', {class: 'num'},
         el('button', {class: 'link', textContent: 'Test', onclick: () => runTestUrl('Test: ' + d.domain + ' → ' + d.ip + ':' + d.port, '/api/domains/' + d.id + '/test')}),
         d.tls !== 'none' ? el('button', {class: 'link', textContent: 'Cert', title: 'Request / renew certificate now', onclick: () => cert(d)}) : null,
-        el('button', {class: 'link', textContent: 'Edit', onclick: () => openDomDlg(d)}),
-        el('button', {class: 'link del', textContent: 'Delete', onclick: () => delDomain(d)})));
+        lockBtn('domains', d, 'domain ' + d.domain),
+        el('button', {class: 'link', textContent: 'Edit', disabled: d.locked, title: d.locked ? 'locked - unlock to change' : '', onclick: () => openDomDlg(d)}),
+        el('button', {class: 'link del', textContent: 'Delete', disabled: d.locked, title: d.locked ? 'locked - unlock to change' : '', onclick: () => delDomain(d)})));
 }
 
 function domFlash(t, isErr) {
@@ -5708,12 +5782,12 @@ $('#domForm').addEventListener('submit', async e => {
   d.upstream_https = f.upstream_https.checked; d.force_https = f.force_https.checked; d.enabled = f.enabled.checked;
   for (const k of ['alias_redirect', 'hsts', 'headers', 'cloudflare']) d[k] = f[k].checked;
   if (!await ask((editingDom ? 'Save changes to ' : 'Add domain ') + d.domain + '?', d.domain + ' → ' + (d.upstream_https ? 'https://' : 'http://') +
-    d.ip + ':' + d.port + '. nginx is reloaded' + (d.tls === 'letsencrypt' && d.enabled && !editingDom ? ' and a certificate is requested.' : '.'), editingDom ? 'Save' : 'Add')) return;
+    d.ip + ':' + d.port + '. nginx is reloaded' + (d.tls === 'letsencrypt' && d.enabled && !editingDom ? ' and a certificate is requested if needed.' : '.'), editingDom ? 'Save' : 'Add')) return;
   const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
   try {
-    await api(editingDom ? 'PUT' : 'POST', editingDom ? '/api/domains/' + editingDom : '/api/domains', d);
+    const r = await api(editingDom ? 'PUT' : 'POST', editingDom ? '/api/domains/' + editingDom : '/api/domains', d);
     $('#domDlg').close();
-    domFlash(d.tls === 'letsencrypt' && d.enabled ? 'Saved - requesting certificate in the background…' : 'Saved, nginx reloaded');
+    domFlash(r.cert ? 'Saved - requesting certificate in the background…' : 'Saved, nginx reloaded');
     load().catch(() => {});
   } catch (err) { $('#domErr').textContent = err.message; }
   btn.disabled = false;
