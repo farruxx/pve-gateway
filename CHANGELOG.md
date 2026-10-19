@@ -4,6 +4,14 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.11.0 - 2026-10-19
+- The web UI speaks Russian and Uzbek (Latin) besides English: it follows the browser's language, and Settings → Language
+  (or the menu on the login page) switches it (remembered per browser). Server messages - errors, health checks, test
+  steps, hints - are translated too, through one catalog of ~1300 texts and templates. Missing translations fall
+  back to English; data (names, domains, IPs, logs) is never translated. The CLI and the log stay English.
+- README in Russian (README.ru.md) and Uzbek (README.uz.md).
+- A port-test detail now reads "DNAT entries in PVEGW_PRE: N" (was "N DNAT entries in ...").
+
 ## 1.10.0 - 2026-10-19
 - Lock / unlock port rules and domains (🔓 / 🔒 button in the row, with confirmation). A locked item can't be
   edited, switched on/off, deleted or moved by a group rename until it is unlocked - enforced by the server (HTTP 423),

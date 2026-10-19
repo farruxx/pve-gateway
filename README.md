@@ -2,6 +2,8 @@
 
 # pve-gateway
 
+**English** · [Русский](README.ru.md) · [Oʻzbekcha](README.uz.md)
+
 A small web UI that turns a Proxmox VE host into the gateway for its VMs and containers:
 
 - **Ports:** forward host ports to guests (iptables DNAT).
@@ -35,6 +37,7 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 - Supports TCP, UDP or both, port ranges, a source IP/CIDR allow-list, an incoming interface, optional masquerade, and shows per-rule hit counters.
 - **Groups.** Port rules and domains can be put into groups (e.g. *web*, *games*). Each group is a collapsible section with its own **+ Add**, **Rename** and **Ungroup**. Anything without a group, including everything saved by older versions, stays in **default**. While all items are in default, the tables look as before. Groups only change how items are listed; they don't affect iptables or nginx.
 - **Lock.** The 🔓 button locks a port rule or domain (🔒). A locked item can't be edited, switched off, deleted or moved to another group until you unlock it. This is enforced by the server too (HTTP 423), not just the UI. Test and Cert still work.
+- **Languages.** The web UI is available in English, Russian and Uzbek (Latin). It follows the browser's language, and you can switch it in **Settings → Language** or on the login page. Server messages, checks and errors are translated too; the CLI and the log stay in English.
 - **Guard rails.** It refuses to forward 22, 8006, 3128, 111, 5405-5412 or its own port. Only traffic **addressed to the host** is forwarded (`-m addrtype --dst-type LOCAL`), so guests' outgoing traffic is never hijacked.
 - A watchdog re-hooks the chains if something flushes iptables, and rules are restored at boot.
 
