@@ -44,7 +44,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.9.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.9.1"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -1047,13 +1047,15 @@ def cert_paths(cfg, name):
 
 
 def cert_info(cfg, name, fresh=False):
-    """{"exists": bool, "expires": ts, "days": int} for a certbot certificate by name (cached 60s)."""
+    """{"exists": bool, "expires": ts, "days": int, "names": [...]} for a certbot certificate by name (cached 60s)."""
     if not name:
         return {"exists": False}
     hit = CERT_CACHE.get(name)
     if hit and not fresh and time.time() - hit[0] < 60:
         return hit[1]
-    rc, out = sh(["openssl", "x509", "-noout", "-enddate", "-in", cert_paths(cfg, name)[0]])
+    rc, out = sh(["openssl", "x509", "-noout", "-enddate", "-ext", "subjectAltName", "-in", cert_paths(cfg, name)[0]])
+    if rc != 0 and "-ext" in out:  # OpenSSL older than 1.1.1: no -ext, so no names
+        rc, out = sh(["openssl", "x509", "-noout", "-enddate", "-in", cert_paths(cfg, name)[0]])
     info = {"exists": False}
     m = re.search(r"notAfter=(.+)", out or "") if rc == 0 else None
     if m:
@@ -1062,6 +1064,7 @@ def cert_info(cfg, name, fresh=False):
             info = {"exists": True, "expires": exp, "days": int((exp - time.time()) // 86400)}
         except ValueError:
             info = {"exists": True}
+        info["names"] = [n.lower() for n in re.findall(r"DNS:([^,\s]+)", out)]
     CERT_CACHE[name] = (time.time(), info)
     return info
 
@@ -1307,6 +1310,25 @@ def run_certbot(key, cert_name, names, auth, plugin=None, package=None, prefligh
         log("certbot: %s - %s" % (cert_name, CERT_JOBS[key]["msg"]))
 
     threading.Thread(target=job, daemon=True).start()
+
+
+def cert_needed(cfg, d, old=None):
+    """Should saving domain d (previously old) request a certificate? Only when something the certificate depends
+    on changed (new domain, names, HTTPS type, switched on) and the current one doesn't already cover it - so editing
+    the upstream port, the group etc. never re-runs certbot, and a failed request isn't retried on every edit
+    (that would use up Let's Encrypt's limit of 5 failures per hour; the Cert button retries on purpose)."""
+    if not d["enabled"] or d["tls"] == "none":
+        return False
+    if old and old["enabled"] and old["tls"] == d["tls"] and _names(old) == _names(d):
+        return False
+    if d["tls"] == "wildcard":
+        w = wildcard_for(cfg, d)
+        return bool(w) and not cert_info(cfg, wc_cert_name(w))["exists"]
+    ci = cert_info(cfg, domain_cert(cfg, d)[0] or d["domain"], fresh=True)
+    if not ci["exists"] or ci.get("days", 99) < 30:
+        return True
+    have = ci.get("names")
+    return have is not None and not set(n.lower() for n in _names(d)) <= set(have)
 
 
 def issue_cert(did, force=False):
@@ -4304,6 +4326,7 @@ class Handler(BaseHTTPRequestHandler):
             idx = next((i for i, d in enumerate(domains) if d["id"] == did), None) if did else None
             if did and idx is None:
                 raise ApiError("domain not found", 404)
+            old = domains[idx] if idx is not None else None
             dom, body = None, {}
             if method in ("POST", "PUT") and (method == "POST") == (not did):
                 body = self.body()
@@ -4333,9 +4356,10 @@ class Handler(BaseHTTPRequestHandler):
             save_config(new)
             STATE["cfg"] = new
             log("%s %s domain %s" % (user, method, dom["domain"] if dom else did))
-        if dom and dom["tls"] != "none" and dom["enabled"]:
-            issue_cert(dom["id"])  # no-op for certbot if the cert already covers these names
-        return self.send(200, {"ok": True})
+        want = bool(dom) and cert_needed(new, dom, old)
+        if want:
+            issue_cert(dom["id"])
+        return self.send(200, {"ok": True, "cert": want})
 
     def wireguard_api(self, method, path, tid, pid, config, user):
         cfg = STATE["cfg"]
@@ -5708,12 +5732,12 @@ $('#domForm').addEventListener('submit', async e => {
   d.upstream_https = f.upstream_https.checked; d.force_https = f.force_https.checked; d.enabled = f.enabled.checked;
   for (const k of ['alias_redirect', 'hsts', 'headers', 'cloudflare']) d[k] = f[k].checked;
   if (!await ask((editingDom ? 'Save changes to ' : 'Add domain ') + d.domain + '?', d.domain + ' → ' + (d.upstream_https ? 'https://' : 'http://') +
-    d.ip + ':' + d.port + '. nginx is reloaded' + (d.tls === 'letsencrypt' && d.enabled && !editingDom ? ' and a certificate is requested.' : '.'), editingDom ? 'Save' : 'Add')) return;
+    d.ip + ':' + d.port + '. nginx is reloaded' + (d.tls === 'letsencrypt' && d.enabled && !editingDom ? ' and a certificate is requested if needed.' : '.'), editingDom ? 'Save' : 'Add')) return;
   const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
   try {
-    await api(editingDom ? 'PUT' : 'POST', editingDom ? '/api/domains/' + editingDom : '/api/domains', d);
+    const r = await api(editingDom ? 'PUT' : 'POST', editingDom ? '/api/domains/' + editingDom : '/api/domains', d);
     $('#domDlg').close();
-    domFlash(d.tls === 'letsencrypt' && d.enabled ? 'Saved - requesting certificate in the background…' : 'Saved, nginx reloaded');
+    domFlash(r.cert ? 'Saved - requesting certificate in the background…' : 'Saved, nginx reloaded');
     load().catch(() => {});
   } catch (err) { $('#domErr').textContent = err.message; }
   btn.disabled = false;

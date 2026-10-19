@@ -981,7 +981,10 @@ server {
         c = st["issued"].get(self._cert_name(path))
         if not c:
             return 1, "Could not open file or uri for loading certificate from %s" % path, False
-        return 0, "notAfter=" + time.strftime("%b %d %H:%M:%S %Y GMT", time.gmtime(c["expires"])), False
+        out = "notAfter=" + time.strftime("%b %d %H:%M:%S %Y GMT", time.gmtime(c["expires"]))
+        if "-ext" in a:
+            out += "\nX509v3 Subject Alternative Name: \n    " + ", ".join("DNS:" + n for n in c["names"])
+        return 0, out, False
 
     def c_certbot(self, st, a, data):
         if a == ["--version"]:
