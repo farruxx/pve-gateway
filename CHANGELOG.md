@@ -4,6 +4,11 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.10.0 - 2026-10-19
+- Lock / unlock port rules and domains (🔓 / 🔒 button in the row, with confirmation). A locked item can't be
+  edited, switched on/off, deleted or moved by a group rename until it is unlocked - enforced by the server (HTTP 423),
+  not only hidden in the UI. Test and Cert still work. Locked items show 🔒 next to their name.
+
 ## 1.9.1 - 2026-10-19
 - Fix: editing a domain (upstream port, group, the on/off switch, ...) no longer starts a certificate request every
   time. A certificate is requested only for a new domain, changed names/aliases, a changed HTTPS type or a domain
