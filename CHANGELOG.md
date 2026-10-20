@@ -4,6 +4,11 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.12.1 - 2026-10-20
+- Locked domains: the Cert button is disabled and manual certificate requests (UI, API, CLI `cert`) are refused until
+  the domain is unlocked. Automatic renewals by certbot's timer keep running, and a failed request never replaces
+  a working certificate.
+
 ## 1.12.0 - 2026-10-19
 - Backup and restore (Settings > Backups, CLI `backup` / `restore`). A backup is one .tar.gz with the configuration
   and, optionally, the secrets kept outside it (DNS API credentials, WireGuard keys, alert tokens, login hash) and the

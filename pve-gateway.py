@@ -46,7 +46,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.12.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.12.1"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -4658,6 +4658,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError("domain not found", 404)
             if m.group(2) == "test":
                 return self.send(200, {"steps": test_domain(dom)})
+            check_unlocked(dom, "domain %s" % dom["domain"])  # automatic renewals (certbot timer) still run
             name, key = domain_cert(cfg, dom)
             if not name or not dom["enabled"]:
                 raise ApiError("domain is disabled, HTTP only, or no wildcard covers it")
@@ -6099,6 +6100,7 @@ I18N = {
     "loaded in iptables": ["загружено в iptables", "iptables ga yuklangan"],
     "locked": ["закреплено", "qulflangan"],
     "locked - unlock to change": ["закреплено - открепите, чтобы изменить", "qulflangan - oʻzgartirish uchun qulfdan chiqaring"],
+    "locked - unlock to request a certificate (automatic renewals still run)": ["закреплено - открепите, чтобы запросить сертификат (автоматическое продление продолжает работать)", "qulflangan - sertifikat soʻrash uchun qulfdan chiqaring (avtomatik yangilash ishlayveradi)"],
     "locked: {0} - unlock them first": ["закреплены: {0} - сначала открепите их", "qulflangan: {0} - avval ularni qulfdan chiqaring"],
     "log every iptables command and HTTP request": ["записывать в журнал каждую команду iptables и HTTP-запрос", "har bir iptables buyrugʻi va HTTP soʻrovini jurnalga yozish"],
     "log iptables changes instead of running them": ["записывать изменения iptables в журнал вместо выполнения", "iptables oʻzgarishlarini bajarish oʻrniga jurnalga yozish"],
@@ -7684,7 +7686,8 @@ function domainRow(d) {
       el('td', {class: 'mono', textContent: d.source.length ? d.source.join(', ') : 'anyone'}),
       el('td', {class: 'num'},
         el('button', {class: 'link', textContent: 'Test', onclick: () => runTestUrl('Test: ' + d.domain + ' → ' + d.ip + ':' + d.port, '/api/domains/' + d.id + '/test')}),
-        d.tls !== 'none' ? el('button', {class: 'link', textContent: 'Cert', title: 'Request / renew certificate now', onclick: () => cert(d)}) : null,
+        d.tls !== 'none' ? el('button', {class: 'link', textContent: 'Cert', disabled: d.locked,
+          title: d.locked ? 'locked - unlock to request a certificate (automatic renewals still run)' : 'Request / renew certificate now', onclick: () => cert(d)}) : null,
         lockBtn('domains', d, 'domain ' + d.domain),
         el('button', {class: 'link', textContent: 'Edit', disabled: d.locked, title: d.locked ? 'locked - unlock to change' : '', onclick: () => openDomDlg(d)}),
         el('button', {class: 'link del', textContent: 'Delete', disabled: d.locked, title: d.locked ? 'locked - unlock to change' : '', onclick: () => delDomain(d)})));
@@ -8878,6 +8881,8 @@ local development (macOS etc.):
             key = w["id"]
             issue_wildcard(key)
         elif d:
+            if d.get("locked"):
+                sys.exit("domain %s is locked - unlock it first (automatic renewals still run)" % d["domain"])
             key = domain_cert(cfg, d)[1] or d["id"]
             issue_cert(d["id"], force=True)
         else:
