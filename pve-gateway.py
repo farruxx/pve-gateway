@@ -46,7 +46,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.12.1"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.13.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -857,6 +857,40 @@ def _names(d):
     return [d["domain"]] + d["aliases"]
 
 
+HEADER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,39}$")
+RESERVED_HEADERS = {"host", "connection", "upgrade", "content-length", "transfer-encoding", "x-real-ip",
+                    "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"}
+
+
+def validate_client_ip(d, data):
+    """How the visitor's IP reaches the guest: headers nginx sends, and proxies in front that nginx trusts."""
+    d["ip_real"] = bool(data.get("ip_real", True))                     # X-Real-IP
+    d["ip_xff"] = str(data.get("ip_xff", "append") or "append")       # X-Forwarded-For
+    if d["ip_xff"] not in ("append", "replace", "off"):
+        raise ApiError("X-Forwarded-For must be append, replace or off")
+    d["ip_header"] = str(data.get("ip_header", "") or "").strip()     # extra header, e.g. True-Client-IP
+    if d["ip_header"] and (not HEADER_RE.match(d["ip_header"]) or d["ip_header"].lower() in RESERVED_HEADERS):
+        raise ApiError("extra client IP header: a header name like True-Client-IP or CF-Connecting-IP "
+                       "(not Host, X-Real-IP, X-Forwarded-For ...)")
+    proxies = data.get("trusted_proxies", [])
+    d["trusted_proxies"] = []
+    for c in re.split(r"[\s,]+", proxies) if isinstance(proxies, str) else proxies:
+        c = str(c).strip()
+        if c:
+            try:
+                d["trusted_proxies"].append(str(ipaddress.ip_network(c, strict=False)))
+            except ValueError:
+                raise ApiError("invalid trusted proxy '%s' (IP or CIDR)" % c)
+    if any(ipaddress.ip_network(c).prefixlen == 0 for c in d["trusted_proxies"]):
+        raise ApiError("trusting every address would let anyone fake their IP - list only your proxies' IPs")
+    d["trusted_header"] = str(data.get("trusted_header", "") or "").strip() or "X-Forwarded-For"
+    if not HEADER_RE.match(d["trusted_header"]):
+        raise ApiError("header of the trusted proxies: a header name like X-Forwarded-For or X-Real-IP")
+    if d["trusted_proxies"] and d.get("cloudflare") and d["trusted_header"].lower() != "cf-connecting-ip":
+        raise ApiError("with 'Behind Cloudflare' the client IP comes from CF-Connecting-IP - set the trusted proxies' "
+                       "header to CF-Connecting-IP, or turn one of them off")
+
+
 def validate_domain(data, others, cfg, did=None, check_rules=True):
     if not isinstance(data, dict):
         raise ApiError("domain must be an object")
@@ -918,6 +952,7 @@ def validate_domain(data, others, cfg, did=None, check_rules=True):
             except ValueError:
                 raise ApiError("invalid source '%s' (IP or CIDR)" % c)
     d["enabled"] = bool(data.get("enabled", True))
+    validate_client_ip(d, data)
 
     taken = {n: o for o in others for n in _names(o)}
     for n in _names(d):
@@ -1107,6 +1142,28 @@ def is_cloudflare(ip):
     return any(a in ipaddress.ip_network(n) for n in CLOUDFLARE_NETS)
 
 
+def client_ip_headers(d):
+    """$remote_addr is the visitor (after real_ip, when proxies in front are trusted)."""
+    out = ["        proxy_set_header X-Real-IP $remote_addr;"] if d.get("ip_real", True) else \
+        ["        proxy_set_header X-Real-IP \"\";"]  # don't pass on a value the client sent
+    xff = d.get("ip_xff", "append")
+    out.append("        proxy_set_header X-Forwarded-For %s;" % {"append": "$proxy_add_x_forwarded_for",
+                                                                 "replace": "$remote_addr", "off": '""'}[xff])
+    if d.get("ip_header"):
+        out.append("        proxy_set_header %s $remote_addr;" % d["ip_header"])
+    return out
+
+
+def nginx_real_ip(d):
+    """real_ip lines for a server block: Cloudflare and / or the domain's trusted proxies."""
+    nets = (CLOUDFLARE_NETS if d.get("cloudflare") else []) + d.get("trusted_proxies", [])
+    if not nets:
+        return []
+    header = "CF-Connecting-IP" if d.get("cloudflare") else d.get("trusted_header") or "X-Forwarded-For"
+    return ["    set_real_ip_from %s;" % n for n in nets] + ["    real_ip_header %s;" % header] + \
+        (["    real_ip_recursive on;"] if d.get("trusted_proxies") else [])
+
+
 def nginx_proxy_block(d, tls=False):
     up = "%s://%s:%d" % ("https" if d["upstream_https"] else "http", d["ip"], d["port"])
     lines = ["    client_max_body_size %s;" % d["max_body"], "", "    location / {"]
@@ -1115,8 +1172,7 @@ def nginx_proxy_block(d, tls=False):
         "        proxy_pass %s;" % up,
         "        proxy_http_version 1.1;",
         "        proxy_set_header Host $host;",
-        "        proxy_set_header X-Real-IP $remote_addr;",
-        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+    ] + client_ip_headers(d) + [
         "        proxy_set_header X-Forwarded-Proto $scheme;",
         "        proxy_set_header X-Forwarded-Host $host;",
         "        proxy_set_header Upgrade $http_upgrade;",
@@ -1158,8 +1214,7 @@ def build_nginx(cfg):
         crt, key = cert_paths(cfg, cname) if tls else (None, None)
         ssl = ["    ssl_certificate %s;" % crt, "    ssl_certificate_key %s;" % key, "    ssl_protocols TLSv1.2 TLSv1.3;",
                "    ssl_session_cache shared:pvegw_ssl:10m;", "    ssl_session_timeout 1d;"] if tls else []
-        realip = (["    set_real_ip_from %s;" % n for n in CLOUDFLARE_NETS] +
-                  ["    real_ip_header CF-Connecting-IP;"]) if d.get("cloudflare") else []
+        realip = nginx_real_ip(d)
         redirect_aliases = d.get("alias_redirect") and d["aliases"]
         names = d["domain"] if redirect_aliases else " ".join(_names(d))
         out += ["", "# %s -> %s:%d  (id %s)" % (d["domain"], d["ip"], d["port"], d["id"]),
@@ -1784,6 +1839,14 @@ def test_domain(d):
     except OSError:
         present = False
     add("in nginx config", _st(present or not d["enabled"]), cfg["nginx_conf"])
+    sent = [h for h, on in (("X-Real-IP", d.get("ip_real", True)), ("X-Forwarded-For", d.get("ip_xff", "append") != "off"),
+                            (d.get("ip_header"), bool(d.get("ip_header")))) if on]
+    detail = ("sent to the guest as %s" % ", ".join(sent)) if sent else "not sent to the guest"
+    if d.get("ip_xff") == "replace":
+        detail += " (X-Forwarded-For holds only the client IP)"
+    if d.get("trusted_proxies"):
+        detail += "; taken from %s when the request comes from %s" % (d["trusted_header"], ", ".join(d["trusted_proxies"]))
+    add("client IP", "info", detail)
     if d["enabled"] and out.strip() == "active":
         problems = acme_preflight(cfg, _names(d))
         add("reachable like Let's Encrypt", _st(not problems), "; ".join(problems) + other_sites_hint(cfg, _names(d)) if problems else
@@ -6564,6 +6627,33 @@ I18N = {
     "— pick a guest to fill its IP —": ["— выберите гостя, чтобы подставить его IP —", "— IP manzilini toʻldirish uchun mehmonni tanlang —"],
     "▸ default": ["▸ по умолчанию", "▸ standart"],
     "▾ default": ["▾ по умолчанию", "▾ standart"],
+    "Client IP": ["IP клиента", "Mijoz IP manzili"],
+    "- how the guest learns the visitor's IP address.": ["- как гостевая система узнаёт IP-адрес посетителя.", "- mehmon tizim tashrifchining IP manzilini qanday bilishi."],
+    "append the client IP (standard)": ["добавить IP клиента (стандартно)", "mijoz IP manzilini qoʻshish (standart)"],
+    "only the client IP (can't be faked)": ["только IP клиента (нельзя подделать)", "faqat mijoz IP manzili (soxtalashtirib boʻlmaydi)"],
+    "don't send": ["не отправлять", "yubormaslik"],
+    "Send X-Real-IP": ["Отправлять X-Real-IP", "X-Real-IP yuborish"],
+    "Also send the client IP as": ["Также отправлять IP клиента в заголовке", "Mijoz IP manzilini quyidagi sarlavhada ham yuborish"],
+    "optional, e.g. True-Client-IP": ["необязательно, например True-Client-IP", "ixtiyoriy, masalan True-Client-IP"],
+    "Trusted proxies in front of this host": ["Доверенные прокси перед этим хостом", "Ushbu xost oldidagi ishonchli proksilar"],
+    "optional, e.g. 10.20.0.2 192.0.2.0/24": ["необязательно, например 10.20.0.2 192.0.2.0/24", "ixtiyoriy, masalan 10.20.0.2 192.0.2.0/24"],
+    "Their header with the client IP": ["Их заголовок с IP клиента", "Ulardagi mijoz IP sarlavhasi"],
+    "Requests from these proxies are taken to come from the IP in that header - for the guest, the logs and \"Allowed sources\". Only list proxies you control: anyone else could fake their IP.": ["Запросы от этих прокси считаются пришедшими с IP из этого заголовка - для гостевой системы, журналов и \"Разрешённых источников\". Указывайте только свои прокси: любой другой сможет подделать свой IP.", "Ushbu proksilardan kelgan soʻrovlar shu sarlavhadagi IP dan kelgan deb hisoblanadi - mehmon tizim, jurnallar va \"Ruxsat etilgan manbalar\" uchun. Faqat oʻzingiz boshqaradigan proksilarni kiriting: boshqa har kim oʻz IP manzilini soxtalashtirishi mumkin."],
+    "behind proxy": ["за прокси", "proksi ortida"],
+    "client IP from {0} of {1}": ["IP клиента из {0} от {1}", "{1} ning {0} sarlavhasidan mijoz IP"],
+    "X-Forwarded-For must be append, replace or off": ["X-Forwarded-For: append, replace или off", "X-Forwarded-For: append, replace yoki off boʻlishi kerak"],
+    "extra client IP header: a header name like True-Client-IP or CF-Connecting-IP (not Host, X-Real-IP, X-Forwarded-For ...)": ["дополнительный заголовок с IP клиента: имя заголовка, например True-Client-IP или CF-Connecting-IP (не Host, X-Real-IP, X-Forwarded-For ...)", "qoʻshimcha mijoz IP sarlavhasi: True-Client-IP yoki CF-Connecting-IP kabi sarlavha nomi (Host, X-Real-IP, X-Forwarded-For ... emas)"],
+    "invalid trusted proxy '{0}' (IP or CIDR)": ["неверный доверенный прокси '{0}' (IP или CIDR)", "notoʻgʻri ishonchli proksi '{0}' (IP yoki CIDR)"],
+    "trusting every address would let anyone fake their IP - list only your proxies' IPs": ["доверие всем адресам позволит любому подделать свой IP - укажите только IP своих прокси", "barcha manzillarga ishonish har kimga IP manzilini soxtalashtirish imkonini beradi - faqat proksilaringiz IP manzillarini kiriting"],
+    "header of the trusted proxies: a header name like X-Forwarded-For or X-Real-IP": ["заголовок доверенных прокси: имя заголовка, например X-Forwarded-For или X-Real-IP", "ishonchli proksilar sarlavhasi: X-Forwarded-For yoki X-Real-IP kabi sarlavha nomi"],
+    "with 'Behind Cloudflare' the client IP comes from CF-Connecting-IP - set the trusted proxies' header to CF-Connecting-IP, or turn one of them off": ["с опцией 'За Cloudflare' IP клиента берётся из CF-Connecting-IP - укажите для доверенных прокси заголовок CF-Connecting-IP или выключите одно из двух", "'Cloudflare ortida' yoqilganda mijoz IP CF-Connecting-IP dan olinadi - ishonchli proksilar sarlavhasini CF-Connecting-IP qiling yoki ulardan birini oʻchiring"],
+    "client IP": ["IP клиента", "mijoz IP manzili"],
+    "sent to the guest as {0}": ["передаётся гостевой системе как {0}", "mehmon tizimga {0} sifatida yuboriladi"],
+    "sent to the guest as {0} (X-Forwarded-For holds only the client IP)": ["передаётся гостевой системе как {0} (в X-Forwarded-For только IP клиента)", "mehmon tizimga {0} sifatida yuboriladi (X-Forwarded-For da faqat mijoz IP)"],
+    "sent to the guest as {0}; taken from {1} when the request comes from {2}": ["передаётся гостевой системе как {0}; берётся из {1}, если запрос приходит от {2}", "mehmon tizimga {0} sifatida yuboriladi; soʻrov {2} dan kelsa, {1} dan olinadi"],
+    "sent to the guest as {0} (X-Forwarded-For holds only the client IP); taken from {1} when the request comes from {2}": ["передаётся гостевой системе как {0} (в X-Forwarded-For только IP клиента); берётся из {1}, если запрос приходит от {2}", "mehmon tizimga {0} sifatida yuboriladi (X-Forwarded-For da faqat mijoz IP); soʻrov {2} dan kelsa, {1} dan olinadi"],
+    "not sent to the guest": ["не передаётся гостевой системе", "mehmon tizimga yuborilmaydi"],
+    "not sent to the guest; taken from {0} when the request comes from {1}": ["не передаётся гостевой системе; берётся из {0}, если запрос приходит от {1}", "mehmon tizimga yuborilmaydi; soʻrov {1} dan kelsa, {0} dan olinadi"],
 }
 
 
@@ -6871,6 +6961,15 @@ INDEX_HTML = r"""<!doctype html>
       <label class="check wide tls-on"><input type="checkbox" name="hsts"> HSTS: browsers insist on HTTPS for this domain for 180 days</label>
       <label class="check wide"><input type="checkbox" name="headers" checked> Security headers (nosniff, same-origin framing, referrer policy)</label>
       <label class="check wide"><input type="checkbox" name="cloudflare"> Behind the Cloudflare proxy (orange cloud): pass the real visitor IP to the guest and to "Allowed sources"</label>
+      <p class="hint wide"><b>Client IP</b> - how the guest learns the visitor's IP address.</p>
+      <label>X-Forwarded-For<select name="ip_xff"><option value="append">append the client IP (standard)</option>
+        <option value="replace">only the client IP (can't be faked)</option><option value="off">don't send</option></select></label>
+      <label class="check"><input type="checkbox" name="ip_real" checked> Send X-Real-IP</label>
+      <label>Also send the client IP as<input name="ip_header" placeholder="optional, e.g. True-Client-IP" spellcheck="false" autocomplete="off"></label>
+      <label>Trusted proxies in front of this host<input name="trusted_proxies" placeholder="optional, e.g. 10.20.0.2 192.0.2.0/24" spellcheck="false" autocomplete="off"></label>
+      <label class="proxy-only">Their header with the client IP<input name="trusted_header" placeholder="X-Forwarded-For" spellcheck="false" autocomplete="off"></label>
+      <p class="hint wide proxy-only">Requests from these proxies are taken to come from the IP in that header - for the guest, the logs and
+        "Allowed sources". Only list proxies you control: anyone else could fake their IP.</p>
       <label>Max upload size<input name="max_body" value="100m" placeholder="100m, 2g, 0 = unlimited"></label>
       <label>Allowed sources<input name="source" placeholder="anyone (or 203.0.113.0/24 …)"></label>
       <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled</label>
@@ -7677,8 +7776,9 @@ function domainRow(d) {
       el('td', {class: 'names'}, el('a', {href: (d.tls !== 'none' ? 'https://' : 'http://') + d.domain, target: '_blank', rel: 'noopener', textContent: d.domain}),
         d.locked ? el('span', {class: 'lock-mark', textContent: ' 🔒', title: 'locked'}) : null,
         ...d.aliases.map(a => el('span', {class: 'alias', textContent: d.alias_redirect ? '↳ ' + a + ' → 301' : a})),
-        (d.cloudflare || d.hsts) ? el('span', {class: 'alias'},
+        (d.cloudflare || d.hsts || (d.trusted_proxies && d.trusted_proxies.length)) ? el('span', {class: 'alias'},
           d.cloudflare ? el('span', {class: 'tag', textContent: 'cloudflare'}) : null, ' ',
+          d.trusted_proxies && d.trusted_proxies.length ? el('span', {class: 'tag', title: 'client IP from ' + d.trusted_header + ' of ' + d.trusted_proxies.join(', '), textContent: 'behind proxy'}) : null, ' ',
           d.hsts ? el('span', {class: 'tag', textContent: 'hsts'}) : null) : null),
       el('td', {class: 'arrow', textContent: '→'}),
       el('td', {class: 'mono', textContent: (d.upstream_https ? 'https://' : 'http://') + d.ip + ':' + d.port}),
@@ -7729,6 +7829,9 @@ function openDomDlg(d, group) {
   f.ip.value = d.ip || ''; f.port.value = d.port || 80; f.upstream_https.checked = !!d.upstream_https;
   f.tls.value = d.tls; f.force_https.checked = d.force_https !== false; f.max_body.value = d.max_body || '100m';
   f.source.value = (d.source || []).join(' '); f.enabled.checked = d.enabled !== false;
+  f.ip_xff.value = d.ip_xff || 'append'; f.ip_real.checked = d.ip_real !== false; f.ip_header.value = d.ip_header || '';
+  f.trusted_proxies.value = (d.trusted_proxies || []).join(' ');
+  f.trusted_header.value = d.trusted_header && d.trusted_header !== 'X-Forwarded-For' ? d.trusted_header : ''; proxyFields();
   f.acme_email.value = S.acme_email || '';
   toggleLe();
   $('#domDlg').showModal();
@@ -7756,11 +7859,15 @@ $('#domForm').upstream_https.addEventListener('change', e => {
   const p = $('#domForm').port; if (e.target.checked && p.value === '80') p.value = '443'; else if (!e.target.checked && p.value === '443') p.value = '80';
 });
 $('#domForm').guest.addEventListener('change', () => pickGuest($('#domForm'), false));
+function proxyFields() { for (const x of document.querySelectorAll('#domForm .proxy-only')) x.hidden = !$('#domForm').trusted_proxies.value.trim(); }
+$('#domForm').trusted_proxies.addEventListener('input', proxyFields);
 $('#domForm').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, d = {};
   for (const k of ['domain', 'aliases', 'ip', 'port', 'tls', 'max_body', 'source', 'acme_email', 'group']) d[k] = f[k].value.trim();
   d.upstream_https = f.upstream_https.checked; d.force_https = f.force_https.checked; d.enabled = f.enabled.checked;
+  d.ip_xff = f.ip_xff.value; d.ip_real = f.ip_real.checked; d.ip_header = f.ip_header.value.trim();
+  d.trusted_proxies = f.trusted_proxies.value.trim(); d.trusted_header = f.trusted_header.value.trim();
   for (const k of ['alias_redirect', 'hsts', 'headers', 'cloudflare']) d[k] = f[k].checked;
   if (!await ask((editingDom ? 'Save changes to ' : 'Add domain ') + d.domain + '?', d.domain + ' → ' + (d.upstream_https ? 'https://' : 'http://') +
     d.ip + ':' + d.port + '. nginx is reloaded' + (d.tls === 'letsencrypt' && d.enabled && !editingDom ? ' and a certificate is requested if needed.' : '.'), editingDom ? 'Save' : 'Add')) return;

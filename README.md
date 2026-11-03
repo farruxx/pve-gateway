@@ -104,6 +104,7 @@ The **Domains** tab maps hostnames to guests: `cloud.example.com` → `10.10.10.
   - **security headers** (nosniff, same-origin framing, referrer policy);
   - max upload size, and allowed source IPs/CIDRs;
   - **Behind Cloudflare**: for domains behind the orange cloud, nginx trusts Cloudflare's address ranges, so logs, the guest and *Allowed sources* see the real visitor IP.
+  - **Client IP**: the guest gets the visitor's IP in `X-Real-IP` and `X-Forwarded-For` (appended, as usual). `X-Forwarded-For` can instead carry **only the client IP**, so a client can't fake an earlier hop, or be switched off. The IP can also go in one more header, such as `True-Client-IP`. **Trusted proxies** handle the case where another proxy or load balancer forwards to this host: list its IPs and the header it uses (default `X-Forwarded-For`), and nginx uses the real visitor IP for logs, the guest and *Allowed sources*. Only list proxies you control.
 
   WebSockets always work.
 - **Test** checks DNS (A, AAAA and Cloudflare-proxied records), nginx and the upstream. It also checks the certificate nginx **actually serves**: it must cover every name, not be close to expiry, and be the same over IPv4 and IPv6. Aliases set to redirect must answer with a 301.
