@@ -104,6 +104,7 @@ IP manzilni har doim qoʻlda kiritishingiz mumkin.
   - **xavfsizlik sarlavhalari** (nosniff, same-origin framing, referrer policy);
   - maksimal yuklash hajmi va ruxsat etilgan manba IP/CIDR lar;
   - **Cloudflare ortida**: toʻq sariq bulut ortidagi domenlar uchun nginx Cloudflare manzil diapazonlariga ishonadi, shunda loglar, mehmon tizim va *Ruxsat etilgan manbalar* tashrif buyuruvchining haqiqiy IP manzilini koʻradi.
+  - **Mijoz IP manzili**: mehmon tizim tashrif buyuruvchining IP manzilini `X-Real-IP` va `X-Forwarded-For` da oladi (odatdagidek qoʻshiladi). Buning oʻrniga `X-Forwarded-For` da **faqat mijoz IP** boʻlishi (shunda mijoz oldingi tugunni soxtalashtira olmaydi) yoki u oʻchirilishi mumkin. IP manzilni yana bitta sarlavhada ham yuborish mumkin, masalan `True-Client-IP`. **Ishonchli proksilar** bu xostga boshqa proksi yoki yuk taqsimlagich yoʻnaltirganda kerak: uning IP manzillari va ishlatadigan sarlavhasini kiriting (standart `X-Forwarded-For`), shunda nginx loglar, mehmon tizim va *Ruxsat etilgan manbalar* uchun haqiqiy IP manzildan foydalanadi. Faqat oʻzingiz boshqaradigan proksilarni kiriting.
 
   WebSocket lar har doim ishlaydi.
 - **Tekshirish** DNS (A, AAAA va Cloudflare orqali proksilangan yozuvlar), nginx va upstream ni tekshiradi. Shuningdek, nginx **haqiqatda taqdim etayotgan** sertifikatni ham tekshiradi: u barcha nomlarni qamrashi, muddati tugashiga yaqin boʻlmasligi va IPv4 hamda IPv6 orqali bir xil boʻlishi kerak. Qayta yoʻnaltirishga sozlangan taxalluslar 301 bilan javob berishi shart.
