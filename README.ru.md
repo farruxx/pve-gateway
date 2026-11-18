@@ -157,7 +157,7 @@ IP всегда можно ввести вручную.
 | **Masquerade для всех** | IP этого хоста | шлюз гостевой системы — *не* этот хост, а IP клиента не важен |
 | **PROXY protocol** (TCP) | IP этого хоста плюс IP клиента в заголовке [PROXY protocol](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt) v1 | шлюз гостевой системы — не этот хост, но сервису нужен IP клиента |
 
-С **PROXY protocol** соединение принимает nginx на этом хосте (модуль stream) и пересылает его гостевой системе с заголовком в начале. Сервис в гостевой системе должен его ожидать, например nginx `listen 443 proxy_protocol;` + `set_real_ip_from <IP моста хоста>; real_ip_header proxy_protocol;`, HAProxy `accept-proxy`, Traefik `proxyProtocol.trustedIPs`, Postfix `smtpd_upstream_proxy_protocol = haproxy`. Прямые подключения к гостевой системе без заголовка тогда не работают. Нужен `apt install nginx` (и `libnginx-mod-stream`, если nginx его не включает); pve-gateway пишет `/etc/nginx/modules-enabled/zz-pve-gateway-stream.conf` и проверяет его через `nginx -t`, как и конфигурацию доменов. Такие правила нельзя ограничить входящим интерфейсом; разрешённый источник становится `allow` в nginx, а фаервол хоста открывает порт. Для HTTP(S) используйте домен: он передаёт IP клиента в `X-Forwarded-For` / `X-Real-IP`.
+С **PROXY protocol** соединение принимает nginx на этом хосте (модуль stream) и пересылает его гостевой системе с заголовком в начале. Сервис в гостевой системе должен его ожидать, например nginx `listen 443 proxy_protocol;` + `set_real_ip_from <IP моста хоста>; real_ip_header proxy_protocol;`, HAProxy `accept-proxy`, Traefik `proxyProtocol.trustedIPs`, Postfix `smtpd_upstream_proxy_protocol = haproxy`. Прямые подключения к гостевой системе без заголовка тогда не работают. Нужны nginx и его модуль stream: `apt install nginx libnginx-mod-stream` (если модуля нет, в окне правила появляется кнопка **Установить модуль stream**, а установленный, но не подключённый модуль загружается автоматически); pve-gateway пишет `/etc/nginx/modules-enabled/zz-pve-gateway-stream.conf` и проверяет его через `nginx -t`, как и конфигурацию доменов. Такие правила нельзя ограничить входящим интерфейсом; разрешённый источник становится `allow` в nginx, а фаервол хоста открывает порт. Для HTTP(S) используйте домен: он передаёт IP клиента в `X-Forwarded-For` / `X-Real-IP`.
 
 ## CLI
 
@@ -244,6 +244,7 @@ pve-gateway --dry-run ...   # log iptables commands instead of running them (for
 | `nginx-stopped` | останавливает nginx, так что проверки доменов не проходят |
 | `nginx-test-fails` | делает следующий `nginx -t` неудачным, демонстрируя откат |
 | `cert-expiring` | все сертификаты истекают через 5 дней |
+| `no-stream-module` | nginx без модуля stream, поэтому правила портов с PROXY protocol не сохраняются (кнопка установки в окне правила) |
 | `no-dnsmasq` | dnsmasq отсутствует, поэтому SDN DHCP не работает (кнопка установки на вкладке «Сеть») |
 | `no-sdn` | старый Proxmox VE (7.4) без API SDN |
 | `sdn-pending` | изменение SDN, сделанное в другом месте и ещё не применённое |

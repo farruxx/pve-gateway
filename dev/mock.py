@@ -62,6 +62,7 @@ SCENARIOS = {
     "no-fail2ban": "fail2ban is not installed (use the Install button)",
     "no-wireguard": "wireguard-tools is not installed (use the Install button)",
     "dnat-80": "another tool's iptables rule forwards ports 80/443 to a firewall VM instead of the host's nginx",
+    "no-stream-module": "nginx without its stream module (PROXY protocol port rules need: apt install libnginx-mod-stream)",
     "no-dnsmasq": "dnsmasq is not installed (SDN DHCP needs it; use the Install button on the Network tab)",
     "no-sdn": "old Proxmox VE (7.4) without the SDN API",
     "sdn-pending": "an SDN change was made in the Proxmox UI and not applied yet",
@@ -478,6 +479,8 @@ server {
                 self._bump(st, burst=True)
             elif name == "nginx-stopped":
                 st["nginx_active"] = False
+            elif name == "no-stream-module":
+                st["stream_module"] = False
             elif name == "nginx-test-fails":
                 st["nginx_test_fail"] = True
             elif name == "foreign-site":
@@ -742,7 +745,30 @@ server {
             p, s, addr, "*:*" if addr.startswith("*") else "0.0.0.0:*", u if procs else "") for p, s, addr, u in lines), False
 
     # ------------------------------------------------------------------ nginx / certbot / systemd
+    STREAM_SO = "/usr/lib/nginx/modules/ngx_stream_module.so"
+    STREAM_LOADER = "/etc/nginx/modules-enabled/50-mod-stream.conf"
+
+    def _stream_files(self, st):
+        """Debian's libnginx-mod-stream: the .so plus a modules-enabled file that loads it."""
+        so, loader = self.path_for(self.STREAM_SO), self.path_for(self.STREAM_LOADER)
+        if st.get("stream_module", True):
+            for path, text in ((so, "(mock module)"), (loader, "load_module modules/ngx_stream_module.so;\n")):
+                if not os.path.exists(path):
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w") as f:
+                        f.write(text)
+        else:
+            for path in (so, loader):
+                if os.path.exists(path):
+                    os.remove(path)
+
     def c_nginx(self, st, a, data):
+        self._stream_files(st)
+        if a == ["-V"]:
+            return 0, ("nginx version: nginx/1.22.1\nbuilt with OpenSSL 3.0.11 19 Sep 2023\nTLS SNI support enabled\n"
+                       "configure arguments: --with-cc-opt='-g -O2' --prefix=/usr/share/nginx --conf-path=/etc/nginx/nginx.conf "
+                       "--with-http_ssl_module --with-http_v2_module --with-http_realip_module "
+                       "--with-stream=dynamic --with-stream_ssl_module --with-mail=dynamic"), False
         if a == ["-v"]:
             return 0, "nginx version: nginx/1.22.1", False
         if a == ["-T"]:
@@ -762,6 +788,15 @@ server {
                 st["nginx_test_fail"] = False
                 return 1, ('nginx: [emerg] unknown directive "proxy_pas" in /etc/nginx/conf.d/pve-gateway.conf:42\n'
                            "nginx: configuration file /etc/nginx/nginx.conf test failed  [mock: nginx-test-fails]"), True
+            mods = self._nginx_conf(("modules-enabled",))
+            if re.search(r"^stream \{", mods, re.M) and "ngx_stream_module" not in mods:
+                n = mods[:mods.index("stream {")].count("\n") + 1
+                return 1, ('nginx: [emerg] unknown directive "stream" in /etc/nginx/modules-enabled/zz-pve-gateway-stream.conf:%d\n'
+                           "nginx: configuration file /etc/nginx/nginx.conf test failed" % n), False
+            if mods.count("ngx_stream_module") > 1:
+                return 1, ('nginx: [emerg] module "ngx_stream_module" is already loaded in '
+                           "/etc/nginx/modules-enabled/zz-pve-gateway-stream.conf:4\n"
+                           "nginx: configuration file /etc/nginx/nginx.conf test failed"), False
             if conf.count("{") != conf.count("}"):
                 return 1, "nginx: [emerg] unexpected end of file, expecting \"}\" in /etc/nginx/conf.d/pve-gateway.conf", False
             for path in re.findall(r"ssl_certificate (\S+);", conf):
@@ -921,6 +956,10 @@ server {
 
     def c_apt_get(self, st, a, data):
         time.sleep(1.5)
+        if "libnginx-mod-stream" in a:
+            st["stream_module"] = True
+            self._stream_files(st)
+            return 0, "Setting up libnginx-mod-stream (1.22.1-9) ...", True
         if "dnsmasq" in a:
             self._sdn(st)["dnsmasq"] = True
             return 0, "Setting up dnsmasq (2.90-4) ...", True

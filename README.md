@@ -157,7 +157,7 @@ Guests sit on a private bridge (for example `vmbr1`, `10.10.10.0/24`), and the h
 | **Masquerade all** | this host's IP | the guest's default gateway is *not* this host and the client IP doesn't matter |
 | **PROXY protocol** (TCP) | this host's IP, plus the client IP in a [PROXY protocol](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt) v1 header | the guest's gateway is not this host, but the service needs the client IP |
 
-With **PROXY protocol**, nginx on this host (stream module) takes the connection and forwards it to the guest with the header in front. The service on the guest must expect it, e.g. nginx `listen 443 proxy_protocol;` + `set_real_ip_from <host bridge IP>; real_ip_header proxy_protocol;`, HAProxy `accept-proxy`, Traefik `proxyProtocol.trustedIPs`, Postfix `smtpd_upstream_proxy_protocol = haproxy`. Connections straight to the guest without the header then fail. It needs `apt install nginx` (and `libnginx-mod-stream` where nginx doesn't include it); pve-gateway writes `/etc/nginx/modules-enabled/zz-pve-gateway-stream.conf` and checks it with `nginx -t` like the domains config. Such rules can't be limited to an incoming interface; the allowed source becomes an nginx `allow`, and the host firewall opens the port. For HTTP(S), use a domain instead: it passes the client IP in `X-Forwarded-For` / `X-Real-IP`.
+With **PROXY protocol**, nginx on this host (stream module) takes the connection and forwards it to the guest with the header in front. The service on the guest must expect it, e.g. nginx `listen 443 proxy_protocol;` + `set_real_ip_from <host bridge IP>; real_ip_header proxy_protocol;`, HAProxy `accept-proxy`, Traefik `proxyProtocol.trustedIPs`, Postfix `smtpd_upstream_proxy_protocol = haproxy`. Connections straight to the guest without the header then fail. It needs nginx and its stream module: `apt install nginx libnginx-mod-stream` (the rule dialog offers an **Install stream module** button when it is missing, and an installed module that isn't enabled is loaded automatically); pve-gateway writes `/etc/nginx/modules-enabled/zz-pve-gateway-stream.conf` and checks it with `nginx -t` like the domains config. Such rules can't be limited to an incoming interface; the allowed source becomes an nginx `allow`, and the host firewall opens the port. For HTTP(S), use a domain instead: it passes the client IP in `X-Forwarded-For` / `X-Real-IP`.
 
 ## CLI
 
@@ -244,6 +244,7 @@ To break the host on purpose, run a scenario. They're also available as buttons 
 | `nginx-stopped` | stops nginx, so domain tests fail |
 | `nginx-test-fails` | makes the next `nginx -t` fail, showing the rollback |
 | `cert-expiring` | makes every certificate expire in 5 days |
+| `no-stream-module` | nginx without its stream module, so PROXY protocol port rules can't be saved (Install button in the rule dialog) |
 | `no-dnsmasq` | dnsmasq is missing, so SDN DHCP can't work (Install button on the Network tab) |
 | `no-sdn` | an old Proxmox VE (7.4) without the SDN API |
 | `sdn-pending` | an SDN change made elsewhere that isn't applied yet |
