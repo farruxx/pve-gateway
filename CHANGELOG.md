@@ -12,6 +12,12 @@ from GitHub and shows the entries below that are newer than the installed one.
   (default X-Forwarded-For) and nginx uses the real visitor IP for logs, the guest and "Allowed sources"
   (set_real_ip_from + real_ip_recursive). Works together with "Behind Cloudflare" when both use CF-Connecting-IP.
 - Domain test: a "client IP" step that says which headers carry the IP and which proxies are trusted.
+- Port rules: a Client IP mode replaces the Masquerade checkbox. "Keep the client IP" (plain DNAT, as before),
+  "Masquerade private sources only" (hairpin: other guests / LAN / VPN can use the public IP while internet clients
+  keep their real IP), "Masquerade all" (the old Masquerade) and "PROXY protocol" (TCP): nginx's stream module on
+  the host forwards the connection with a PROXY protocol v1 header, so the guest gets the client IP even when its
+  gateway is not this host. Existing rules keep their behaviour. Rule test and Debug check nginx, its stream config
+  and the listening port; the host firewall opens PROXY protocol ports.
 
 ## 1.12.1 - 2026-10-20
 - Locked domains: the Cert button is disabled and manual certificate requests (UI, API, CLI `cert`) are refused until

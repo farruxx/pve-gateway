@@ -34,7 +34,7 @@ Proxmox VE xostini undagi VM va konteynerlar uchun shlyuzga aylantiruvchi kichik
 - **Boshqa qoidalar bilan yonma-yon xavfsiz ishlaydi.** Hammasi alohida zanjirlarda (`PVEGW_PRE`, `PVEGW_POST`, `PVEGW_FWD`) saqlanadi va ular `iptables-restore` orqali atomar almashtiriladi. pve-firewall va sizning qoidalaringizga tegilmaydi.
 - **Mehmon tizimni tanlash.** Mahalliy VM va CT lar IP manzillari bilan roʻyxatda koʻrsatiladi (QEMU guest agent, xostning ARP jadvali, cloud-init yoki LXC konfiguratsiyasidan; qarang: [Mehmon tizimlar IP manzillari](#mehmon-tizimlar-ip-manzillari)).
 - **Xost tarmogʻi bir qarashda.** Portlar va Domenlar boʻlimlarida xostning interfeyslari va IP manzillari (ommaviy, WAN, mehmon koʻpriklari) hamda DNS va routerlar qayerga yoʻnaltirilishi kerakligi haqida maslahatlar koʻrsatiladi.
-- TCP, UDP yoki ikkalasini, port diapazonlarini, manba IP/CIDR ruxsat roʻyxatini, kiruvchi interfeysni, ixtiyoriy masquerade ni qoʻllab-quvvatlaydi va har bir qoida uchun murojaatlar hisoblagichini koʻrsatadi.
+- TCP, UDP yoki ikkalasini, port diapazonlarini, manba IP/CIDR ruxsat roʻyxatini, kiruvchi interfeysni, har bir qoida uchun **Mijoz IP** rejimini (saqlash, masquerade yoki PROXY protocol orqali uzatish) qoʻllab-quvvatlaydi va har bir qoida uchun murojaatlar hisoblagichini koʻrsatadi.
 - **Guruhlar.** Port qoidalari va domenlarni guruhlarga (masalan, *web*, *games*) ajratish mumkin. Har bir guruh oʻzining **+ Qoʻshish**, **Qayta nomlash** va **Guruhdan chiqarish** tugmalariga ega yigʻiladigan boʻlimdir. Guruhsiz hamma narsa, jumladan eski versiyalarda saqlanganlar ham, **standart** guruhda qoladi. Barcha elementlar standart guruhda boʻlsa, jadvallar avvalgidek koʻrinadi. Guruhlar faqat elementlarning roʻyxatda koʻrsatilishini oʻzgartiradi; iptables yoki nginx ga taʼsir qilmaydi.
 - **Qulf.** 🔓 tugmasi port qoidasi yoki domenni qulflaydi (🔒). Qulflangan elementni qulfdan chiqarmaguningizcha tahrirlab, oʻchirib qoʻyib, oʻchirib yoki boshqa guruhga koʻchirib boʻlmaydi. Bu nafaqat UI da, balki server tomonida ham taʼminlanadi (HTTP 423). Tekshirish ishlashda davom etadi. Sertifikatni qoʻlda soʻrash (Cert) ham bloklanadi; avtomatik yangilash ishlayveradi, muvaffaqiyatsiz soʻrov esa ishlab turgan sertifikatni hech qachon almashtirmaydi.
 - **Tillar.** Veb interfeys ingliz, rus va oʻzbek (lotin) tillarida mavjud. Til brauzerdan olinadi, uni **Sozlamalar → Til** boʻlimida yoki kirish sahifasida almashtirish mumkin. Server xabarlari, tekshiruvlar va xatolar ham tarjima qilinadi; CLI va jurnal ingliz tilida qoladi.
@@ -148,7 +148,16 @@ Mehmon tizimlar xususiy koʻprikda (masalan, `vmbr1`, `10.10.10.0/24`) joylashga
 | `8080` | `10.10.10.10:80` | `http://<host-ip>:8080` VM 100 ning veb serveriga yetib boradi |
 | `27015-27020` TCP+UDP | `10.10.10.12` | port diapazoni, mehmon tizimda ham xuddi shu portlar |
 
-**Masquerade** faqat mehmon tizimning standart shlyuzi Proxmox xosti *boʻlmasa* yoki boshqa mehmon tizimlar xizmatga xostning ommaviy IP manzili orqali murojaat qilishi kerak boʻlsa (hairpin NAT) kerak boʻladi. Eʼtibor bering: masquerade yoqilganda mehmon tizim mijozning haqiqiy IP manzili oʻrniga xostning IP manzilini koʻradi.
+**Mijoz IP.** Oddiy DNAT mijozning IP manzilini saqlaydi, shuning uchun mehmon tizim kim ulanayotganini koʻradi. Har bir qoidada toʻrt rejimdan biri tanlanadi:
+
+| Rejim | Mehmon tizim koʻradi | Qachon ishlatiladi |
+|---|---|---|
+| **Mijoz IP manzilini saqlash** (standart) | mijozning haqiqiy IP manzili | mehmon tizimning standart shlyuzi shu xost |
+| **Masquerade faqat xususiy manbalar uchun** | internet mijozlarning haqiqiy IP manzili; xususiy manbalar (10/8, 172.16/12, 192.168/16, 100.64/10) uchun shu xost | boshqa mehmon tizimlar, LAN yoki VPN mijozlari xizmatga xostning ommaviy IP manzili orqali murojaat qiladi (hairpin NAT) |
+| **Masquerade hammasi uchun** | shu xostning IP manzili | mehmon tizimning shlyuzi bu xost *emas*, mijoz IP manzili esa muhim emas |
+| **PROXY protocol** (TCP) | shu xostning IP manzili va [PROXY protocol](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt) v1 sarlavhasidagi mijoz IP manzili | mehmon tizimning shlyuzi bu xost emas, lekin xizmatga mijoz IP manzili kerak |
+
+**PROXY protocol** bilan ulanishni shu xostdagi nginx (stream moduli) qabul qiladi va uni boshiga sarlavha qoʻshib mehmon tizimga uzatadi. Mehmon tizimdagi xizmat uni kutishi kerak, masalan nginx `listen 443 proxy_protocol;` + `set_real_ip_from <xost koʻprigi IP>; real_ip_header proxy_protocol;`, HAProxy `accept-proxy`, Traefik `proxyProtocol.trustedIPs`, Postfix `smtpd_upstream_proxy_protocol = haproxy`. Shunda mehmon tizimga sarlavhasiz toʻgʻridan-toʻgʻri ulanishlar ishlamaydi. `apt install nginx` kerak (nginx uni oʻz ichiga olmasa, `libnginx-mod-stream` ham); pve-gateway `/etc/nginx/modules-enabled/zz-pve-gateway-stream.conf` faylini yozadi va uni domenlar konfiguratsiyasi kabi `nginx -t` bilan tekshiradi. Bunday qoidalarni kiruvchi interfeys bilan cheklab boʻlmaydi; ruxsat etilgan manba nginx dagi `allow` ga aylanadi, xost fayrvoli esa portni ochadi. HTTP(S) uchun domendan foydalaning: u mijoz IP manzilini `X-Forwarded-For` / `X-Real-IP` da uzatadi.
 
 ## CLI
 

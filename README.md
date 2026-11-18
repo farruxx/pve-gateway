@@ -34,7 +34,7 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 - **Safe to run next to other rules.** Everything lives in its own chains (`PVEGW_PRE`, `PVEGW_POST`, `PVEGW_FWD`), which are swapped atomically with `iptables-restore`. pve-firewall and your own rules are left alone.
 - **Guest picker.** It lists local VMs and CTs with their IPs (from the QEMU guest agent, the host's ARP table, cloud-init or the LXC config; see [Guest IPs](#guest-ips)).
 - **Host network at a glance.** The Ports and Domains tabs show the host's interfaces and IPs (public, WAN, guest bridges) with tips on where DNS and routers should point.
-- Supports TCP, UDP or both, port ranges, a source IP/CIDR allow-list, an incoming interface, optional masquerade, and shows per-rule hit counters.
+- Supports TCP, UDP or both, port ranges, a source IP/CIDR allow-list, an incoming interface, a per-rule **Client IP** mode (keep it, masquerade, or pass it on with the PROXY protocol), and shows per-rule hit counters.
 - **Groups.** Port rules and domains can be put into groups (e.g. *web*, *games*). Each group is a collapsible section with its own **+ Add**, **Rename** and **Ungroup**. Anything without a group, including everything saved by older versions, stays in **default**. While all items are in default, the tables look as before. Groups only change how items are listed; they don't affect iptables or nginx.
 - **Lock.** The 🔓 button locks a port rule or domain (🔒). A locked item can't be edited, switched off, deleted or moved to another group until you unlock it. This is enforced by the server too (HTTP 423), not just the UI. Test still works. Manual certificate requests (Cert) are blocked too; automatic renewals keep running, and a failed request never replaces a working certificate.
 - **Languages.** The web UI is available in English, Russian and Uzbek (Latin). It follows the browser's language, and you can switch it in **Settings → Language** or on the login page. Server messages, checks and errors are translated too; the CLI and the log stay in English.
@@ -148,7 +148,16 @@ Guests sit on a private bridge (for example `vmbr1`, `10.10.10.0/24`), and the h
 | `8080` | `10.10.10.10:80` | `http://<host-ip>:8080` reaches VM 100's web server |
 | `27015-27020` TCP+UDP | `10.10.10.12` | port range, same ports on the guest |
 
-**Masquerade** is only needed if the guest's default gateway is *not* the Proxmox host, or if other guests need to reach the service through the host's public IP (hairpin NAT). Note that with masquerade on, the guest sees the host's IP instead of the real client IP.
+**Client IP.** Plain DNAT keeps the client's IP, so the guest sees who connects. Each rule picks one of four modes:
+
+| Mode | The guest sees | Use it when |
+|---|---|---|
+| **Keep the client IP** (default) | the real client IP | the guest's default gateway is this host |
+| **Masquerade private sources only** | the real IP for internet clients; this host for private sources (10/8, 172.16/12, 192.168/16, 100.64/10) | other guests, the LAN or VPN clients reach the service through the host's public IP (hairpin NAT) |
+| **Masquerade all** | this host's IP | the guest's default gateway is *not* this host and the client IP doesn't matter |
+| **PROXY protocol** (TCP) | this host's IP, plus the client IP in a [PROXY protocol](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt) v1 header | the guest's gateway is not this host, but the service needs the client IP |
+
+With **PROXY protocol**, nginx on this host (stream module) takes the connection and forwards it to the guest with the header in front. The service on the guest must expect it, e.g. nginx `listen 443 proxy_protocol;` + `set_real_ip_from <host bridge IP>; real_ip_header proxy_protocol;`, HAProxy `accept-proxy`, Traefik `proxyProtocol.trustedIPs`, Postfix `smtpd_upstream_proxy_protocol = haproxy`. Connections straight to the guest without the header then fail. It needs `apt install nginx` (and `libnginx-mod-stream` where nginx doesn't include it); pve-gateway writes `/etc/nginx/modules-enabled/zz-pve-gateway-stream.conf` and checks it with `nginx -t` like the domains config. Such rules can't be limited to an incoming interface; the allowed source becomes an nginx `allow`, and the host firewall opens the port. For HTTP(S), use a domain instead: it passes the client IP in `X-Forwarded-For` / `X-Real-IP`.
 
 ## CLI
 
