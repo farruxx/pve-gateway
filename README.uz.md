@@ -157,7 +157,7 @@ Mehmon tizimlar xususiy koʻprikda (masalan, `vmbr1`, `10.10.10.0/24`) joylashga
 | **Masquerade hammasi uchun** | shu xostning IP manzili | mehmon tizimning shlyuzi bu xost *emas*, mijoz IP manzili esa muhim emas |
 | **PROXY protocol** (TCP) | shu xostning IP manzili va [PROXY protocol](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt) v1 sarlavhasidagi mijoz IP manzili | mehmon tizimning shlyuzi bu xost emas, lekin xizmatga mijoz IP manzili kerak |
 
-**PROXY protocol** bilan ulanishni shu xostdagi nginx (stream moduli) qabul qiladi va uni boshiga sarlavha qoʻshib mehmon tizimga uzatadi. Mehmon tizimdagi xizmat uni kutishi kerak, masalan nginx `listen 443 proxy_protocol;` + `set_real_ip_from <xost koʻprigi IP>; real_ip_header proxy_protocol;`, HAProxy `accept-proxy`, Traefik `proxyProtocol.trustedIPs`, Postfix `smtpd_upstream_proxy_protocol = haproxy`. Shunda mehmon tizimga sarlavhasiz toʻgʻridan-toʻgʻri ulanishlar ishlamaydi. `apt install nginx` kerak (nginx uni oʻz ichiga olmasa, `libnginx-mod-stream` ham); pve-gateway `/etc/nginx/modules-enabled/zz-pve-gateway-stream.conf` faylini yozadi va uni domenlar konfiguratsiyasi kabi `nginx -t` bilan tekshiradi. Bunday qoidalarni kiruvchi interfeys bilan cheklab boʻlmaydi; ruxsat etilgan manba nginx dagi `allow` ga aylanadi, xost fayrvoli esa portni ochadi. HTTP(S) uchun domendan foydalaning: u mijoz IP manzilini `X-Forwarded-For` / `X-Real-IP` da uzatadi.
+**PROXY protocol** bilan ulanishni shu xostdagi nginx (stream moduli) qabul qiladi va uni boshiga sarlavha qoʻshib mehmon tizimga uzatadi. Mehmon tizimdagi xizmat uni kutishi kerak, masalan nginx `listen 443 proxy_protocol;` + `set_real_ip_from <xost koʻprigi IP>; real_ip_header proxy_protocol;`, HAProxy `accept-proxy`, Traefik `proxyProtocol.trustedIPs`, Postfix `smtpd_upstream_proxy_protocol = haproxy`. Shunda mehmon tizimga sarlavhasiz toʻgʻridan-toʻgʻri ulanishlar ishlamaydi. nginx va uning stream moduli kerak: `apt install nginx libnginx-mod-stream` (modul boʻlmasa, qoida oynasida **Stream modulini oʻrnatish** tugmasi chiqadi, oʻrnatilgan, lekin ulanmagan modul esa avtomatik yuklanadi); pve-gateway `/etc/nginx/modules-enabled/zz-pve-gateway-stream.conf` faylini yozadi va uni domenlar konfiguratsiyasi kabi `nginx -t` bilan tekshiradi. Bunday qoidalarni kiruvchi interfeys bilan cheklab boʻlmaydi; ruxsat etilgan manba nginx dagi `allow` ga aylanadi, xost fayrvoli esa portni ochadi. HTTP(S) uchun domendan foydalaning: u mijoz IP manzilini `X-Forwarded-For` / `X-Real-IP` da uzatadi.
 
 ## CLI
 
@@ -244,6 +244,7 @@ Xostni ataylab buzish uchun ssenariyni ishga tushiring. Ular Diagnostika boʻlim
 | `nginx-stopped` | nginx ni toʻxtatadi, shuning uchun domen testlari xato beradi |
 | `nginx-test-fails` | navbatdagi `nginx -t` ni xato bilan yakunlaydi va orqaga qaytarishni koʻrsatadi |
 | `cert-expiring` | barcha sertifikatlar muddatini 5 kunda tugaydigan qiladi |
+| `no-stream-module` | nginx da stream moduli yoʻq, shuning uchun PROXY protocol port qoidalari saqlanmaydi (qoida oynasida Oʻrnatish tugmasi) |
 | `no-dnsmasq` | dnsmasq yoʻq, shuning uchun SDN DHCP ishlay olmaydi (Tarmoq boʻlimida Oʻrnatish tugmasi) |
 | `no-sdn` | SDN API siz eski Proxmox VE (7.4) |
 | `sdn-pending` | boshqa joyda qilingan, hali qoʻllanmagan SDN oʻzgarishi |
