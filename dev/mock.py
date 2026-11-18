@@ -405,14 +405,22 @@ server {
         res, _ = self.tcp_probe(m.group(1), int(m.group(2)))
         return (200, srv, b"guest says hello") if res == "ok" else (502, srv, b"<html>502 Bad Gateway</html>")
 
-    def _nginx_conf(self):
-        d = self.path_for("/etc/nginx/conf.d")
+    def _nginx_conf(self, dirs=("conf.d", "modules-enabled")):
         out = ""
-        for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
-            if f.endswith(".conf"):
-                with open(os.path.join(d, f)) as fh:
-                    out += fh.read()
+        for name in dirs:
+            d = self.path_for("/etc/nginx/" + name)
+            for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+                if f.endswith(".conf"):
+                    with open(os.path.join(d, f)) as fh:
+                        out += fh.read()
         return out
+
+    def _stream_ports(self):
+        """Ports nginx listens on for stream {} servers (PROXY protocol port rules)."""
+        res = []
+        for m in re.finditer(r"^\s*listen (\d+)(?:-(\d+))?;", self._nginx_conf(("modules-enabled",)), re.M):
+            res += range(int(m.group(1)), int(m.group(2) or m.group(1)) + 1)
+        return res
 
     def sample_rules(self):
         return [dict(r) for r in SAMPLE_RULES]
@@ -728,6 +736,8 @@ server {
         if st.get("nginx_active", True):
             lines += [("tcp", "LISTEN", "0.0.0.0:80", 'users:(("nginx",pid=3010,fd=6))'),
                       ("tcp", "LISTEN", "0.0.0.0:443", 'users:(("nginx",pid=3010,fd=8))')]
+            lines += [("tcp", "LISTEN", "0.0.0.0:%d" % p, 'users:(("nginx",pid=3010,fd=%d))' % (10 + i))
+                      for i, p in enumerate(self._stream_ports()[:50])]
         return 0, "\n".join("%-5s %-6s 0      4096  %21s %21s %s" % (
             p, s, addr, "*:*" if addr.startswith("*") else "0.0.0.0:*", u if procs else "") for p, s, addr, u in lines), False
 
@@ -738,8 +748,9 @@ server {
         if a == ["-T"]:
             out = ["nginx: the configuration file /etc/nginx/nginx.conf syntax is ok",
                    "# configuration file /etc/nginx/nginx.conf:",
+                   "include /etc/nginx/modules-enabled/*.conf;\n"
                    "http {\n    include /etc/nginx/conf.d/*.conf;\n    include /etc/nginx/sites-enabled/*;\n}"]
-            for d in ("conf.d", "sites-enabled"):
+            for d in ("modules-enabled", "conf.d", "sites-enabled"):
                 p = self.path_for("/etc/nginx/" + d)
                 for f in sorted(os.listdir(p)) if os.path.isdir(p) else []:
                     with open(os.path.join(p, f)) as fh:

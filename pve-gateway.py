@@ -46,7 +46,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.12.1"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.13.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -78,6 +78,9 @@ DEFAULTS = {
     "wildcards": [],  # wildcard certificates via DNS-01 (credentials in <config dir>/dns/<id>.ini)
     "acme_email": "",
     "nginx_conf": "/etc/nginx/conf.d/pve-gateway.conf",
+    # port rules with "PROXY protocol": a stream {} block in main context (Debian's nginx.conf includes
+    # modules-enabled/*.conf at the top; "zz-" sorts it after the stream module is loaded)
+    "nginx_stream_conf": "/etc/nginx/modules-enabled/zz-pve-gateway-stream.conf",
     "acme_webroot": "/var/lib/pve-gateway/acme",
     "letsencrypt_dir": "/etc/letsencrypt/live",
     "nginx_ipv6": True,  # also listen on [::]:80/443
@@ -364,6 +367,13 @@ def check_unlocked(item, what):
         raise ApiError("%s is locked - unlock it first" % what, 423)
 
 
+# keep: plain DNAT, the guest sees the client (its gateway must be this host); private: masquerade only private /
+# CGNAT sources (other guests, LAN, VPN - hairpin), internet clients keep their IP; all: masquerade everything, the
+# guest sees this host; proxy: nginx stream proxies TCP and sends the client IP in a PROXY protocol header
+CLIENT_IP_MODES = ("keep", "private", "all", "proxy")
+MASQ_PRIVATE_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")
+
+
 def validate_rule(data, others, cfg, rid=None):
     if not isinstance(data, dict):
         raise ApiError("rule must be an object")
@@ -415,7 +425,18 @@ def validate_rule(data, others, cfg, rid=None):
     if iface and not IFACE_RE.match(iface):
         raise ApiError("invalid interface name")
     r["iface"] = iface
-    r["masq"] = bool(data.get("masq", False))
+    # how the guest learns the client's IP; older configs only have the masq flag
+    mode = str(data.get("client_ip") or ("all" if data.get("masq") else "keep")).strip().lower()
+    if mode not in CLIENT_IP_MODES:
+        raise ApiError("client IP mode must be one of: %s" % ", ".join(CLIENT_IP_MODES))
+    if mode == "proxy":
+        if r["proto"] != "tcp":
+            raise ApiError("PROXY protocol works with TCP only - set the protocol to TCP")
+        if iface:
+            raise ApiError("PROXY protocol rules can't be limited to an interface - leave the interface empty "
+                           "(use the source filter or the firewall)")
+    r["client_ip"] = mode
+    r["masq"] = mode in ("private", "all")  # kept for older versions (downgrade) and the CLI
 
     # never hijack ports the host itself needs
     for p in list(cfg.get("protected_ports", [])) + [str(cfg.get("port", 8099))]:
@@ -486,6 +507,15 @@ def view_wants_ports(handler):
     return "ports=1" in (urllib.parse.urlsplit(handler.path).query or "")
 
 
+def rule_client_ip(r):
+    return r.get("client_ip") or ("all" if r.get("masq") else "keep")
+
+
+def proxy_rules(cfg):
+    """Enabled rules that nginx (stream) proxies with the PROXY protocol."""
+    return [r for r in cfg.get("rules", []) if r["enabled"] and rule_client_ip(r) == "proxy"]
+
+
 def owns_web_ports(cfg):
     return any(d["enabled"] for d in cfg.get("domains", []))
 
@@ -514,18 +544,24 @@ def build_ruleset(cfg):
         to = "%s:%s" % (r["ip"], r["int_port"]) if r["int_port"] else r["ip"]
         iport = r["int_port"] or dport
         cm = '-m comment --comment "gw:%s"' % r["id"]
+        mode = rule_client_ip(r)
         for p in protos(r["proto"]):
             pre = "-A %s -p %s" % (CH_PRE, p)
             if r["iface"]:
                 pre += " -i " + r["iface"]
             if r["source"]:
                 pre += " -s " + r["source"]
+            if mode == "proxy":
+                # nginx on this host takes the connection: ACCEPT ends NAT processing, so no other DNAT rule
+                # forwards the port away, and the rule still counts hits
+                nat.append(pre + " -m addrtype --dst-type LOCAL -m %s --dport %s %s -j ACCEPT" % (p, dport, cm))
+                continue
             # only traffic addressed to the host itself - never hijack guests' outbound traffic
             pre += " -m addrtype --dst-type LOCAL -m %s --dport %s %s -j DNAT --to-destination %s" % (p, dport, cm, to)
             nat.append(pre)
-            if r["masq"]:
-                nat.append("-A %s -d %s/32 -p %s -m %s --dport %s -m conntrack --ctstate DNAT %s -j MASQUERADE"
-                           % (CH_POST, r["ip"], p, p, iport, cm))
+            for src in {"all": [""], "private": [" -s " + n for n in MASQ_PRIVATE_NETS]}.get(mode, []):
+                nat.append("-A %s%s -d %s/32 -p %s -m %s --dport %s -m conntrack --ctstate DNAT %s -j MASQUERADE"
+                           % (CH_POST, src, r["ip"], p, p, iport, cm))
             if cfg.get("forward_accept", True):
                 flt.append("-A %s -d %s/32 -p %s -m %s --dport %s -m conntrack --ctstate DNAT %s -j ACCEPT"
                            % (CH_FWD, r["ip"], p, p, iport, cm))
@@ -857,6 +893,40 @@ def _names(d):
     return [d["domain"]] + d["aliases"]
 
 
+HEADER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,39}$")
+RESERVED_HEADERS = {"host", "connection", "upgrade", "content-length", "transfer-encoding", "x-real-ip",
+                    "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"}
+
+
+def validate_client_ip(d, data):
+    """How the visitor's IP reaches the guest: headers nginx sends, and proxies in front that nginx trusts."""
+    d["ip_real"] = bool(data.get("ip_real", True))                     # X-Real-IP
+    d["ip_xff"] = str(data.get("ip_xff", "append") or "append")       # X-Forwarded-For
+    if d["ip_xff"] not in ("append", "replace", "off"):
+        raise ApiError("X-Forwarded-For must be append, replace or off")
+    d["ip_header"] = str(data.get("ip_header", "") or "").strip()     # extra header, e.g. True-Client-IP
+    if d["ip_header"] and (not HEADER_RE.match(d["ip_header"]) or d["ip_header"].lower() in RESERVED_HEADERS):
+        raise ApiError("extra client IP header: a header name like True-Client-IP or CF-Connecting-IP "
+                       "(not Host, X-Real-IP, X-Forwarded-For ...)")
+    proxies = data.get("trusted_proxies", [])
+    d["trusted_proxies"] = []
+    for c in re.split(r"[\s,]+", proxies) if isinstance(proxies, str) else proxies:
+        c = str(c).strip()
+        if c:
+            try:
+                d["trusted_proxies"].append(str(ipaddress.ip_network(c, strict=False)))
+            except ValueError:
+                raise ApiError("invalid trusted proxy '%s' (IP or CIDR)" % c)
+    if any(ipaddress.ip_network(c).prefixlen == 0 for c in d["trusted_proxies"]):
+        raise ApiError("trusting every address would let anyone fake their IP - list only your proxies' IPs")
+    d["trusted_header"] = str(data.get("trusted_header", "") or "").strip() or "X-Forwarded-For"
+    if not HEADER_RE.match(d["trusted_header"]):
+        raise ApiError("header of the trusted proxies: a header name like X-Forwarded-For or X-Real-IP")
+    if d["trusted_proxies"] and d.get("cloudflare") and d["trusted_header"].lower() != "cf-connecting-ip":
+        raise ApiError("with 'Behind Cloudflare' the client IP comes from CF-Connecting-IP - set the trusted proxies' "
+                       "header to CF-Connecting-IP, or turn one of them off")
+
+
 def validate_domain(data, others, cfg, did=None, check_rules=True):
     if not isinstance(data, dict):
         raise ApiError("domain must be an object")
@@ -918,6 +988,7 @@ def validate_domain(data, others, cfg, did=None, check_rules=True):
             except ValueError:
                 raise ApiError("invalid source '%s' (IP or CIDR)" % c)
     d["enabled"] = bool(data.get("enabled", True))
+    validate_client_ip(d, data)
 
     taken = {n: o for o in others for n in _names(o)}
     for n in _names(d):
@@ -1107,6 +1178,28 @@ def is_cloudflare(ip):
     return any(a in ipaddress.ip_network(n) for n in CLOUDFLARE_NETS)
 
 
+def client_ip_headers(d):
+    """$remote_addr is the visitor (after real_ip, when proxies in front are trusted)."""
+    out = ["        proxy_set_header X-Real-IP $remote_addr;"] if d.get("ip_real", True) else \
+        ["        proxy_set_header X-Real-IP \"\";"]  # don't pass on a value the client sent
+    xff = d.get("ip_xff", "append")
+    out.append("        proxy_set_header X-Forwarded-For %s;" % {"append": "$proxy_add_x_forwarded_for",
+                                                                 "replace": "$remote_addr", "off": '""'}[xff])
+    if d.get("ip_header"):
+        out.append("        proxy_set_header %s $remote_addr;" % d["ip_header"])
+    return out
+
+
+def nginx_real_ip(d):
+    """real_ip lines for a server block: Cloudflare and / or the domain's trusted proxies."""
+    nets = (CLOUDFLARE_NETS if d.get("cloudflare") else []) + d.get("trusted_proxies", [])
+    if not nets:
+        return []
+    header = "CF-Connecting-IP" if d.get("cloudflare") else d.get("trusted_header") or "X-Forwarded-For"
+    return ["    set_real_ip_from %s;" % n for n in nets] + ["    real_ip_header %s;" % header] + \
+        (["    real_ip_recursive on;"] if d.get("trusted_proxies") else [])
+
+
 def nginx_proxy_block(d, tls=False):
     up = "%s://%s:%d" % ("https" if d["upstream_https"] else "http", d["ip"], d["port"])
     lines = ["    client_max_body_size %s;" % d["max_body"], "", "    location / {"]
@@ -1115,8 +1208,7 @@ def nginx_proxy_block(d, tls=False):
         "        proxy_pass %s;" % up,
         "        proxy_http_version 1.1;",
         "        proxy_set_header Host $host;",
-        "        proxy_set_header X-Real-IP $remote_addr;",
-        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+    ] + client_ip_headers(d) + [
         "        proxy_set_header X-Forwarded-Proto $scheme;",
         "        proxy_set_header X-Forwarded-Host $host;",
         "        proxy_set_header Upgrade $http_upgrade;",
@@ -1158,8 +1250,7 @@ def build_nginx(cfg):
         crt, key = cert_paths(cfg, cname) if tls else (None, None)
         ssl = ["    ssl_certificate %s;" % crt, "    ssl_certificate_key %s;" % key, "    ssl_protocols TLSv1.2 TLSv1.3;",
                "    ssl_session_cache shared:pvegw_ssl:10m;", "    ssl_session_timeout 1d;"] if tls else []
-        realip = (["    set_real_ip_from %s;" % n for n in CLOUDFLARE_NETS] +
-                  ["    real_ip_header CF-Connecting-IP;"]) if d.get("cloudflare") else []
+        realip = nginx_real_ip(d)
         redirect_aliases = d.get("alias_redirect") and d["aliases"]
         names = d["domain"] if redirect_aliases else " ".join(_names(d))
         out += ["", "# %s -> %s:%d  (id %s)" % (d["domain"], d["ip"], d["port"], d["id"]),
@@ -1182,6 +1273,30 @@ def build_nginx(cfg):
     return "\n".join(out) + "\n"
 
 
+def build_nginx_stream(cfg):
+    """stream {} for PROXY-protocol port rules, or None when there are none (the file is then removed)."""
+    rules = proxy_rules(cfg)
+    if not rules:
+        return None
+    out = ["# Generated by pve-gateway %s - do not edit, changes are overwritten." % VERSION,
+           "# Port rules with client IP mode \"PROXY protocol\"; manage them in the pve-gateway web UI.", "", "stream {"]
+    for r in rules:
+        ea, eb = parse_ports(r["ext_port"])
+        port = r["int_port"] or ("$server_port" if ea != eb else str(ea))
+        out += ["    # %s %s -> %s:%s  (id %s)" % (r["name"] or "-", r["ext_port"], r["ip"], port, r["id"]),
+                "    server {", "        listen %s;" % (str(ea) if ea == eb else "%d-%d" % (ea, eb))]
+        if r["source"]:
+            out += ["        allow %s;" % r["source"], "        deny all;"]
+        out += ["        proxy_pass %s:%s;" % (r["ip"], port), "        proxy_protocol on;",
+                "        proxy_connect_timeout 10s;", "        proxy_timeout 1h;", "    }"]
+    return "\n".join(out + ["}"]) + "\n"
+
+
+def nginx_stream_path(cfg):
+    p = cfg.get("nginx_stream_conf") or DEFAULTS["nginx_stream_conf"]
+    return MOCK.path_for(p) if MOCK else p
+
+
 def nginx_installed():
     return sh(["nginx", "-v"])[0] == 0
 
@@ -1195,47 +1310,69 @@ def nginx_conf_path(cfg):
     return MOCK.path_for(cfg["nginx_conf"]) if MOCK else cfg["nginx_conf"]
 
 
+def _write_file(path, text):
+    """Atomic write; text None removes the file."""
+    if text is None:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+
+
 def apply_nginx(cfg=None):
-    """Write the nginx config, validate with `nginx -t` (rolling back on failure), reload. Returns error or None."""
+    """Write the nginx config (domains + PROXY-protocol port rules), validate with `nginx -t` (rolling back on
+    failure), reload. Returns error or None."""
     with LOCK:
         cfg = cfg or STATE["cfg"]
-        path = nginx_conf_path(cfg)
+        path, spath = nginx_conf_path(cfg), nginx_stream_path(cfg)
         active = [d for d in cfg["domains"] if d["enabled"]]
-        if not active and not os.path.exists(path):
-            return None  # domains never used: don't require nginx
+        streams = proxy_rules(cfg)
+        if not active and not streams and not os.path.exists(path) and not os.path.exists(spath):
+            return None  # domains / PROXY rules never used: don't require nginx
         if not nginx_installed():
+            if not active and not streams:
+                return None
             NGINX["last_error"] = "nginx is not installed - run: apt install nginx" + (
                 " certbot" if any(d["tls"] != "none" for d in active) else "")
             return NGINX["last_error"]
-        conf = build_nginx(cfg)
+        files = [(path, build_nginx(cfg)), (spath, build_nginx_stream(cfg))]
         if DRY_RUN:
-            log("[dry-run] would write %s:\n%s" % (path, conf.rstrip()))
+            for p, text in files:
+                log("[dry-run] would %s %s%s" % ("remove" if text is None else "write", p,
+                                                ":\n" + text.rstrip() if text else ""))
             return None
+        old = {}
+        for p, _ in files:
+            try:
+                with open(p) as f:
+                    old[p] = f.read()
+            except OSError:
+                old[p] = None
+
+        def restore():
+            for p, _ in files:
+                try:
+                    _write_file(p, old[p])
+                except OSError as e:
+                    log("cannot restore %s: %s" % (p, e), "error")
         try:
-            with open(path) as f:
-                old = f.read()
-        except OSError:
-            old = None
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
             os.makedirs(os.path.join(MOCK.path_for(cfg["acme_webroot"]) if MOCK else cfg["acme_webroot"],
                                      ".well-known", "acme-challenge"), exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                f.write(conf)
-            os.replace(tmp, path)
+            for p, text in files:
+                _write_file(p, text)
         except OSError as e:
-            NGINX["last_error"] = "cannot write %s: %s" % (path, e)
+            restore()
+            NGINX["last_error"] = "cannot write %s: %s" % (e.filename or path, e.strerror or e)
             log(NGINX["last_error"], "error")
             return NGINX["last_error"]
         rc, out = run(["nginx", "-t"])
         if rc != 0:
-            if old is None:
-                os.remove(path)
-            else:
-                with open(path, "w") as f:
-                    f.write(old)
-            NGINX["last_error"] = "nginx config test failed (previous config restored): " + out
+            restore()
+            hint = " - run: apt install libnginx-mod-stream" if 'unknown directive "stream"' in out else ""
+            NGINX["last_error"] = "nginx config test failed (previous config restored): " + out + hint
             log(NGINX["last_error"], "error")
             return NGINX["last_error"]
         rc, out = run(["systemctl", "reload-or-restart", "nginx"])
@@ -1244,7 +1381,8 @@ def apply_nginx(cfg=None):
             log(NGINX["last_error"], "error")
             return NGINX["last_error"]
         NGINX["last_apply"], NGINX["last_error"] = time.time(), None
-        log("nginx: applied %d domain(s)" % len(active))
+        log("nginx: applied %d domain(s)%s" % (len(active), ", %d PROXY protocol port rule(s)" % len(streams)
+                                                if streams else ""))
         return None
 
 
@@ -1607,10 +1745,13 @@ def nginx_sites(cfg):
     if rc != 0:
         return None
     parts = re.split(r"^# configuration file (.+?):\s*$", out, flags=re.M)
-    loaded, sites = False, []
+    loaded, stream, sites = False, False, []
     for name, text in zip(parts[1::2], parts[2::2]):
         if name.strip() == cfg["nginx_conf"]:
             loaded = True
+            continue
+        if name.strip() == cfg.get("nginx_stream_conf"):
+            stream = True
             continue
         text = re.sub(r"#[^\n]*", "", text)
         for m in re.finditer(r"(?<![\w-])server\s*\{", text):
@@ -1626,7 +1767,7 @@ def nginx_sites(cfg):
             names = " ".join(re.findall(r"(?:^|;|\n)\s*server_name\s+([^;]+);", top)).split()
             sites.append({"file": name.strip(), "listen": listens, "names": names,
                           "default": any("default_server" in x for x in listens)})
-    return {"loaded": loaded, "sites": sites}
+    return {"loaded": loaded, "stream_loaded": stream, "sites": sites}
 
 
 def explicit_listens(sites):
@@ -1784,6 +1925,14 @@ def test_domain(d):
     except OSError:
         present = False
     add("in nginx config", _st(present or not d["enabled"]), cfg["nginx_conf"])
+    sent = [h for h, on in (("X-Real-IP", d.get("ip_real", True)), ("X-Forwarded-For", d.get("ip_xff", "append") != "off"),
+                            (d.get("ip_header"), bool(d.get("ip_header")))) if on]
+    detail = ("sent to the guest as %s" % ", ".join(sent)) if sent else "not sent to the guest"
+    if d.get("ip_xff") == "replace":
+        detail += " (X-Forwarded-For holds only the client IP)"
+    if d.get("trusted_proxies"):
+        detail += "; taken from %s when the request comes from %s" % (d["trusted_header"], ", ".join(d["trusted_proxies"]))
+    add("client IP", "info", detail)
     if d["enabled"] and out.strip() == "active":
         problems = acme_preflight(cfg, _names(d))
         add("reachable like Let's Encrypt", _st(not problems), "; ".join(problems) + other_sites_hint(cfg, _names(d)) if problems else
@@ -1828,6 +1977,44 @@ def test_domain(d):
 
 def _st(ok, warn=False):
     return "ok" if ok else ("warn" if warn else "fail")
+
+
+def nginx_listens(port):
+    """Who listens on TCP <port> on the host: "nginx", another program's name, or None."""
+    rc, out = sh(["ss", "-Hlntp"])
+    who = None
+    for line in out.splitlines() if rc == 0 else []:
+        if re.search(r":%d\s" % port, line + " "):
+            if "nginx" in line:
+                return "nginx"
+            m = re.search(r'\(\("([^"]+)"', line)
+            who = m.group(1) if m else "another program"
+    return who
+
+
+def stream_checks(cfg, rules=None):
+    """[(name, status, detail)] for PROXY-protocol port rules: nginx, its stream module and the listening ports."""
+    rules = proxy_rules(cfg) if rules is None else rules
+    if not rules:
+        return []
+    res = []
+    rc, out = sh(["nginx", "-v"])
+    res.append(("nginx installed", _st(rc == 0), out if rc == 0 else "apt install nginx libnginx-mod-stream"))
+    if rc != 0:
+        return res
+    sites = nginx_sites(cfg)
+    if sites is not None:
+        res.append(("nginx loads the stream config", _st(sites["stream_loaded"]),
+                    cfg["nginx_stream_conf"] if sites["stream_loaded"] else
+                    "no - nginx.conf must include /etc/nginx/modules-enabled/*.conf in the main context"))
+    for r in rules:
+        ea, eb = parse_ports(r["ext_port"])
+        who = nginx_listens(ea)
+        res.append(("nginx listens on %d" % ea, "ok" if who == "nginx" else "fail",
+                    "PROXY protocol to %s" % r["ip"] if who == "nginx" else
+                    "port %d is used by %s - free it or pick another port" % (ea, who) if who else
+                    "nothing listens - check Debug > nginx last apply and: journalctl -u nginx"))
+    return res
 
 
 def host_listeners():
@@ -2043,7 +2230,7 @@ def checks():
             % cfg.get("port", 8099))
     listeners = host_listeners()
     for r in cfg["rules"]:
-        if not r["enabled"]:
+        if not r["enabled"] or rule_client_ip(r) == "proxy":  # nginx listens there on purpose
             continue
         ea, eb = parse_ports(r["ext_port"])
         for p, port in sorted(listeners):
@@ -2076,6 +2263,9 @@ def checks():
             m = re.search(r":(80|443)\s", line)
             if m and "nginx" not in line:
                 add("port %s" % m.group(1), "warn", "used by another program, not nginx: " + line.split()[-1])
+    for name, status, detail in stream_checks(cfg):
+        add(name, status, detail)
+    if cfg["domains"] or os.path.exists(nginx_conf_path(cfg)):
         le = [d for d in cfg["domains"] if d["tls"] == "letsencrypt" and d["enabled"]]
         wcs = [w for w in cfg.get("wildcards", []) if w["enabled"]]
         if le or wcs:
@@ -2142,6 +2332,8 @@ def sections():
         {"title": "iptables -t nat POSTROUTING", "text": sh(["iptables", "-t", "nat", "-L", "POSTROUTING", "-n", "-v", "--line-numbers"])[1]},
         {"title": "iptables FORWARD", "text": sh(["iptables", "-L", "FORWARD", "-n", "-v", "--line-numbers"])[1]},
         {"title": "Tracked connections to forwarded guests", "text": conntrack_lines(sorted({r["ip"] for r in cfg["rules"] if r["enabled"]}))},
+    ] + ([{"title": "nginx stream config " + cfg["nginx_stream_conf"],
+           "text": _read(nginx_stream_path(cfg)) or "(not written yet)"}] if proxy_rules(cfg) else []) + [
         {"title": "Interfaces", "text": sh(["ip", "-4", "-br", "addr"])[1]},
         {"title": "Routes", "text": sh(["ip", "-4", "route"])[1]},
         {"title": "Listening sockets on host", "text": sh(["ss", "-Hlntup"])[1]},
@@ -2219,11 +2411,16 @@ def test_rule(r):
     ip = r["ip"]
     ea, _ = parse_ports(r["ext_port"])
     port = int(r["int_port"] or ea)
+    mode = rule_client_ip(r)
     add("rule enabled", _st(r["enabled"]), "" if r["enabled"] else "rule is disabled - nothing is forwarded")
     n = loaded_rule_ids().get(r["id"], 0)
     add("loaded in iptables", _st(n == len(protos(r["proto"])) or not r["enabled"]),
-        "DNAT entries in %s: %d" % (CH_PRE, n))
-    add("ip_forward", _st(ip_forward_on()))
+        "%s entries in %s: %d" % ("ACCEPT" if mode == "proxy" else "DNAT", CH_PRE, n))
+    if mode == "proxy":
+        for name, status, detail in stream_checks(STATE["cfg"], [r] if r["enabled"] else []):
+            add(name, status, detail)
+    else:
+        add("ip_forward", _st(ip_forward_on()))
 
     rc, out = sh(["ip", "route", "get", ip])
     src = re.search(r"\bsrc (\S+)", out or "")
@@ -2231,9 +2428,11 @@ def test_rule(r):
         add("route to guest", "fail", out)
     else:
         via = " via " in out
-        add("route to guest", "warn" if via and not r["masq"] else "ok", out.splitlines()[0].strip() + (
-            "" if not via else "\nguest is behind a gateway - Masquerade is on, so replies come back through this host"
-            if r["masq"] else "\nguest is behind a gateway, not on a local bridge - replies may bypass this host; try Masquerade"))
+        add("route to guest", "warn" if via and mode in ("keep", "private") else "ok", out.splitlines()[0].strip() + (
+            "" if not via else "\nguest is behind a gateway - nginx connects from this host, so replies come back here"
+            if mode == "proxy" else "\nguest is behind a gateway - Masquerade is on, so replies come back through this host"
+            if mode == "all" else "\nguest is behind a gateway, not on a local bridge - replies to internet clients may "
+            "bypass this host; set Client IP to Masquerade all or PROXY protocol"))
 
     rc, out = sh(["ping", "-c", "1", "-W", "1", ip], timeout=5)
     add("ping guest", _st(rc == 0, warn=True),
@@ -2257,9 +2456,17 @@ def test_rule(r):
     add("traffic counter", "info", "%d connection(s), %d bytes matched since rules were loaded" % tuple(c) if c and c[0] else
         "no traffic has hit this rule yet - if tests from outside fail, check that your router / ISP / "
         "cloud firewall sends port %s to this host" % r["ext_port"])
-    if not r["masq"]:
-        add("return path", "info", "without Masquerade the guest's default gateway must be this host%s"
-            % (" (%s)" % src.group(1) if src else ""))
+    gw = " (%s)" % src.group(1) if src else ""
+    add("client IP", "info", {
+        "keep": "the guest sees the client's real IP; its default gateway must be this host%s" % gw,
+        "private": "internet clients keep their real IP (the guest's default gateway must be this host%s); private "
+                   "sources (other guests, LAN, VPN) are masqueraded, so they can use the public IP too" % gw,
+        "all": "Masquerade is on: the guest sees this host's IP%s, not the client's - use PROXY protocol "
+               "(TCP) or Masquerade private sources only to keep it" % gw,
+        "proxy": "the guest sees this host's IP%s as the source; the client IP comes in a PROXY protocol v1 header, "
+                 "so the service must expect it (nginx: listen ... proxy_protocol; HAProxy: accept-proxy; "
+                 "Traefik: proxyProtocol.trustedIPs); connections straight to the guest, without the header, then fail" % gw,
+    }[mode])
     return steps
 
 
@@ -2853,6 +3060,8 @@ def fw_safety(cfg):
     rules += [("ACCEPT", "tcp", [str(cfg.get("port", 8099))], s, "safety: pve-gateway UI") for s in ui_src]
     if owns_web_ports(cfg):
         rules.append(("ACCEPT", "tcp", ["80", "443"], "", "safety: domains (nginx)"))
+    for r in proxy_rules(cfg):  # nginx on this host takes these connections, so they pass INPUT, not FORWARD
+        rules.append(("ACCEPT", "tcp", [r["ext_port"]], r["source"], "safety: PROXY protocol port %s" % r["ext_port"]))
     if os.path.exists("/etc/pve/corosync.conf") and not MOCK:
         rules.append(("ACCEPT", "udp", ["5405-5412"], "", "safety: cluster (corosync)"))
     for t in cfg.get("wireguard", {}).get("tunnels", []):
@@ -3824,7 +4033,7 @@ BACKUP_NAME_RE = re.compile(r"^pve-gateway-\d{8}-\d{6}(?:-[a-z0-9-]{1,24})?\.tar
 BACKUP_MAX = 30 * 1024 * 1024  # uploaded / unpacked size limit
 BACKUP_KEEP = {"daily": 7, "manual": 20, "pre-restore": 10, "upload": 10}
 # which config keys each restorable part covers; host-specific keys (listen, port, cert, key, nginx_conf,
-# acme_webroot, letsencrypt_dir, protected_ports) are never taken from a backup
+# nginx_stream_conf, acme_webroot, letsencrypt_dir, protected_ports) are never taken from a backup
 BACKUP_PARTS = {
     "rules": ("Port rules", ["rules", "forward_accept"]),
     "domains": ("Domains and wildcard certificates", ["domains", "wildcards", "acme_email", "nginx_ipv6"]),
@@ -4714,8 +4923,16 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError("method not allowed", 405)
             new = dict(cfg, rules=rules)
             err = apply_rules(new)  # atomic: on failure the old rules stay in place
+            if not err and (proxy_rules(new) or proxy_rules(cfg)):
+                err = apply_nginx(new)  # PROXY protocol rules live in nginx (old config restored on failure)
+            if not err and new["firewall"]["enabled"] and proxy_rules(new) != proxy_rules(cfg):
+                err = apply_fw(new)  # nginx's ports must be open in the host firewall
             if err:
                 apply_rules(cfg)
+                if proxy_rules(new) or proxy_rules(cfg):
+                    apply_nginx(cfg)
+                    if new["firewall"]["enabled"]:
+                        apply_fw(cfg)
                 raise ApiError(err, 500)
             save_config(new)
             STATE["cfg"] = new
@@ -5352,7 +5569,6 @@ I18N = {
     "DHCP range {0} contains the gateway {1}": ["Диапазон DHCP {0} содержит шлюз {1}", "DHCP diapazoni {0} shlyuz {1} ni oʻz ichiga oladi"],
     "DHCP range {0}: the start must come before the end": ["Диапазон DHCP {0}: начало должно быть меньше конца", "DHCP diapazoni {0}: boshi oxiridan oldin boʻlishi kerak"],
     "DHCP ranges (start-end, one per line)": ["Диапазоны DHCP (начало-конец, по одному на строку)", "DHCP diapazonlari (boshi-oxiri, har qatorda bittadan)"],
-    "DNAT entries in {0}: {1}": ["Записей DNAT в {0}: {1}", "{0} dagi DNAT yozuvlari: {1}"],
     "DNS = {0}": ["DNS = {0}", "DNS = {0}"],
     "DNS for clients": ["DNS для клиентов", "Mijozlar uchun DNS"],
     "DNS plugin": ["DNS-плагин", "DNS plagin"],
@@ -5545,7 +5761,6 @@ I18N = {
     "MAC must look like bc:24:11:12:34:56 (Proxmox shows it on the guest's network device)": ["MAC должен выглядеть как bc:24:11:12:34:56 (Proxmox показывает его у сетевого устройства гостевой системы)", "MAC bc:24:11:12:34:56 koʻrinishida boʻlishi kerak (Proxmox uni mehmon tizimning tarmoq qurilmasida koʻrsatadi)"],
     "MS SQL": ["MS SQL", "MS SQL"],
     "Mail server": ["Почтовый сервер", "Pochta serveri"],
-    "Masquerade (SNAT) — needed if the guest's gateway is not this host, or to reach it via the public IP from other guests": ["Маскарадинг (SNAT) — нужен, если шлюз гостевой системы не этот хост, или чтобы обращаться к ней по публичному IP из других гостевых систем", "Maskarad (SNAT) — mehmon tizimning shlyuzi bu xost boʻlmasa yoki unga boshqa mehmon tizimlardan ochiq IP orqali murojaat qilish uchun kerak"],
     "Max upload size": ["Макс. размер загрузки", "Maks. yuklash hajmi"],
     "Mock host": ["Mock-хост", "Mock xost"],
     "Mock mode (simulated host): admin / admin": ["Mock-режим (симуляция хоста): admin / admin", "Mock rejimi (simulyatsiya qilingan xost): admin / admin"],
@@ -6040,7 +6255,6 @@ I18N = {
     "guest": ["гость", "mehmon"],
     "guest agent not responding - is qemu-guest-agent running inside the VM?": ["гостевой агент не отвечает - запущен ли qemu-guest-agent внутри ВМ?", "mehmon agenti javob bermayapti - VM ichida qemu-guest-agent ishlayaptimi?"],
     "guest is behind a gateway - Masquerade is on, so replies come back through this host": ["гость находится за шлюзом - Masquerade включён, поэтому ответы возвращаются через этот хост", "mehmon shlyuz ortida - Masquerade yoqilgan, shuning uchun javoblar shu xost orqali qaytadi"],
-    "guest is behind a gateway, not on a local bridge - replies may bypass this host; try Masquerade": ["гость находится за шлюзом, а не на локальном мосту - ответы могут идти в обход этого хоста; попробуйте Masquerade", "mehmon mahalliy koʻprikda emas, shlyuz ortida - javoblar bu xostni chetlab oʻtishi mumkin; Masquerade ni sinab koʻring"],
     "handled by nginx on this host → proxied to guests": ["обрабатывается nginx на этом хосте → проксируется на гостей", "bu xostdagi nginx tomonidan qayta ishlanadi → mehmonlarga proksilanadi"],
     "health checks": ["проверки", "tekshiruvlar"],
     "hook {0}/{1} -> {2}": ["подключение {0}/{1} -> {2}", "ulanish {0}/{1} -> {2}"],
@@ -6273,7 +6487,6 @@ I18N = {
     "resolves to {0} - this host has no public IPv4, so that must be your router forwarding ports 80/443 here": ["указывает на {0} - у этого хоста нет публичного IPv4, значит это должен быть ваш роутер, перенаправляющий сюда порты 80/443", "{0} ga yoʻnaltirilgan - bu xostda ommaviy IPv4 yoʻq, demak bu 80/443 portlarini shu yerga yoʻnaltiruvchi routeringiz boʻlishi kerak"],
     "resolves to {0}, but this host's public IP is {1} - fix the A record, unless a router or proxy in front forwards 80/443 here": ["указывает на {0}, но публичный IP этого хоста - {1} - исправьте A-запись, если только роутер или прокси перед ним не перенаправляет сюда 80/443", "{0} ga yoʻnaltirilgan, lekin bu xostning ommaviy IP manzili {1} - A yozuvini tuzating, agar oldidagi router yoki proksi 80/443 ni shu yerga yoʻnaltirmasa"],
     "restore failed, nothing was changed: {0}": ["восстановление не удалось, ничего не изменено: {0}", "tiklash amalga oshmadi, hech narsa oʻzgarmadi: {0}"],
-    "return path": ["обратный путь", "qaytish yoʻli"],
     "risky ports: LAN": ["опасные порты: LAN", "xavfli portlar: LAN"],
     "risky ports: not from internet": ["опасные порты: не из интернета", "xavfli portlar: internetdan emas"],
     "root@pam\nadmin@pve": ["root@pam\nadmin@pve", "root@pam\nadmin@pve"],
@@ -6413,7 +6626,6 @@ I18N = {
     "wireguard-tools installed": ["wireguard-tools установлен", "wireguard-tools oʻrnatilgan"],
     "wireguard-tools is not installed - click Install first": ["wireguard-tools не установлен - сначала нажмите Установить", "wireguard-tools oʻrnatilmagan - avval Oʻrnatish tugmasini bosing"],
     "wireguard-tools is not installed - click Install or run: apt install wireguard-tools": ["wireguard-tools не установлен - нажмите Установить или выполните: apt install wireguard-tools", "wireguard-tools oʻrnatilmagan - Oʻrnatish tugmasini bosing yoki ishga tushiring: apt install wireguard-tools"],
-    "without Masquerade the guest's default gateway must be this host{0}": ["без Masquerade шлюзом по умолчанию у гостя должен быть этот хост{0}", "Masquerade boʻlmasa, mehmonning standart shlyuzi shu xost boʻlishi kerak{0}"],
     "www.example.com (optional, space separated)": ["www.example.com (необязательно, через пробел)", "www.example.com (ixtiyoriy, boʻsh joy bilan ajratilgan)"],
     "yes": ["да", "ha"],
     "you would be locked out: the backup allows the web UI only from {0}, not from your IP {1}{2}": ["вы потеряете доступ: копия разрешает веб-интерфейс только с {0}, а не с вашего IP {1}{2}", "kirish yopilib qoladi: nusxa veb interfeysga faqat {0} dan ruxsat beradi, sizning IP {1} dan emas{2}"],
@@ -6564,6 +6776,62 @@ I18N = {
     "— pick a guest to fill its IP —": ["— выберите гостя, чтобы подставить его IP —", "— IP manzilini toʻldirish uchun mehmonni tanlang —"],
     "▸ default": ["▸ по умолчанию", "▸ standart"],
     "▾ default": ["▾ по умолчанию", "▾ standart"],
+    "Client IP": ["IP клиента", "Mijoz IP manzili"],
+    "- how the guest learns the visitor's IP address.": ["- как гостевая система узнаёт IP-адрес посетителя.", "- mehmon tizim tashrifchining IP manzilini qanday bilishi."],
+    "append the client IP (standard)": ["добавить IP клиента (стандартно)", "mijoz IP manzilini qoʻshish (standart)"],
+    "only the client IP (can't be faked)": ["только IP клиента (нельзя подделать)", "faqat mijoz IP manzili (soxtalashtirib boʻlmaydi)"],
+    "don't send": ["не отправлять", "yubormaslik"],
+    "Send X-Real-IP": ["Отправлять X-Real-IP", "X-Real-IP yuborish"],
+    "Also send the client IP as": ["Также отправлять IP клиента в заголовке", "Mijoz IP manzilini quyidagi sarlavhada ham yuborish"],
+    "optional, e.g. True-Client-IP": ["необязательно, например True-Client-IP", "ixtiyoriy, masalan True-Client-IP"],
+    "Trusted proxies in front of this host": ["Доверенные прокси перед этим хостом", "Ushbu xost oldidagi ishonchli proksilar"],
+    "optional, e.g. 10.20.0.2 192.0.2.0/24": ["необязательно, например 10.20.0.2 192.0.2.0/24", "ixtiyoriy, masalan 10.20.0.2 192.0.2.0/24"],
+    "Their header with the client IP": ["Их заголовок с IP клиента", "Ulardagi mijoz IP sarlavhasi"],
+    "Requests from these proxies are taken to come from the IP in that header - for the guest, the logs and \"Allowed sources\". Only list proxies you control: anyone else could fake their IP.": ["Запросы от этих прокси считаются пришедшими с IP из этого заголовка - для гостевой системы, журналов и \"Разрешённых источников\". Указывайте только свои прокси: любой другой сможет подделать свой IP.", "Ushbu proksilardan kelgan soʻrovlar shu sarlavhadagi IP dan kelgan deb hisoblanadi - mehmon tizim, jurnallar va \"Ruxsat etilgan manbalar\" uchun. Faqat oʻzingiz boshqaradigan proksilarni kiriting: boshqa har kim oʻz IP manzilini soxtalashtirishi mumkin."],
+    "behind proxy": ["за прокси", "proksi ortida"],
+    "client IP from {0} of {1}": ["IP клиента из {0} от {1}", "{1} ning {0} sarlavhasidan mijoz IP"],
+    "X-Forwarded-For must be append, replace or off": ["X-Forwarded-For: append, replace или off", "X-Forwarded-For: append, replace yoki off boʻlishi kerak"],
+    "extra client IP header: a header name like True-Client-IP or CF-Connecting-IP (not Host, X-Real-IP, X-Forwarded-For ...)": ["дополнительный заголовок с IP клиента: имя заголовка, например True-Client-IP или CF-Connecting-IP (не Host, X-Real-IP, X-Forwarded-For ...)", "qoʻshimcha mijoz IP sarlavhasi: True-Client-IP yoki CF-Connecting-IP kabi sarlavha nomi (Host, X-Real-IP, X-Forwarded-For ... emas)"],
+    "invalid trusted proxy '{0}' (IP or CIDR)": ["неверный доверенный прокси '{0}' (IP или CIDR)", "notoʻgʻri ishonchli proksi '{0}' (IP yoki CIDR)"],
+    "trusting every address would let anyone fake their IP - list only your proxies' IPs": ["доверие всем адресам позволит любому подделать свой IP - укажите только IP своих прокси", "barcha manzillarga ishonish har kimga IP manzilini soxtalashtirish imkonini beradi - faqat proksilaringiz IP manzillarini kiriting"],
+    "header of the trusted proxies: a header name like X-Forwarded-For or X-Real-IP": ["заголовок доверенных прокси: имя заголовка, например X-Forwarded-For или X-Real-IP", "ishonchli proksilar sarlavhasi: X-Forwarded-For yoki X-Real-IP kabi sarlavha nomi"],
+    "with 'Behind Cloudflare' the client IP comes from CF-Connecting-IP - set the trusted proxies' header to CF-Connecting-IP, or turn one of them off": ["с опцией 'За Cloudflare' IP клиента берётся из CF-Connecting-IP - укажите для доверенных прокси заголовок CF-Connecting-IP или выключите одно из двух", "'Cloudflare ortida' yoqilganda mijoz IP CF-Connecting-IP dan olinadi - ishonchli proksilar sarlavhasini CF-Connecting-IP qiling yoki ulardan birini oʻchiring"],
+    "client IP": ["IP клиента", "mijoz IP manzili"],
+    "sent to the guest as {0}": ["передаётся гостевой системе как {0}", "mehmon tizimga {0} sifatida yuboriladi"],
+    "sent to the guest as {0} (X-Forwarded-For holds only the client IP)": ["передаётся гостевой системе как {0} (в X-Forwarded-For только IP клиента)", "mehmon tizimga {0} sifatida yuboriladi (X-Forwarded-For da faqat mijoz IP)"],
+    "sent to the guest as {0}; taken from {1} when the request comes from {2}": ["передаётся гостевой системе как {0}; берётся из {1}, если запрос приходит от {2}", "mehmon tizimga {0} sifatida yuboriladi; soʻrov {2} dan kelsa, {1} dan olinadi"],
+    "sent to the guest as {0} (X-Forwarded-For holds only the client IP); taken from {1} when the request comes from {2}": ["передаётся гостевой системе как {0} (в X-Forwarded-For только IP клиента); берётся из {1}, если запрос приходит от {2}", "mehmon tizimga {0} sifatida yuboriladi (X-Forwarded-For da faqat mijoz IP); soʻrov {2} dan kelsa, {1} dan olinadi"],
+    "not sent to the guest": ["не передаётся гостевой системе", "mehmon tizimga yuborilmaydi"],
+    "not sent to the guest; taken from {0} when the request comes from {1}": ["не передаётся гостевой системе; берётся из {0}, если запрос приходит от {1}", "mehmon tizimga yuborilmaydi; soʻrov {1} dan kelsa, {0} dan olinadi"],
+    # port rules: client IP modes, PROXY protocol
+    "{0} entries in {1}: {2}": ["Записей {0} в {1}: {2}", "{1} dagi {0} yozuvlari: {2}"],
+    "client IP mode must be one of: {0}": ["режим IP клиента должен быть одним из: {0}", "mijoz IP rejimi quyidagilardan biri boʻlishi kerak: {0}"],
+    "PROXY protocol works with TCP only - set the protocol to TCP": ["PROXY protocol работает только с TCP - выберите протокол TCP", "PROXY protocol faqat TCP bilan ishlaydi - protokolni TCP qilib belgilang"],
+    "PROXY protocol rules can't be limited to an interface - leave the interface empty (use the source filter or the firewall)": ["Правила с PROXY protocol нельзя ограничить интерфейсом - оставьте интерфейс пустым (используйте фильтр источника или фаервол)", "PROXY protocol qoidalarini interfeys bilan cheklab boʻlmaydi - interfeysni boʻsh qoldiring (manba filtri yoki fayrvoldan foydalaning)"],
+    "safety: PROXY protocol port {0}": ["безопасность: порт PROXY protocol {0}", "xavfsizlik: PROXY protocol porti {0}"],
+    "nginx loads the stream config": ["nginx загружает конфигурацию stream", "nginx stream konfiguratsiyasini yuklaydi"],
+    "no - nginx.conf must include /etc/nginx/modules-enabled/*.conf in the main context": ["нет - nginx.conf должен включать /etc/nginx/modules-enabled/*.conf в основном контексте", "yoʻq - nginx.conf asosiy kontekstda /etc/nginx/modules-enabled/*.conf ni oʻz ichiga olishi kerak"],
+    "nginx listens on {0}": ["nginx слушает порт {0}", "nginx {0} portini tinglaydi"],
+    "PROXY protocol to {0}": ["PROXY protocol к {0}", "{0} ga PROXY protocol"],
+    "port {0} is used by {1} - free it or pick another port": ["порт {0} занят программой {1} - освободите его или выберите другой порт", "{0} portini {1} egallagan - uni boʻshating yoki boshqa port tanlang"],
+    "nothing listens - check Debug > nginx last apply and: journalctl -u nginx": ["никто не слушает - проверьте Отладка > nginx last apply и: journalctl -u nginx", "hech narsa tinglamayapti - Debug > nginx last apply va journalctl -u nginx ni tekshiring"],
+    "nginx stream config {0}": ["конфигурация nginx stream {0}", "nginx stream konfiguratsiyasi {0}"],
+    "guest is behind a gateway - nginx connects from this host, so replies come back here": ["гость находится за шлюзом - nginx подключается с этого хоста, поэтому ответы возвращаются сюда", "mehmon shlyuz ortida - nginx shu xostdan ulanadi, shuning uchun javoblar bu yerga qaytadi"],
+    "guest is behind a gateway, not on a local bridge - replies to internet clients may bypass this host; set Client IP to Masquerade all or PROXY protocol": ["гость находится за шлюзом, а не на локальном мосту - ответы интернет-клиентам могут идти в обход этого хоста; выберите IP клиента: Masquerade для всех или PROXY protocol", "mehmon mahalliy koʻprikda emas, shlyuz ortida - internet mijozlarga javoblar bu xostni chetlab oʻtishi mumkin; Mijoz IP manzilini Masquerade (hammasi) yoki PROXY protocol qilib belgilang"],
+    "the guest sees the client's real IP; its default gateway must be this host{0}": ["гость видит реальный IP клиента; шлюзом по умолчанию у гостя должен быть этот хост{0}", "mehmon mijozning haqiqiy IP manzilini koʻradi; uning standart shlyuzi shu xost boʻlishi kerak{0}"],
+    "internet clients keep their real IP (the guest's default gateway must be this host{0}); private sources (other guests, LAN, VPN) are masqueraded, so they can use the public IP too": ["интернет-клиенты сохраняют реальный IP (шлюзом по умолчанию у гостя должен быть этот хост{0}); частные адреса (другие гости, LAN, VPN) маскарадятся, поэтому они тоже могут обращаться по публичному IP", "internet mijozlar haqiqiy IP manzilini saqlaydi (mehmonning standart shlyuzi shu xost boʻlishi kerak{0}); xususiy manbalar (boshqa mehmonlar, LAN, VPN) maskarad qilinadi, shuning uchun ular ham ochiq IP dan foydalana oladi"],
+    "Masquerade is on: the guest sees this host's IP{0}, not the client's - use PROXY protocol (TCP) or Masquerade private sources only to keep it": ["Masquerade включён: гость видит IP этого хоста{0}, а не клиента - чтобы сохранить его, используйте PROXY protocol (TCP) или Masquerade только для частных адресов", "Masquerade yoqilgan: mehmon mijozniki emas, shu xostning IP manzilini{0} koʻradi - uni saqlash uchun PROXY protocol (TCP) yoki faqat xususiy manbalar uchun Masquerade dan foydalaning"],
+    "the guest sees this host's IP{0} as the source; the client IP comes in a PROXY protocol v1 header, so the service must expect it (nginx: listen ... proxy_protocol; HAProxy: accept-proxy; Traefik: proxyProtocol.trustedIPs); connections straight to the guest, without the header, then fail": ["гость видит IP этого хоста{0} как источник; IP клиента передаётся в заголовке PROXY protocol v1, поэтому сервис должен его ожидать (nginx: listen ... proxy_protocol; HAProxy: accept-proxy; Traefik: proxyProtocol.trustedIPs); прямые подключения к гостю без заголовка тогда не работают", "mehmon manba sifatida shu xostning IP manzilini{0} koʻradi; mijoz IP manzili PROXY protocol v1 sarlavhasida keladi, shuning uchun xizmat uni kutishi kerak (nginx: listen ... proxy_protocol; HAProxy: accept-proxy; Traefik: proxyProtocol.trustedIPs); mehmonga sarlavhasiz toʻgʻridan-toʻgʻri ulanishlar unda ishlamaydi"],
+    "Keep the client IP (DNAT only)": ["Сохранять IP клиента (только DNAT)", "Mijoz IP manzilini saqlash (faqat DNAT)"],
+    "Masquerade private sources only (hairpin)": ["Masquerade только для частных адресов (hairpin)", "Masquerade faqat xususiy manbalar uchun (hairpin)"],
+    "Masquerade all (SNAT) — guest sees this host": ["Masquerade для всех (SNAT) — гость видит этот хост", "Masquerade hammasi uchun (SNAT) — mehmon shu xostni koʻradi"],
+    "PROXY protocol (TCP, via nginx)": ["PROXY protocol (TCP, через nginx)", "PROXY protocol (TCP, nginx orqali)"],
+    "masquerade private sources only": ["masquerade только для частных адресов", "masquerade faqat xususiy manbalar uchun"],
+    "PROXY protocol": ["PROXY protocol", "PROXY protocol"],
+    "The guest sees the real client IP. Its default gateway must be this host, and other guests can't reach it via the public IP.": ["Гость видит реальный IP клиента. Его шлюзом по умолчанию должен быть этот хост, а другие гости не смогут обратиться к нему по публичному IP.", "Mehmon mijozning haqiqiy IP manzilini koʻradi. Uning standart shlyuzi shu xost boʻlishi kerak, boshqa mehmonlar esa unga ochiq IP orqali murojaat qila olmaydi."],
+    "Internet clients keep their real IP (the guest's gateway must be this host). Private sources - other guests, LAN, VPN - are masqueraded, so they can reach it via the public IP too.": ["Интернет-клиенты сохраняют реальный IP (шлюзом гостя должен быть этот хост). Частные адреса - другие гости, LAN, VPN - маскарадятся, поэтому тоже могут обращаться к нему по публичному IP.", "Internet mijozlar haqiqiy IP manzilini saqlaydi (mehmonning shlyuzi shu xost boʻlishi kerak). Xususiy manbalar - boshqa mehmonlar, LAN, VPN - maskarad qilinadi, shuning uchun ular ham unga ochiq IP orqali murojaat qila oladi."],
+    "The guest sees this host's IP instead of the client's. Works when the guest's gateway is not this host.": ["Гость видит IP этого хоста вместо IP клиента. Работает, когда шлюз гостя - не этот хост.", "Mehmon mijozniki oʻrniga shu xostning IP manzilini koʻradi. Mehmonning shlyuzi bu xost boʻlmasa ham ishlaydi."],
+    "nginx on this host forwards the connection and sends the client IP in a PROXY protocol v1 header. Works with any gateway, but the guest's service must accept PROXY protocol (nginx: listen ... proxy_protocol; HAProxy: accept-proxy). TCP only, needs nginx.": ["nginx на этом хосте пересылает соединение и передаёт IP клиента в заголовке PROXY protocol v1. Работает с любым шлюзом, но сервис гостя должен принимать PROXY protocol (nginx: listen ... proxy_protocol; HAProxy: accept-proxy). Только TCP, нужен nginx.", "Shu xostdagi nginx ulanishni uzatadi va mijoz IP manzilini PROXY protocol v1 sarlavhasida yuboradi. Istalgan shlyuz bilan ishlaydi, lekin mehmon xizmati PROXY protocol ni qabul qilishi kerak (nginx: listen ... proxy_protocol; HAProxy: accept-proxy). Faqat TCP, nginx kerak."],
 }
 
 
@@ -6871,6 +7139,15 @@ INDEX_HTML = r"""<!doctype html>
       <label class="check wide tls-on"><input type="checkbox" name="hsts"> HSTS: browsers insist on HTTPS for this domain for 180 days</label>
       <label class="check wide"><input type="checkbox" name="headers" checked> Security headers (nosniff, same-origin framing, referrer policy)</label>
       <label class="check wide"><input type="checkbox" name="cloudflare"> Behind the Cloudflare proxy (orange cloud): pass the real visitor IP to the guest and to "Allowed sources"</label>
+      <p class="hint wide"><b>Client IP</b> - how the guest learns the visitor's IP address.</p>
+      <label>X-Forwarded-For<select name="ip_xff"><option value="append">append the client IP (standard)</option>
+        <option value="replace">only the client IP (can't be faked)</option><option value="off">don't send</option></select></label>
+      <label class="check"><input type="checkbox" name="ip_real" checked> Send X-Real-IP</label>
+      <label>Also send the client IP as<input name="ip_header" placeholder="optional, e.g. True-Client-IP" spellcheck="false" autocomplete="off"></label>
+      <label>Trusted proxies in front of this host<input name="trusted_proxies" placeholder="optional, e.g. 10.20.0.2 192.0.2.0/24" spellcheck="false" autocomplete="off"></label>
+      <label class="proxy-only">Their header with the client IP<input name="trusted_header" placeholder="X-Forwarded-For" spellcheck="false" autocomplete="off"></label>
+      <p class="hint wide proxy-only">Requests from these proxies are taken to come from the IP in that header - for the guest, the logs and
+        "Allowed sources". Only list proxies you control: anyone else could fake their IP.</p>
       <label>Max upload size<input name="max_body" value="100m" placeholder="100m, 2g, 0 = unlimited"></label>
       <label>Allowed sources<input name="source" placeholder="anyone (or 203.0.113.0/24 …)"></label>
       <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled</label>
@@ -7085,7 +7362,13 @@ INDEX_HTML = r"""<!doctype html>
       <p class="hint wide ip-hint" hidden></p>
       <label>Allowed source<input name="source" placeholder="any (or 203.0.113.0/24)"></label>
       <label>Incoming interface<select name="iface"><option value="">any</option></select></label>
-      <label class="check wide"><input type="checkbox" name="masq"> Masquerade (SNAT) &mdash; needed if the guest's gateway is not this host, or to reach it via the public IP from other guests</label>
+      <label class="wide">Client IP<select name="client_ip">
+        <option value="keep">Keep the client IP (DNAT only)</option>
+        <option value="private">Masquerade private sources only (hairpin)</option>
+        <option value="all">Masquerade all (SNAT) &mdash; guest sees this host</option>
+        <option value="proxy">PROXY protocol (TCP, via nginx)</option>
+      </select></label>
+      <p class="hint wide ci-hint"></p>
       <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled</label>
     </div>
     <p id="formErr" class="err"></p>
@@ -7474,7 +7757,8 @@ function ruleRow(r) {
       el('td', {}, el('span', {class: 'tag', textContent: r.proto === 'both' ? 'tcp+udp' : r.proto})),
       el('td', {class: 'mono', textContent: r.ext_port}),
       el('td', {class: 'arrow', textContent: '→'}),
-      el('td', {class: 'mono', textContent: r.ip + ':' + (r.int_port || r.ext_port) + (r.masq ? ' ⇄' : ''), title: r.masq ? 'masquerade on' : ''}),
+      el('td', {class: 'mono', textContent: r.ip + ':' + (r.int_port || r.ext_port) + ({all: ' ⇄', private: ' ⇄', proxy: ' ⓟ'}[r.client_ip] || ''),
+        title: {all: 'masquerade on', private: 'masquerade private sources only', proxy: 'PROXY protocol'}[r.client_ip] || ''}),
       el('td', {class: 'mono', textContent: r.source || 'any'}),
       el('td', {class: 'mono', textContent: r.iface || 'any'}),
       el('td', {class: 'num', textContent: c ? c[0] + ' · ' + fmtBytes(c[1]) : '—', title: 'new connections · bytes'}),
@@ -7537,11 +7821,22 @@ function openDlg(r, group) {
   for (const k of ['name', 'proto', 'ext_port', 'ip', 'int_port', 'source', 'iface']) f[k].value = r[k] || '';
   fillGroups('#ruleGroups', S.rules); f.group.value = r.id ? (r.group === 'default' ? '' : r.group || '') : group && group !== 'default' ? group : '';
   if (r.iface && !S.ifaces.includes(r.iface)) iface.append(el('option', {value: r.iface, textContent: r.iface, selected: true}));
-  f.masq.checked = !!r.masq; f.enabled.checked = r.enabled !== false;
+  f.client_ip.value = r.client_ip || (r.masq ? 'all' : 'keep'); f.enabled.checked = r.enabled !== false;
+  ciHint(f);
   $('#dlg').showModal();
   (r.id ? f.name : f.ext_port).focus();
   fillGuests();
 }
+
+// What the guest sees as the source with each client IP mode
+const CI_HINTS = {
+  keep: "The guest sees the real client IP. Its default gateway must be this host, and other guests can't reach it via the public IP.",
+  private: "Internet clients keep their real IP (the guest's gateway must be this host). Private sources - other guests, LAN, VPN - are masqueraded, so they can reach it via the public IP too.",
+  all: "The guest sees this host's IP instead of the client's. Works when the guest's gateway is not this host.",
+  proxy: "nginx on this host forwards the connection and sends the client IP in a PROXY protocol v1 header. Works with any gateway, but the guest's service must accept PROXY protocol (nginx: listen ... proxy_protocol; HAProxy: accept-proxy). TCP only, needs nginx.",
+};
+function ciHint(f) { f.querySelector('.ci-hint').textContent = CI_HINTS[f.client_ip.value] || ''; }
+$('#ruleForm').client_ip.addEventListener('change', () => ciHint($('#ruleForm')));
 
 // Picking a guest fills its IP; for a guest whose IP wasn't detected, focus the field and say why.
 function pickGuest(f, setName) {
@@ -7562,7 +7857,7 @@ $('#ruleForm').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, d = {};
   for (const k of ['name', 'proto', 'ext_port', 'ip', 'int_port', 'source', 'iface', 'group']) d[k] = f[k].value.trim();
-  d.masq = f.masq.checked; d.enabled = f.enabled.checked;
+  d.client_ip = f.client_ip.value; d.enabled = f.enabled.checked;
   if (!await ask((editing ? 'Save changes to rule ' : 'Create rule ') + '"' + (d.name || d.ext_port) + '"?',
     (d.proto === 'both' ? 'TCP+UDP' : d.proto.toUpperCase()) + ' ' + d.ext_port + ' → ' + d.ip + (d.int_port ? ':' + d.int_port : '') +
     (d.enabled ? '. iptables is updated right away.' : ' (disabled).') + ' Group: ' + (d.group || 'default') + '.', editing ? 'Save' : 'Create')) return;
@@ -7677,8 +7972,9 @@ function domainRow(d) {
       el('td', {class: 'names'}, el('a', {href: (d.tls !== 'none' ? 'https://' : 'http://') + d.domain, target: '_blank', rel: 'noopener', textContent: d.domain}),
         d.locked ? el('span', {class: 'lock-mark', textContent: ' 🔒', title: 'locked'}) : null,
         ...d.aliases.map(a => el('span', {class: 'alias', textContent: d.alias_redirect ? '↳ ' + a + ' → 301' : a})),
-        (d.cloudflare || d.hsts) ? el('span', {class: 'alias'},
+        (d.cloudflare || d.hsts || (d.trusted_proxies && d.trusted_proxies.length)) ? el('span', {class: 'alias'},
           d.cloudflare ? el('span', {class: 'tag', textContent: 'cloudflare'}) : null, ' ',
+          d.trusted_proxies && d.trusted_proxies.length ? el('span', {class: 'tag', title: 'client IP from ' + d.trusted_header + ' of ' + d.trusted_proxies.join(', '), textContent: 'behind proxy'}) : null, ' ',
           d.hsts ? el('span', {class: 'tag', textContent: 'hsts'}) : null) : null),
       el('td', {class: 'arrow', textContent: '→'}),
       el('td', {class: 'mono', textContent: (d.upstream_https ? 'https://' : 'http://') + d.ip + ':' + d.port}),
@@ -7729,6 +8025,9 @@ function openDomDlg(d, group) {
   f.ip.value = d.ip || ''; f.port.value = d.port || 80; f.upstream_https.checked = !!d.upstream_https;
   f.tls.value = d.tls; f.force_https.checked = d.force_https !== false; f.max_body.value = d.max_body || '100m';
   f.source.value = (d.source || []).join(' '); f.enabled.checked = d.enabled !== false;
+  f.ip_xff.value = d.ip_xff || 'append'; f.ip_real.checked = d.ip_real !== false; f.ip_header.value = d.ip_header || '';
+  f.trusted_proxies.value = (d.trusted_proxies || []).join(' ');
+  f.trusted_header.value = d.trusted_header && d.trusted_header !== 'X-Forwarded-For' ? d.trusted_header : ''; proxyFields();
   f.acme_email.value = S.acme_email || '';
   toggleLe();
   $('#domDlg').showModal();
@@ -7756,11 +8055,15 @@ $('#domForm').upstream_https.addEventListener('change', e => {
   const p = $('#domForm').port; if (e.target.checked && p.value === '80') p.value = '443'; else if (!e.target.checked && p.value === '443') p.value = '80';
 });
 $('#domForm').guest.addEventListener('change', () => pickGuest($('#domForm'), false));
+function proxyFields() { for (const x of document.querySelectorAll('#domForm .proxy-only')) x.hidden = !$('#domForm').trusted_proxies.value.trim(); }
+$('#domForm').trusted_proxies.addEventListener('input', proxyFields);
 $('#domForm').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, d = {};
   for (const k of ['domain', 'aliases', 'ip', 'port', 'tls', 'max_body', 'source', 'acme_email', 'group']) d[k] = f[k].value.trim();
   d.upstream_https = f.upstream_https.checked; d.force_https = f.force_https.checked; d.enabled = f.enabled.checked;
+  d.ip_xff = f.ip_xff.value; d.ip_real = f.ip_real.checked; d.ip_header = f.ip_header.value.trim();
+  d.trusted_proxies = f.trusted_proxies.value.trim(); d.trusted_header = f.trusted_header.value.trim();
   for (const k of ['alias_redirect', 'hsts', 'headers', 'cloudflare']) d[k] = f[k].checked;
   if (!await ask((editingDom ? 'Save changes to ' : 'Add domain ') + d.domain + '?', d.domain + ' → ' + (d.upstream_https ? 'https://' : 'http://') +
     d.ip + ':' + d.port + '. nginx is reloaded' + (d.tls === 'letsencrypt' && d.enabled && !editingDom ? ' and a certificate is requested if needed.' : '.'), editingDom ? 'Save' : 'Add')) return;
@@ -8906,7 +9209,8 @@ local development (macOS etc.):
             for r in cfg["rules"]:
                 c = cnt.get(r["id"])
                 print(fmt % (r["id"], "yes" if r["enabled"] else "no", r["proto"], r["ext_port"],
-                             "%s:%s%s" % (r["ip"], r["int_port"] or r["ext_port"], " (masq)" if r["masq"] else ""),
+                             "%s:%s%s" % (r["ip"], r["int_port"] or r["ext_port"],
+                                          {"all": " (masq)", "private": " (masq private)", "proxy": " (PROXY)"}.get(rule_client_ip(r), "")),
                              r["source"] or "any", r["iface"] or "any",
                              "%d pkts / %d B" % tuple(c) if c else "-") + ("   " + r["name"] if r["name"] else "")
                       + ("   [%s]" % r["group"] if r["group"] != DEFAULT_GROUP else ""))

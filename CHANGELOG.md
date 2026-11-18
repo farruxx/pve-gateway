@@ -4,6 +4,21 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.13.0 - 2026-11-03
+- Domains: Client IP settings. X-Forwarded-For can be appended (as before), replaced with only the client IP (clients
+  can't fake earlier hops) or left out; X-Real-IP can be turned off (a client-sent value is then dropped, not passed
+  on); the IP can also go in an extra header such as True-Client-IP. Defaults are unchanged.
+- Trusted proxies per domain: when another proxy / load balancer forwards to this host, list its IPs and header
+  (default X-Forwarded-For) and nginx uses the real visitor IP for logs, the guest and "Allowed sources"
+  (set_real_ip_from + real_ip_recursive). Works together with "Behind Cloudflare" when both use CF-Connecting-IP.
+- Domain test: a "client IP" step that says which headers carry the IP and which proxies are trusted.
+- Port rules: a Client IP mode replaces the Masquerade checkbox. "Keep the client IP" (plain DNAT, as before),
+  "Masquerade private sources only" (hairpin: other guests / LAN / VPN can use the public IP while internet clients
+  keep their real IP), "Masquerade all" (the old Masquerade) and "PROXY protocol" (TCP): nginx's stream module on
+  the host forwards the connection with a PROXY protocol v1 header, so the guest gets the client IP even when its
+  gateway is not this host. Existing rules keep their behaviour. Rule test and Debug check nginx, its stream config
+  and the listening port; the host firewall opens PROXY protocol ports.
+
 ## 1.12.1 - 2026-10-20
 - Locked domains: the Cert button is disabled and manual certificate requests (UI, API, CLI `cert`) are refused until
   the domain is unlocked. Automatic renewals by certbot's timer keep running, and a failed request never replaces
