@@ -46,7 +46,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.14.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.15.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -85,6 +85,8 @@ DEFAULTS = {
     "letsencrypt_dir": "/etc/letsencrypt/live",
     "nginx_ipv6": True,  # also listen on [::]:80/443
     "nginx_http2": True,  # HTTP/2 on 443 for the domains (Settings > Domains)
+    "nginx_server_tokens": False,  # False: server_tokens off - don't tell scanners the nginx version
+    "nginx_session_tickets": False,  # False: ssl_session_tickets off (CVE-2026-97629; the session cache still works)
     # Updates: branch/tag on GitHub to check and install from; daily background check.
     "update_ref": "master",
     "update_check": True,
@@ -1244,6 +1246,8 @@ def build_nginx(cfg):
     listen443 = ["    listen 443 %s;" % ssl_listen] + (["    listen [::]:443 %s;" % ssl_listen] if v6 else []) + \
         ["    listen %s:443 %s;  # another site listens on this address" % (a, ssl_listen) for a, p in extra if p == 443] + \
         (["    http2 %s;" % ("on" if h2 else "off")] if new_h2 else [])
+    if not cfg.get("nginx_server_tokens", False):  # every server block gets it with its listen lines
+        listen80, listen443 = listen80 + ["    server_tokens off;"], listen443 + ["    server_tokens off;"]
     for d in cfg["domains"]:
         if not d["enabled"]:
             continue
@@ -1251,7 +1255,8 @@ def build_nginx(cfg):
         tls = cert_info(cfg, cname)["exists"]
         crt, key = cert_paths(cfg, cname) if tls else (None, None)
         ssl = ["    ssl_certificate %s;" % crt, "    ssl_certificate_key %s;" % key, "    ssl_protocols TLSv1.2 TLSv1.3;",
-               "    ssl_session_cache shared:pvegw_ssl:10m;", "    ssl_session_timeout 1d;"] if tls else []
+               "    ssl_session_cache shared:pvegw_ssl:10m;", "    ssl_session_timeout 1d;"] + \
+            ([] if cfg.get("nginx_session_tickets", False) else ["    ssl_session_tickets off;"]) if tls else []
         realip = nginx_real_ip(d)
         redirect_aliases = d.get("alias_redirect") and d["aliases"]
         names = d["domain"] if redirect_aliases else " ".join(_names(d))
@@ -1328,6 +1333,62 @@ def build_nginx_stream(cfg, load_module=False):
 def nginx_stream_path(cfg):
     p = cfg.get("nginx_stream_conf") or DEFAULTS["nginx_stream_conf"]
     return MOCK.path_for(p) if MOCK else p
+
+
+NGINX_SETTINGS = ("nginx_http2", "nginx_server_tokens", "nginx_session_tickets")
+
+# nginx.org security advisories that hit features pve-gateway's own config uses (others - HTTP/3, mail, mp4, ssi,
+# resolver, stream TLS... - aren't enabled by it). (CVE, what, first, last vulnerable, fixed in branches, applies, fix)
+NGINX_ADVISORIES = [
+    ("CVE-2026-123007", "memory corruption in HTTP/2 flow control (major)", (1, 9, 5), (1, 31, 8), [(1, 31, 9), (1, 30, 7)],
+     "http2", "update nginx, or turn HTTP/2 off in Settings > Domains (nginx)"),
+    ("CVE-2026-123633", "use-after-free in HTTP/2", (1, 19, 7), (1, 31, 8), [(1, 31, 9), (1, 30, 7)],
+     "http2", "update nginx, or turn HTTP/2 off in Settings > Domains (nginx)"),
+    ("CVE-2026-118899", "infinite loop reading a request body over TLS 1.3 (major)", (1, 13, 0), (1, 31, 8),
+     [(1, 31, 9), (1, 30, 7)], "tls", "update nginx (no configuration workaround)"),
+    ("CVE-2026-97629", "session forgery with TLS session tickets", (1, 23, 2), (1, 31, 6), [(1, 31, 7), (1, 30, 6)],
+     "tickets", "update nginx, or turn TLS session tickets off in Settings > Domains (nginx)"),
+    ("CVE-2026-1642", "SSL upstream injection", (1, 3, 0), (1, 29, 4), [(1, 29, 5), (1, 28, 2)],
+     "upstream_tls", "update nginx (affects domains with an HTTPS upstream)"),
+]
+NGINX_PKG_RE = re.compile(r"^(nginx(?:-[\w]+)?|libnginx-mod-[\w.-]+)/")
+
+
+def nginx_vulnerable(ver, first, last, fixed):
+    """Upstream version check: in the vulnerable range and not on a patched release of a stable branch."""
+    return first <= ver <= last and not any(ver[:2] == f[:2] and ver >= f for f in fixed)
+
+
+def nginx_security_checks(cfg):
+    """[(name, status, detail)]: pending nginx package updates and nginx.org advisories for the features in use."""
+    res = []
+    rc, out = sh(["apt", "list", "--upgradable"], timeout=20)
+    if rc == 0:
+        pkgs = sorted({m.group(1) for m in (NGINX_PKG_RE.match(l) for l in out.splitlines()) if m})
+        res.append(("nginx security updates", "warn" if pkgs else "ok",
+                    "updates available for %s - run: apt update && apt install --only-upgrade %s"
+                    % (", ".join(pkgs), " ".join(pkgs)) if pkgs else "none pending (as of the last apt update)"))
+    ver = nginx_version()
+    if ver == (0, 0, 0):
+        return res
+    rc, pkg = sh(["dpkg-query", "-W", "-f=${Version}", "nginx"])
+    pkg = pkg.strip() if rc == 0 else ""
+    # nginx.org packages ("1.30.0-1~bookworm") follow the upstream fixes; distro builds ("1.22.1-9+deb12u3")
+    # backport them without changing the version, so for those the advisories are only a hint
+    upstream = bool(re.match(r"^\d+\.\d+\.\d+-\d+~", pkg))
+    tls = [d for d in cfg["domains"] if d["enabled"] and d["tls"] != "none"]
+    used = {"http2": bool(tls) and cfg.get("nginx_http2", True), "tls": bool(tls),
+            "tickets": bool(tls) and cfg.get("nginx_session_tickets", False),
+            "upstream_tls": any(d["enabled"] and d["upstream_https"] for d in cfg["domains"])}
+    hits = [a for a in NGINX_ADVISORIES if used[a[5]] and nginx_vulnerable(ver, a[2], a[3], a[4])]
+    v = "%d.%d.%d" % ver
+    if not hits:
+        res.append(("nginx advisories", "ok", "nginx %s: no known nginx.org advisory for the features pve-gateway uses" % v))
+    for cve, what, first, last, fixed, _, fix in hits:
+        res.append(("nginx %s" % cve, "warn", "%s - nginx %s is in the affected range; %s" % (what, v, fix)) if upstream else
+                   ("nginx %s" % cve, "info", "%s - nginx %s is in the affected range; %s (your distribution may have "
+                    "backported the fix: package %s - see nginx security updates)" % (what, v, fix, pkg or "unknown")))
+    return res
 
 
 def nginx_installed():
@@ -2299,6 +2360,9 @@ def checks():
                 add("name conflict %s" % n, "warn", "also defined in %s" % ", ".join(sorted(set(files))))
         add("nginx HTTP/2", "info", "on for the domains (port 443)" if cfg.get("nginx_http2", True) else
             "off - browsers use HTTP/1.1 (Settings > Domains)")
+        if sh(["nginx", "-v"])[0] == 0:
+            for name, status, detail in nginx_security_checks(cfg):
+                add(name, status, detail)
         add("nginx last apply", _st(not NGINX["last_error"]), NGINX["last_error"] or (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NGINX["last_apply"])) if NGINX["last_apply"] else "never"))
         rc, out = sh(["ss", "-Hlntp"])
@@ -4079,7 +4143,8 @@ BACKUP_KEEP = {"daily": 7, "manual": 20, "pre-restore": 10, "upload": 10}
 # nginx_stream_conf, acme_webroot, letsencrypt_dir, protected_ports) are never taken from a backup
 BACKUP_PARTS = {
     "rules": ("Port rules", ["rules", "forward_accept"]),
-    "domains": ("Domains and wildcard certificates", ["domains", "wildcards", "acme_email", "nginx_ipv6", "nginx_http2"]),
+    "domains": ("Domains and wildcard certificates", ["domains", "wildcards", "acme_email", "nginx_ipv6", "nginx_http2",
+                                                        "nginx_server_tokens", "nginx_session_tickets"]),
     "monitoring": ("Health checks and alerts", ["monitors", "alerts"]),
     "firewall": ("Firewall", ["firewall"]),
     "fail2ban": ("Fail2ban", ["fail2ban"]),
@@ -4852,7 +4917,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "client_ip": self.client_ip(), "own_hosts": sorted(own_hostnames()),
                                    "allowed_users": cfg.get("allowed_users", []), "auth": "local" if cfg.get("pass_hash") else "pve",
                                    "auto_update": bool(cfg.get("auto_update")),
-                                   "nginx_http2": bool(cfg.get("nginx_http2", True)), "nginx_version": "%d.%d.%d" % nginx_version(),
+                                   **{k: bool(cfg.get(k, DEFAULTS[k])) for k in NGINX_SETTINGS},
+                                   "nginx_version": "%d.%d.%d" % nginx_version(),
                                    "http2_shared": nginx_version() < (1, 25, 1)})
         if path == "/api/settings" and method == "PUT":
             d = self.body()
@@ -4864,12 +4930,14 @@ class Handler(BaseHTTPRequestHandler):
                     new["allowed_hosts"] = parse_hostnames(d["allowed_hosts"])
                 if "auto_update" in d:
                     new["auto_update"] = bool(d["auto_update"])
-                if "nginx_http2" in d and bool(d["nginx_http2"]) != bool(new.get("nginx_http2", True)):
-                    new["nginx_http2"] = bool(d["nginx_http2"])
+                changed = [k for k in NGINX_SETTINGS if k in d and bool(d[k]) != bool(new.get(k, DEFAULTS[k]))]
+                if changed:
+                    new.update({k: bool(d[k]) for k in changed})
                     err = apply_nginx(new)  # nginx -t first; the old config stays on failure
                     if err:
                         raise ApiError(err, 500)
-                    log("%s turned HTTP/2 for domains %s" % (user, "on" if new["nginx_http2"] else "off"))
+                    log("%s changed nginx settings: %s" % (user, ", ".join("%s %s" % (k, "on" if new[k] else "off")
+                                                                            for k in changed)))
                 if "allowed_users" in d:
                     users = [u.strip() for u in _as_list(d["allowed_users"]) if u.strip()]
                     bad = [u for u in users if not re.match(r"^[\w.-]{1,64}@[\w.-]{1,64}$", u)]
@@ -6876,6 +6944,27 @@ I18N = {
     "loaded from modules-enabled": ["загружается из modules-enabled", "modules-enabled dan yuklanadi"],
     "loaded by {0}": ["загружается из {0}", "{0} orqali yuklanadi"],
     "apt-get install libnginx-mod-stream failed: {0}": ["apt-get install libnginx-mod-stream завершился с ошибкой: {0}", "apt-get install libnginx-mod-stream bajarilmadi: {0}"],
+    "Show the nginx version in error pages and the Server header": ["Показывать версию nginx на страницах ошибок и в заголовке Server", "nginx versiyasini xato sahifalarida va Server sarlavhasida koʻrsatish"],
+    "Off by default: scanners look for hosts that run a known-vulnerable version.": ["По умолчанию выключено: сканеры ищут хосты с версией, у которой есть известные уязвимости.", "Standart holatda oʻchirilgan: skanerlar maʼlum zaifliklari bor versiyadagi xostlarni qidiradi."],
+    "TLS session tickets": ["TLS session tickets", "TLS session tickets"],
+    "Off by default (CVE-2026-97629: session forgery with tickets). Returning visitors still resume their TLS session through the session cache.": ["По умолчанию выключено (CVE-2026-97629: подделка сессии через tickets). Повторные посетители всё равно возобновляют TLS-сессию через кэш сессий.", "Standart holatda oʻchirilgan (CVE-2026-97629: tickets orqali sessiyani soxtalashtirish). Qayta kelgan tashrifchilar TLS sessiyasini baribir sessiya keshi orqali davom ettiradi."],
+    "the nginx version in responses": ["версию nginx в ответах", "javoblarda nginx versiyasini"],
+    "nginx security updates": ["обновления безопасности nginx", "nginx xavfsizlik yangilanishlari"],
+    "updates available for {0} - run: apt update && apt install --only-upgrade {1}": ["доступны обновления для {0} - выполните: apt update && apt install --only-upgrade {1}", "{0} uchun yangilanishlar bor - bajaring: apt update && apt install --only-upgrade {1}"],
+    "none pending (as of the last apt update)": ["ожидающих нет (по данным последнего apt update)", "kutilayotganlari yoʻq (oxirgi apt update boʻyicha)"],
+    "nginx advisories": ["бюллетени безопасности nginx", "nginx xavfsizlik bildirishnomalari"],
+    "nginx {0}: no known nginx.org advisory for the features pve-gateway uses": ["nginx {0}: нет известных бюллетеней nginx.org для функций, которые использует pve-gateway", "nginx {0}: pve-gateway ishlatadigan funksiyalar uchun nginx.org da maʼlum bildirishnoma yoʻq"],
+    "{0} - nginx {1} is in the affected range; {2}": ["{0} - nginx {1} входит в уязвимый диапазон; {2}", "{0} - nginx {1} zaif diapazonga kiradi; {2}"],
+    "{0} - nginx {1} is in the affected range; {2} (your distribution may have backported the fix: package {3} - see nginx security updates)": ["{0} - nginx {1} входит в уязвимый диапазон; {2} (ваш дистрибутив мог перенести исправление: пакет {3} - см. обновления безопасности nginx)", "{0} - nginx {1} zaif diapazonga kiradi; {2} (distributivingiz tuzatishni koʻchirgan boʻlishi mumkin: {3} paketi - nginx xavfsizlik yangilanishlariga qarang)"],
+    "memory corruption in HTTP/2 flow control (major)": ["повреждение памяти в управлении потоком HTTP/2 (серьёзная)", "HTTP/2 oqim boshqaruvida xotira buzilishi (jiddiy)"],
+    "use-after-free in HTTP/2": ["use-after-free в HTTP/2", "HTTP/2 da use-after-free"],
+    "infinite loop reading a request body over TLS 1.3 (major)": ["бесконечный цикл при чтении тела запроса по TLS 1.3 (серьёзная)", "TLS 1.3 orqali soʻrov tanasini oʻqishda cheksiz sikl (jiddiy)"],
+    "session forgery with TLS session tickets": ["подделка сессии через TLS session tickets", "TLS session tickets orqali sessiyani soxtalashtirish"],
+    "SSL upstream injection": ["инъекция в SSL upstream", "SSL upstream ga inyeksiya"],
+    "update nginx, or turn HTTP/2 off in Settings > Domains (nginx)": ["обновите nginx или выключите HTTP/2 в Настройки > Домены (nginx)", "nginx ni yangilang yoki Sozlamalar > Domenlar (nginx) da HTTP/2 ni oʻchiring"],
+    "update nginx (no configuration workaround)": ["обновите nginx (обойти настройками нельзя)", "nginx ni yangilang (sozlamalar bilan chetlab oʻtib boʻlmaydi)"],
+    "update nginx, or turn TLS session tickets off in Settings > Domains (nginx)": ["обновите nginx или выключите TLS session tickets в Настройки > Домены (nginx)", "nginx ni yangilang yoki Sozlamalar > Domenlar (nginx) da TLS session tickets ni oʻchiring"],
+    "update nginx (affects domains with an HTTPS upstream)": ["обновите nginx (затрагивает домены с HTTPS-бэкендом)", "nginx ni yangilang (HTTPS upstream boʻlgan domenlarga taʼsir qiladi)"],
     "Domains (nginx)": ["Домены (nginx)", "Domenlar (nginx)"],
     "HTTP/2 for HTTPS domains": ["HTTP/2 для HTTPS-доменов", "HTTPS domenlar uchun HTTP/2"],
     "HTTP/2 for domains": ["HTTP/2 для доменов", "domenlar uchun HTTP/2"],
@@ -7145,6 +7234,10 @@ INDEX_HTML = r"""<!doctype html>
       <label class="check"><input type="checkbox" id="http2"> HTTP/2 for HTTPS domains</label>
       <p class="hint">Faster for browsers. Turn it off if a guest app or client has trouble with HTTP/2; domains then use HTTP/1.1.</p>
       <p class="hint" id="http2Shared" hidden></p>
+      <label class="check"><input type="checkbox" id="srvTokens"> Show the nginx version in error pages and the Server header</label>
+      <p class="hint">Off by default: scanners look for hosts that run a known-vulnerable version.</p>
+      <label class="check"><input type="checkbox" id="sessTickets"> TLS session tickets</label>
+      <p class="hint">Off by default (CVE-2026-97629: session forgery with tickets). Returning visitors still resume their TLS session through the session cache.</p>
       <p id="nginxErr" class="err"></p>
     </div>
     <div class="card form-card">
@@ -8973,12 +9066,16 @@ async function waitForRestart(ver) {
   $('#updErr').textContent = 'The update did not finish within 3 minutes - on the host run: journalctl -u pve-gateway-update';
 }
 $('#updCheck').onclick = () => loadUpdate(true);
-$('#http2').onchange = async e => {
-  $('#nginxErr').textContent = '';
-  if (!await askToggle(e, 'HTTP/2 for domains')) return;
-  try { await api('PUT', '/api/settings', {nginx_http2: e.target.checked}); flash('Saved and applied'); }
-  catch (err) { e.target.checked = !e.target.checked; $('#nginxErr').textContent = err.message; }
-};
+// nginx settings for the domains: each switch is applied right away (nginx -t first)
+for (const [id, key, what] of [['#http2', 'nginx_http2', 'HTTP/2 for domains'], ['#srvTokens', 'nginx_server_tokens', 'the nginx version in responses'],
+  ['#sessTickets', 'nginx_session_tickets', 'TLS session tickets']]) {
+  $(id).onchange = async e => {
+    $('#nginxErr').textContent = '';
+    if (!await askToggle(e, what)) return;
+    try { await api('PUT', '/api/settings', {[key]: e.target.checked}); flash('Saved and applied'); }
+    catch (err) { e.target.checked = !e.target.checked; $('#nginxErr').textContent = err.message; }
+  };
+}
 $('#autoUpd').onchange = async e => {
   if (!await askToggle(e, 'automatic updates')) return;
   try { await api('PUT', '/api/settings', {auto_update: e.target.checked}); }
@@ -9005,6 +9102,7 @@ async function loadSettings() {
     $('#uiAllow').value = d.ui_allow.join('\n'); $('#uiHosts').value = d.allowed_hosts.join('\n');
     $('#uiUsers').value = d.allowed_users.join('\n'); $('#usersRow').hidden = d.auth !== 'pve';
     $('#autoUpd').checked = d.auto_update; $('#http2').checked = d.nginx_http2;
+    $('#srvTokens').checked = d.nginx_server_tokens; $('#sessTickets').checked = d.nginx_session_tickets;
     $('#http2Shared').hidden = !d.http2_shared;
     $('#http2Shared').textContent = 'With nginx ' + d.nginx_version + ' the setting is shared by every site on port 443: if another site still has "listen 443 ssl http2", HTTP/2 stays on.';
     $('#myIp').textContent = d.client_ip; $('#uiPort').textContent = location.port || (location.protocol === 'https:' ? 443 : 80);

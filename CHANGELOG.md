@@ -4,6 +4,15 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.15.0 - 2026-11-19
+- nginx hardening for the domains, in Settings > Domains (nginx): the nginx version is hidden (`server_tokens off`)
+  and TLS session tickets are off (`ssl_session_tickets off`, CVE-2026-97629). Both are new defaults and can be
+  turned back on; the change is checked with `nginx -t` before it is applied.
+- Debug: "nginx security updates" warns when apt has newer nginx packages, and the nginx.org advisories that
+  affect the installed version and a feature pve-gateway uses (HTTP/2 CVE-2026-123007 / CVE-2026-123633, TLS 1.3
+  CVE-2026-118899, session tickets CVE-2026-97629, HTTPS upstreams CVE-2026-1642) are listed with the fix. For
+  distro packages, which backport fixes, they are shown as hints. Mock scenario: `nginx-outdated`.
+
 ## 1.14.0 - 2026-11-19
 - Settings > Domains (nginx): HTTP/2 for HTTPS domains can be turned off (it stays on by default). The nginx config
   is checked with `nginx -t` before it is applied. Debug shows the setting. Backups include it with the domains.
