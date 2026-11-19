@@ -62,6 +62,7 @@ SCENARIOS = {
     "no-fail2ban": "fail2ban is not installed (use the Install button)",
     "no-wireguard": "wireguard-tools is not installed (use the Install button)",
     "dnat-80": "another tool's iptables rule forwards ports 80/443 to a firewall VM instead of the host's nginx",
+    "nginx-outdated": "a security update for nginx is waiting in apt (Debug shows it)",
     "no-stream-module": "nginx without its stream module (PROXY protocol port rules need: apt install libnginx-mod-stream)",
     "no-dnsmasq": "dnsmasq is not installed (SDN DHCP needs it; use the Install button on the Network tab)",
     "no-sdn": "old Proxmox VE (7.4) without the SDN API",
@@ -479,6 +480,8 @@ server {
                 self._bump(st, burst=True)
             elif name == "nginx-stopped":
                 st["nginx_active"] = False
+            elif name == "nginx-outdated":
+                st["nginx_update"] = True
             elif name == "no-stream-module":
                 st["stream_module"] = False
             elif name == "nginx-test-fails":
@@ -954,8 +957,25 @@ server {
             return 0, "\n".join(l for l in conf.splitlines() if not re.match(r"^(Address|DNS|MTU|Table|PreUp|PostUp|PreDown|PostDown)\s*=", l)), False
         return 1, "(mock) unsupported wg-quick call", False
 
+    def c_apt(self, st, a, data):
+        if a[:2] == ["list", "--upgradable"]:
+            lines = ["Listing... Done"]
+            if st.get("nginx_update"):
+                lines += ["nginx/stable-security 1.22.1-9+deb12u4 amd64 [upgradable from: 1.22.1-9+deb12u3]",
+                          "nginx-common/stable-security 1.22.1-9+deb12u4 all [upgradable from: 1.22.1-9+deb12u3]"]
+            return 0, "\n".join(lines), False
+        return 1, "(mock) unsupported apt call", False
+
+    def c_dpkg_query(self, st, a, data):
+        if a[-1] == "nginx":
+            return 0, "1.22.1-9+deb12u4" if st.get("nginx_update") is False else "1.22.1-9+deb12u3", False
+        return 1, "dpkg-query: no packages found matching %s" % a[-1], False
+
     def c_apt_get(self, st, a, data):
         time.sleep(1.5)
+        if "--only-upgrade" in a and "nginx" in a:
+            st["nginx_update"] = False
+            return 0, "Setting up nginx (1.22.1-9+deb12u4) ...", True
         if "libnginx-mod-stream" in a:
             st["stream_module"] = True
             self._stream_files(st)

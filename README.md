@@ -97,6 +97,7 @@ The **Domains** tab maps hostnames to guests: `cloud.example.com` → `10.10.10.
 
 - Everything goes into a single generated file, `/etc/nginx/conf.d/pve-gateway.conf`. Other nginx sites are left alone. Each change is checked with `nginx -t` before reload; if the check fails, the previous file is restored and the error is shown in the UI.
 - **HTTP/2** is on for HTTPS domains by default. Turn it off in **Settings > Domains (nginx)** if a guest app or client has trouble with it; domains then use HTTP/1.1. With nginx older than 1.25.1 the setting is shared by every site on port 443, so another site with `listen 443 ssl http2` keeps it on.
+- **Hardening** (also in **Settings > Domains (nginx)**): the nginx version is hidden (`server_tokens off`) and TLS session tickets are off (`ssl_session_tickets off`, CVE-2026-97629); both can be turned back on. **Debug** lists pending nginx security updates from apt (`apt list --upgradable`) and the [nginx.org advisories](https://nginx.org/en/security_advisories.html) that affect the installed version *and* a feature pve-gateway's config uses (HTTP/2, TLS 1.3, session tickets, HTTPS upstreams), with the fix or workaround. Debian and Ubuntu backport fixes without changing the version, so for their packages an advisory is only a hint; the apt check is what tells you an update is due.
 - **Let's Encrypt** (optional, per domain) uses `certbot certonly --webroot`. The certificate is requested in the background right after saving, and certbot's own systemd timer renews it, reloading nginx through a deploy hook. *Cert* re-requests it on demand, and *Test* checks DNS, nginx, the upstream, the certificate and a real request through nginx.
 - **Per domain options:**
   - aliases (extra hostnames), served as the same site or **redirected with a 301** to the main domain;
@@ -245,6 +246,7 @@ To break the host on purpose, run a scenario. They're also available as buttons 
 | `nginx-stopped` | stops nginx, so domain tests fail |
 | `nginx-test-fails` | makes the next `nginx -t` fail, showing the rollback |
 | `cert-expiring` | makes every certificate expire in 5 days |
+| `nginx-outdated` | an nginx security update is waiting in apt (Debug warns) |
 | `no-stream-module` | nginx without its stream module, so PROXY protocol port rules can't be saved (Install button in the rule dialog) |
 | `no-dnsmasq` | dnsmasq is missing, so SDN DHCP can't work (Install button on the Network tab) |
 | `no-sdn` | an old Proxmox VE (7.4) without the SDN API |

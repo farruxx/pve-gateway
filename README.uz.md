@@ -97,6 +97,7 @@ IP manzilni har doim qoʻlda kiritishingiz mumkin.
 
 - Hammasi bitta generatsiya qilingan faylga yoziladi: `/etc/nginx/conf.d/pve-gateway.conf`. Boshqa nginx saytlariga tegilmaydi. Har bir oʻzgarish qayta yuklashdan oldin `nginx -t` bilan tekshiriladi; tekshiruv muvaffaqiyatsiz boʻlsa, oldingi fayl tiklanadi va xato UI da koʻrsatiladi.
 - **HTTP/2** HTTPS domenlar uchun standart holatda yoqilgan. Agar mehmon tizimdagi ilova yoki mijozda u bilan muammo boʻlsa, uni **Sozlamalar > Domenlar (nginx)** da oʻchiring; shunda domenlar HTTP/1.1 dan foydalanadi. nginx ning 1.25.1 dan oldingi versiyalarida bu sozlama 443-portdagi barcha saytlar uchun umumiy, shuning uchun `listen 443 ssl http2` boʻlgan boshqa sayt uni yoqilgan holda qoldiradi.
+- **Himoya** (bu ham **Sozlamalar > Domenlar (nginx)** da): nginx versiyasi yashirilgan (`server_tokens off`), TLS session tickets oʻchirilgan (`ssl_session_tickets off`, CVE-2026-97629); ikkalasini qayta yoqish mumkin. **Debug** apt dan kutilayotgan nginx xavfsizlik yangilanishlarini (`apt list --upgradable`) va oʻrnatilgan versiyaga *hamda* pve-gateway konfiguratsiyasi ishlatadigan funksiyaga (HTTP/2, TLS 1.3, session tickets, HTTPS upstream) taʼsir qiluvchi [nginx.org bildirishnomalarini](https://nginx.org/en/security_advisories.html) tuzatish yoki aylanib oʻtish yoʻli bilan koʻrsatadi. Debian va Ubuntu tuzatishlarni versiya raqamini oʻzgartirmasdan koʻchiradi, shuning uchun ularning paketlari uchun bildirishnoma faqat maslahat; yangilash vaqti kelganini apt tekshiruvi aytadi.
 - **Let's Encrypt** (ixtiyoriy, har bir domen uchun) `certbot certonly --webroot` dan foydalanadi. Sertifikat saqlangandan soʻng darhol fonda soʻraladi, uni certbot ning oʻz systemd taymeri yangilaydi va deploy hook orqali nginx ni qayta yuklaydi. *Cert* uni talab boʻyicha qayta soʻraydi, *Tekshirish* esa DNS, nginx, upstream, sertifikat va nginx orqali haqiqiy soʻrovni tekshiradi.
 - **Har bir domen uchun parametrlar:**
   - taxalluslar (qoʻshimcha xost nomlari), ular xuddi shu sayt sifatida ochiladi yoki asosiy domenga **301 bilan qayta yoʻnaltiriladi**;
@@ -245,6 +246,7 @@ Xostni ataylab buzish uchun ssenariyni ishga tushiring. Ular Diagnostika boʻlim
 | `nginx-stopped` | nginx ni toʻxtatadi, shuning uchun domen testlari xato beradi |
 | `nginx-test-fails` | navbatdagi `nginx -t` ni xato bilan yakunlaydi va orqaga qaytarishni koʻrsatadi |
 | `cert-expiring` | barcha sertifikatlar muddatini 5 kunda tugaydigan qiladi |
+| `nginx-outdated` | apt da nginx xavfsizlik yangilanishi kutmoqda (Debug ogohlantiradi) |
 | `no-stream-module` | nginx da stream moduli yoʻq, shuning uchun PROXY protocol port qoidalari saqlanmaydi (qoida oynasida Oʻrnatish tugmasi) |
 | `no-dnsmasq` | dnsmasq yoʻq, shuning uchun SDN DHCP ishlay olmaydi (Tarmoq boʻlimida Oʻrnatish tugmasi) |
 | `no-sdn` | SDN API siz eski Proxmox VE (7.4) |
