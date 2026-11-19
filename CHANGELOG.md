@@ -4,6 +4,10 @@ All notable changes to pve-gateway. Versions follow [semantic versioning](https:
 `VERSION` in `pve-gateway.py`. The **Update** button in Settings (and `pve-gateway update`) installs the latest version
 from GitHub and shows the entries below that are newer than the installed one.
 
+## 1.14.0 - 2026-11-19
+- Settings > Domains (nginx): HTTP/2 for HTTPS domains can be turned off (it stays on by default). The nginx config
+  is checked with `nginx -t` before it is applied. Debug shows the setting. Backups include it with the domains.
+
 ## 1.13.1 - 2026-11-18
 - PROXY protocol port rules: nginx's stream module (a separate package on Debian, libnginx-mod-stream) is checked
   before the config is written. If it is missing, the rule dialog shows an **Install stream module** button that
