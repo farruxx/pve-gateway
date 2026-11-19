@@ -96,6 +96,7 @@ You can always type the IP by hand.
 The **Domains** tab maps hostnames to guests: `cloud.example.com` → `10.10.10.13:80`, `git.example.com` → `https://10.10.10.10:443`, and so on. nginx on the host answers on ports 80 and 443 and proxies each request by its `Host` header, so many guests can share one public IP and the same ports.
 
 - Everything goes into a single generated file, `/etc/nginx/conf.d/pve-gateway.conf`. Other nginx sites are left alone. Each change is checked with `nginx -t` before reload; if the check fails, the previous file is restored and the error is shown in the UI.
+- **HTTP/2** is on for HTTPS domains by default. Turn it off in **Settings > Domains (nginx)** if a guest app or client has trouble with it; domains then use HTTP/1.1. With nginx older than 1.25.1 the setting is shared by every site on port 443, so another site with `listen 443 ssl http2` keeps it on.
 - **Let's Encrypt** (optional, per domain) uses `certbot certonly --webroot`. The certificate is requested in the background right after saving, and certbot's own systemd timer renews it, reloading nginx through a deploy hook. *Cert* re-requests it on demand, and *Test* checks DNS, nginx, the upstream, the certificate and a real request through nginx.
 - **Per domain options:**
   - aliases (extra hostnames), served as the same site or **redirected with a 301** to the main domain;

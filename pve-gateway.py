@@ -46,7 +46,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.13.1"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
+VERSION = "1.14.0"  # semantic version; bump it (and CHANGELOG.md) with every user-visible change
 REPO_URL = "https://github.com/farruxx/pve-gateway"
 REPO_RAW = "https://raw.githubusercontent.com/farruxx/pve-gateway"
 CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or "/etc/pve-gateway"
@@ -84,6 +84,7 @@ DEFAULTS = {
     "acme_webroot": "/var/lib/pve-gateway/acme",
     "letsencrypt_dir": "/etc/letsencrypt/live",
     "nginx_ipv6": True,  # also listen on [::]:80/443
+    "nginx_http2": True,  # HTTP/2 on 443 for the domains (Settings > Domains)
     # Updates: branch/tag on GitHub to check and install from; daily background check.
     "update_ref": "master",
     "update_check": True,
@@ -1231,8 +1232,9 @@ def build_nginx(cfg):
            "# Manage domains in the pve-gateway web UI.", "",
            "map $http_upgrade $pvegw_connection_upgrade {", "    default upgrade;", "    ''      close;", "}"]
     v6 = cfg.get("nginx_ipv6", True)
+    h2 = cfg.get("nginx_http2", True)
     new_h2 = nginx_version() >= (1, 25, 1)  # Debian trixie / PVE 9: "listen ... http2" is deprecated
-    ssl_listen = "ssl" if new_h2 else "ssl http2"
+    ssl_listen = "ssl" if new_h2 or not h2 else "ssl http2"
     acme = ["    location ^~ /.well-known/acme-challenge/ {", "        root %s;" % cfg["acme_webroot"],
             "        default_type text/plain;", "    }"]
     extra = explicit_listens(nginx_sites(cfg))  # other sites bound to a specific IP would otherwise win
@@ -1241,7 +1243,7 @@ def build_nginx(cfg):
         ["    listen %s:80;  # another site listens on this address" % a for a, p in extra if p == 80]
     listen443 = ["    listen 443 %s;" % ssl_listen] + (["    listen [::]:443 %s;" % ssl_listen] if v6 else []) + \
         ["    listen %s:443 %s;  # another site listens on this address" % (a, ssl_listen) for a, p in extra if p == 443] + \
-        (["    http2 on;"] if new_h2 else [])
+        (["    http2 %s;" % ("on" if h2 else "off")] if new_h2 else [])
     for d in cfg["domains"]:
         if not d["enabled"]:
             continue
@@ -2295,6 +2297,8 @@ def checks():
                     "domains listen there too, so nginx still picks them by name")
             for n, files in sorted(name_conflicts(sites, [x for dm in cfg["domains"] if dm["enabled"] for x in _names(dm)]).items()):
                 add("name conflict %s" % n, "warn", "also defined in %s" % ", ".join(sorted(set(files))))
+        add("nginx HTTP/2", "info", "on for the domains (port 443)" if cfg.get("nginx_http2", True) else
+            "off - browsers use HTTP/1.1 (Settings > Domains)")
         add("nginx last apply", _st(not NGINX["last_error"]), NGINX["last_error"] or (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NGINX["last_apply"])) if NGINX["last_apply"] else "never"))
         rc, out = sh(["ss", "-Hlntp"])
@@ -4075,7 +4079,7 @@ BACKUP_KEEP = {"daily": 7, "manual": 20, "pre-restore": 10, "upload": 10}
 # nginx_stream_conf, acme_webroot, letsencrypt_dir, protected_ports) are never taken from a backup
 BACKUP_PARTS = {
     "rules": ("Port rules", ["rules", "forward_accept"]),
-    "domains": ("Domains and wildcard certificates", ["domains", "wildcards", "acme_email", "nginx_ipv6"]),
+    "domains": ("Domains and wildcard certificates", ["domains", "wildcards", "acme_email", "nginx_ipv6", "nginx_http2"]),
     "monitoring": ("Health checks and alerts", ["monitors", "alerts"]),
     "firewall": ("Firewall", ["firewall"]),
     "fail2ban": ("Fail2ban", ["fail2ban"]),
@@ -4847,7 +4851,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"ui_allow": cfg.get("ui_allow", []), "allowed_hosts": cfg.get("allowed_hosts", []),
                                    "client_ip": self.client_ip(), "own_hosts": sorted(own_hostnames()),
                                    "allowed_users": cfg.get("allowed_users", []), "auth": "local" if cfg.get("pass_hash") else "pve",
-                                   "auto_update": bool(cfg.get("auto_update"))})
+                                   "auto_update": bool(cfg.get("auto_update")),
+                                   "nginx_http2": bool(cfg.get("nginx_http2", True)), "nginx_version": "%d.%d.%d" % nginx_version(),
+                                   "http2_shared": nginx_version() < (1, 25, 1)})
         if path == "/api/settings" and method == "PUT":
             d = self.body()
             with LOCK:
@@ -4858,6 +4864,12 @@ class Handler(BaseHTTPRequestHandler):
                     new["allowed_hosts"] = parse_hostnames(d["allowed_hosts"])
                 if "auto_update" in d:
                     new["auto_update"] = bool(d["auto_update"])
+                if "nginx_http2" in d and bool(d["nginx_http2"]) != bool(new.get("nginx_http2", True)):
+                    new["nginx_http2"] = bool(d["nginx_http2"])
+                    err = apply_nginx(new)  # nginx -t first; the old config stays on failure
+                    if err:
+                        raise ApiError(err, 500)
+                    log("%s turned HTTP/2 for domains %s" % (user, "on" if new["nginx_http2"] else "off"))
                 if "allowed_users" in d:
                     users = [u.strip() for u in _as_list(d["allowed_users"]) if u.strip()]
                     bad = [u for u in users if not re.match(r"^[\w.-]{1,64}@[\w.-]{1,64}$", u)]
@@ -6864,6 +6876,14 @@ I18N = {
     "loaded from modules-enabled": ["загружается из modules-enabled", "modules-enabled dan yuklanadi"],
     "loaded by {0}": ["загружается из {0}", "{0} orqali yuklanadi"],
     "apt-get install libnginx-mod-stream failed: {0}": ["apt-get install libnginx-mod-stream завершился с ошибкой: {0}", "apt-get install libnginx-mod-stream bajarilmadi: {0}"],
+    "Domains (nginx)": ["Домены (nginx)", "Domenlar (nginx)"],
+    "HTTP/2 for HTTPS domains": ["HTTP/2 для HTTPS-доменов", "HTTPS domenlar uchun HTTP/2"],
+    "HTTP/2 for domains": ["HTTP/2 для доменов", "domenlar uchun HTTP/2"],
+    "Faster for browsers. Turn it off if a guest app or client has trouble with HTTP/2; domains then use HTTP/1.1.": ["Быстрее для браузеров. Отключите, если у приложения в гостевой системе или у клиента проблемы с HTTP/2; тогда домены работают по HTTP/1.1.", "Brauzerlar uchun tezroq. Agar mehmon tizimdagi ilova yoki mijozda HTTP/2 bilan muammo boʻlsa, oʻchiring; shunda domenlar HTTP/1.1 dan foydalanadi."],
+    "With nginx {0} the setting is shared by every site on port 443: if another site still has \"listen 443 ssl http2\", HTTP/2 stays on.": ["В nginx {0} эта настройка общая для всех сайтов на порту 443: если у другого сайта остаётся \"listen 443 ssl http2\", HTTP/2 останется включённым.", "nginx {0} da bu sozlama 443-portdagi barcha saytlar uchun umumiy: agar boshqa saytda \"listen 443 ssl http2\" qolsa, HTTP/2 yoqilgan qoladi."],
+    "nginx HTTP/2": ["nginx HTTP/2", "nginx HTTP/2"],
+    "on for the domains (port 443)": ["включён для доменов (порт 443)", "domenlar uchun yoqilgan (443-port)"],
+    "off - browsers use HTTP/1.1 (Settings > Domains)": ["выключен - браузеры используют HTTP/1.1 (Настройки > Домены)", "oʻchirilgan - brauzerlar HTTP/1.1 dan foydalanadi (Sozlamalar > Domenlar)"],
     "Install stream module": ["Установить модуль stream", "Stream modulini oʻrnatish"],
     "Install the nginx stream module?": ["Установить модуль stream для nginx?", "nginx stream moduli oʻrnatilsinmi?"],
     "Runs: apt-get install libnginx-mod-stream. Then the rule is saved again.": ["Выполняет: apt-get install libnginx-mod-stream. Затем правило сохраняется снова.", "Bajaradi: apt-get install libnginx-mod-stream. Soʻng qoida qayta saqlanadi."],
@@ -7119,6 +7139,13 @@ INDEX_HTML = r"""<!doctype html>
       <div class="actions"><a id="updLink" class="muted small" target="_blank" rel="noopener">changes on GitHub</a>
         <span class="spacer"></span><button type="button" class="ghost" id="updCheck">Check now</button>
         <button type="button" id="updRun" hidden>Update</button></div>
+    </div>
+    <div class="card form-card">
+      <h2>Domains (nginx)</h2>
+      <label class="check"><input type="checkbox" id="http2"> HTTP/2 for HTTPS domains</label>
+      <p class="hint">Faster for browsers. Turn it off if a guest app or client has trouble with HTTP/2; domains then use HTTP/1.1.</p>
+      <p class="hint" id="http2Shared" hidden></p>
+      <p id="nginxErr" class="err"></p>
     </div>
     <div class="card form-card">
       <h2>Web UI access</h2>
@@ -8946,6 +8973,12 @@ async function waitForRestart(ver) {
   $('#updErr').textContent = 'The update did not finish within 3 minutes - on the host run: journalctl -u pve-gateway-update';
 }
 $('#updCheck').onclick = () => loadUpdate(true);
+$('#http2').onchange = async e => {
+  $('#nginxErr').textContent = '';
+  if (!await askToggle(e, 'HTTP/2 for domains')) return;
+  try { await api('PUT', '/api/settings', {nginx_http2: e.target.checked}); flash('Saved and applied'); }
+  catch (err) { e.target.checked = !e.target.checked; $('#nginxErr').textContent = err.message; }
+};
 $('#autoUpd').onchange = async e => {
   if (!await askToggle(e, 'automatic updates')) return;
   try { await api('PUT', '/api/settings', {auto_update: e.target.checked}); }
@@ -8971,7 +9004,9 @@ async function loadSettings() {
     const d = await api('GET', '/api/settings');
     $('#uiAllow').value = d.ui_allow.join('\n'); $('#uiHosts').value = d.allowed_hosts.join('\n');
     $('#uiUsers').value = d.allowed_users.join('\n'); $('#usersRow').hidden = d.auth !== 'pve';
-    $('#autoUpd').checked = d.auto_update;
+    $('#autoUpd').checked = d.auto_update; $('#http2').checked = d.nginx_http2;
+    $('#http2Shared').hidden = !d.http2_shared;
+    $('#http2Shared').textContent = 'With nginx ' + d.nginx_version + ' the setting is shared by every site on port 443: if another site still has "listen 443 ssl http2", HTTP/2 stays on.';
     $('#myIp').textContent = d.client_ip; $('#uiPort').textContent = location.port || (location.protocol === 'https:' ? 443 : 80);
     $('#ownHosts').textContent = 'Always allowed: any IP address, ' + d.own_hosts.join(', ') + '.';
     $('#setErr').textContent = '';
